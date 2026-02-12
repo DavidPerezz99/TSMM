@@ -1,0 +1,106 @@
+batch_size: 32
+cache:
+  directory: ./joblib_cache
+  enabled: true
+  size_limit_mb: 12480
+columns:
+- OPEN
+- HIGH
+- LOW
+- CLOSE
+- Price_return
+- Open_return
+- High_return
+- Low_return
+- SMA_10
+- SMA_30
+- EMA_10
+- EMA_30
+- Volatility_10
+- Volatility_30
+- daily_return
+- y_diff
+- SMA_2_diff
+- EMA_2_diff
+- Volatility_2_diff
+- SMA_7_diff
+- EMA_7_diff
+- Volatility_7_diff
+- SMA_30_diff
+- EMA_30_diff
+- Volatility_30_diff
+- SMA_60_diff
+- EMA_60_diff
+- Volatility_60_diff
+- SMA_2
+- EMA_2
+- Volatility_2
+- SMA_7
+- EMA_7
+- Volatility_7
+- SMA_60
+- EMA_60
+- Volatility_60
+data_path: src/xauusd_7h_2009.csv
+date_col: DATE
+end_date: ''
+epochs: 80
+exclude_cols: []
+forecast_validation:
+  enabled: true
+  max_deviation_percent: 50.0
+  max_growth_rate: 2.0
+horizon: 15
+inference_batches: 1
+input_features:
+- HIGH
+- y_diff
+- Price_return
+- Open_return
+input_target_sets:
+  input_features:
+  - HIGH
+  - y_diff
+  - Low_return
+  - Price_return
+  target_features:
+  - y_diff
+  - Low_return
+  - Price_return
+lags:
+- 2
+- 7
+- 30
+- 60
+log_dir: logs
+m_steps: 1
+model_dir: models
+models_to_run:
+  multivariate: []
+  univariate:
+  - ulr
+n_steps: 15
+output:
+  directory: reports
+  filename_prefix: forecast_report
+  format: pdf
+problem_type: univariate
+records: 5000
+rolling_windows:
+- 2
+- 7
+- 30
+- 60
+seasonal_period: 15
+split_ratio: 0.8
+start_date: ''
+target_col: HIGH
+target_features:
+- y_diff
+- Price_return
+- Open_return
+test_size: 15
+watermark_opacity: 0.1
+watermark_path: vrz.png
+watermark_size: 70
+xgb_future_method: recursive

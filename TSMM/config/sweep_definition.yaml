@@ -1,0 +1,41 @@
+# Simple sweep_definition.yaml for ULR, SVR, N-BEATS
+# ~40 total experiments with smart_generation enabled
+
+smart_generation: true
+
+models_to_run:
+  univariate:
+    - ulr          # Univariate Linear Regression
+  multivariate: []
+
+# ---- Global hyperparameters (shared across models) ----
+n_steps     : [15, 30, 60, 90]    # 2 values
+m_steps     : [1, 5, 15, 30]         # 1 value
+split_ratio : [0.8, 0.9]       # 1 value
+test_size   : [15]        # 1 value
+records     : [500, 1000, 3000, 5000] # 2 values (limit data to <=1000 rows)
+
+# ---- Model-specific hyperparameters ----
+# ULR uses only global params (no extra keys needed)
+
+# SVR: keep grid small
+#svr.kernel : ["rbf"]
+#svr.C      : [0.1, 1.0]
+
+# N-BEATS: interpretable only, small grid
+#nbeats.model_type  : ["interpretable"]
+#nbeats.hidden_size : [256, 512]
+
+# ---- Input/target feature recipes (y_diff primary) ----
+input_target_sets:
+  - # Set A: minimalist
+    input_features  : ['HIGH', 'y_diff']
+    target_features : ['y_diff']
+
+  - # Set B: returns-focused
+    input_features  : ['HIGH', 'y_diff', 'Low_return', 'Price_return']
+    target_features : ['y_diff', 'Low_return', 'Price_return']
+    
+  - # Set C: pivot support
+    input_features  : ['HIGH', 'y_diff', 'Low_return']
+    target_features : ['y_diff', 'Low_return']    

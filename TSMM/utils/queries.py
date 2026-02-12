@@ -1,0 +1,166 @@
+# config/queries.py
+
+SELECT_QUERY_AR = """
+SELECT 
+    "BRAND",
+    "day_act_dt" as "ACTIVATION_DATE",
+    "TOTAL_COUNT" AS "GROSS_ADDS",
+    "NOT_ENROLLED",
+    "ENROLLED_30D",
+    "ENROLLED_31D_TO_60D",
+    "ENROLLED_61D_MORE",
+    CASE 
+        WHEN "TOTAL_COUNT" > 0 THEN ROUND(("NOT_ENROLLED" / "TOTAL_COUNT") * 100, 2) 
+        ELSE 0 
+    END AS "NOT_ENROLLED_PERCENT",
+    CASE 
+        WHEN "TOTAL_COUNT" > 0 THEN ROUND(("ENROLLED_30D" / "TOTAL_COUNT") * 100, 2) 
+        ELSE 0 
+    END AS "ENROLLED_30D_PERCENT",
+    CASE 
+        WHEN "TOTAL_COUNT" > 0 THEN ROUND(("ENROLLED_31D_TO_60D" / "TOTAL_COUNT") * 100, 2) 
+        ELSE 0 
+    END AS "ENROLLED_31D_TO_60D_PERCENT",
+    CASE 
+        WHEN "TOTAL_COUNT" > 0 THEN ROUND(("ENROLLED_61D_MORE" / "TOTAL_COUNT") * 100, 2) 
+        ELSE 0 
+    END AS "ENROLLED_61D_MORE_PERCENT"
+FROM (
+    SELECT
+        "BRAND",
+        "day_act_dt",
+        SUM("cntd_sid") AS "TOTAL_COUNT",
+        SUM(CASE WHEN "Act2enroll_days_grp"='NA' THEN "cntd_sid" ELSE 0 END) AS "NOT_ENROLLED",
+        SUM(CASE WHEN "Act2enroll_days_grp"='first_30d' THEN "cntd_sid" ELSE 0 END) AS "ENROLLED_30D",
+        SUM(CASE WHEN "Act2enroll_days_grp"='31-60d' THEN "cntd_sid" ELSE 0 END) AS "ENROLLED_31D_TO_60D",
+        SUM(CASE WHEN "Act2enroll_days_grp"='>60d' THEN "cntd_sid" ELSE 0 END) AS "ENROLLED_61D_MORE"
+    FROM "CUSTOMER_OPS"."ORR_GA_AP_BRAND_MONTHLY_SUMM4X"
+    WHERE "BRAND" = '{{brand}}'
+    AND "day_act_dt" >= TIMESTAMP '{{start_date}}'
+    AND "day_act_dt" < TIMESTAMP '{{end_date}}'
+    GROUP BY "BRAND", "day_act_dt"
+    ORDER BY "BRAND", "day_act_dt" ASC
+) AS subquery
+"""
+
+CREATE_TABLE_QUERY_AR = """
+CREATE OR REPLACE TABLE {{table_name}} 
+    ( 
+        ACTIVATION_DATE                      DATE, 
+        NOT_ENROLLED_PERCENT_FORECAST        FLOAT, 
+        ENROLLED_30D_PERCENT_FORECAST        FLOAT, 
+        ENROLLED_31D_TO_60D_PERCENT_FORECAST FLOAT, 
+        ENROLLED_61D_MORE_PERCENT_FORECAST   FLOAT, 
+        NOT_ENROLLED_FORECAST                FLOAT, 
+        ENROLLED_30D_FORECAST                FLOAT, 
+        ENROLLED_31D_TO_60D_FORECAST         FLOAT, 
+        ENROLLED_61D_MORE_FORECAST           FLOAT, 
+        BRAND                                VARCHAR(200) 
+    );
+"""
+
+
+SELECT_QUERY = """
+SELECT
+    "rl"."REPORTING_LINE" AS "BRAND",
+    "re"."REASON_CODE_DESCRIPTION" AS "DEACT_REASON",
+    DATE_TRUNC('DAY', CAST("dh"."DEACTIVATION_DATE" AS date)) AS "SUSPENSION_DATE",
+    DAYOFWEEK(CAST("dh"."DEACTIVATION_DATE" AS date)) AS "DOW_SUSPENSION_DT",
+    DAY(CAST("dh"."DEACTIVATION_DATE" AS date)) AS "DOM_SUSPENSION_DT",
+    DATEADD('DAY', 30, CAST("dh"."DEACTIVATION_DATE" AS date)) AS "DISCONNECT_DATE",
+    DAYOFWEEK(CAST(DATEADD('DAY', 30, "dh"."DEACTIVATION_DATE") AS date)) AS "DOW_DISCONNECT_DT",
+    DAY(CAST(DATEADD('DAY', 30, "dh"."DEACTIVATION_DATE") AS date)) AS "DOM_DISCONNECT_DT",
+    SUM("dh"."ROW_COUNT") AS "DEACT_COUNT"
+FROM "THOUGHTSPOTDB"."TRACFONE"."FT_DEACTIVATION_HISTORY" "dh"
+INNER JOIN "THOUGHTSPOTDB"."TRACFONE"."DT_REPORTING_LINE" "rl"
+    ON "dh"."REPORTING_LINE_ID" = "rl"."REPORTING_LINE_ID"
+INNER JOIN "THOUGHTSPOTDB"."TRACFONE"."DT_REASON" "re"
+    ON "dh"."REASON_CODE_ID" = "re"."REASON_CODE_ID"
+WHERE 1=1
+    AND "dh"."DEACTIVATION_DATE" >= TIMESTAMP '{{start_date}}'    --2023-01-01 00:00:00.0'
+    AND "dh"."DEACTIVATION_DATE" < TIMESTAMP '{{end_date}}'       --2024-01-01 00:00:00.0'
+    AND "re"."REASON_CODE_DESCRIPTION" = '{{reason}}'             --'PASTDUE'
+    AND "rl"."REPORTING_LINE" = '{{brand}}'                       --'STRAIGHT TALK'
+GROUP BY
+    "rl"."REPORTING_LINE",
+    "re"."REASON_CODE_DESCRIPTION",
+    DATE_TRUNC('DAY', CAST("dh"."DEACTIVATION_DATE" AS date)),
+    DAYOFWEEK(CAST("dh"."DEACTIVATION_DATE" AS date)),
+    DAY(CAST("dh"."DEACTIVATION_DATE" AS date)),
+    DATEADD('DAY', 30, CAST("dh"."DEACTIVATION_DATE" AS date)),
+    DAYOFWEEK(CAST(DATEADD('DAY', 30, "dh"."DEACTIVATION_DATE") AS date)),
+    DAY(CAST(DATEADD('DAY', 30, "dh"."DEACTIVATION_DATE") AS date))
+ORDER BY "BRAND", "SUSPENSION_DATE";
+"""
+
+SUMMARY_QUERY = """
+WITH DailyChurn AS (
+    SELECT 
+        "BRAND",
+        "DEACT_REASON",
+        "DISCONNECT_DATE",
+        EXTRACT(MONTH FROM "DISCONNECT_DATE") AS "MONTH",
+        EXTRACT(DAY FROM "DISCONNECT_DATE") AS "DAY_OF_MONTH",
+        EXTRACT(DAYOFWEEK FROM "DISCONNECT_DATE") AS "DAY_OF_WEEK",
+        SUM("DEACTS") AS "DEACT_COUNT",
+        SUM(CASE WHEN "DEACTS" = 1 AND "REACTS" = 1 THEN 1 ELSE 0 END) AS "REACT_COUNT",
+        SUM(CASE WHEN "DEACTS" = 1 AND "REACTS" = 0 THEN 1 ELSE 0 END) AS "CHURNED_COUNT",
+        ROUND((SUM(CASE WHEN "DEACTS" = 1 AND "REACTS" = 0 THEN 1 ELSE 0 END) / SUM("DEACTS")) * 100, 2) AS "CHURNED_PERCENTAGE"
+    FROM (
+        SELECT
+            "rl"."REPORTING_LINE" "BRAND",
+            CAST("dr"."DEACTIVATION_DATE" AS date) "DISCONNECT_DATE",
+            "dr"."DEACTIVATION_REASON",
+            "dr"."DEACT_REASON",
+            DATEADD('DAY', -30, CAST("dr"."DEACTIVATION_DATE" AS date)) AS "SUSPENSION_DATE",
+            "rd"."DEACTS",
+            "rd"."REACTS",
+            "rd"."ADJUSTS",
+            "rd"."PHONE_ID"
+        FROM "THOUGHTSPOTDB"."TRACFONE"."RETENTION_CHURN_DETAIL" "rd"
+        LEFT OUTER JOIN "THOUGHTSPOTDB"."TRACFONE"."DT_REPORTING_LINE" "rl"
+            ON "rd"."REPORTING_LINE_ID" = "rl"."REPORTING_LINE_ID"
+        LEFT OUTER JOIN "THOUGHTSPOTDB"."TRACFONE"."CHURN_DEACTIVATION_REASON" "dr"
+            ON ("rd"."REPORT_DATE" = "dr"."REPORT_DATE" AND "rd"."PHONE_ID" = "dr"."PHONE_ID")
+        WHERE 1=1
+            AND "rd"."REPORT_DATE" >= TIMESTAMP '{{start_date}}'
+            AND "rd"."REPORT_DATE" <  TIMESTAMP '{{end_date}}'
+            AND "rl"."REPORTING_LINE" = '{{brand}}'
+            AND "dr"."DEACT_REASON" =  'PASTDUE SUSPENSION'
+            AND "dr"."DEACTIVATION_REASON" = 'PASTDUE'
+          --AND "rd"."DEACTS" = 1
+          --AND "rd"."REACTS" = 0
+    )
+    GROUP BY
+        "BRAND",
+        "DEACT_REASON",
+        "DISCONNECT_DATE"
+)
+SELECT
+  --"MONTH",
+    "{{method}}", --DAY_OF_WEEK or DAY_OF_MONTH
+    ROUND(AVG("CHURNED_PERCENTAGE"),4) AS "AVG_CHURNED_PERCENTAGE"
+FROM DailyChurn
+GROUP BY
+  --"MONTH",
+    "{{method}}"
+ORDER BY
+  --"MONTH",
+    "{{method}}"
+"""
+
+CREATE_TABLE_QUERY = """
+CREATE OR REPLACE TABLE {table_name} (
+    BRAND                 VARCHAR(50),
+    DEACT_REASON          VARCHAR(100),
+    SUSPENSION_DATE       DATE,
+    DOW_SUSPENSION_DT     INTEGER,
+    DOM_SUSPENSION_DT     INTEGER,
+    DISCONNECT_DATE       DATE,
+    DOW_DISCONNECT_DT     INTEGER,
+    DOM_DISCONNECT_DT     INTEGER,
+    DEACT_COUNT           INTEGER
+);
+"""
+# Add more queries if needed...
+

@@ -1,0 +1,158 @@
+columns: ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'Price_return', 'Open_return',
+       'High_return', 'Low_return', 'SMA_10', 'SMA_30', 'EMA_10', 'EMA_30',
+       'Volatility_10', 'Volatility_30', 'daily_return', 'y_diff',
+       'SMA_2_diff', 'EMA_2_diff', 'Volatility_2_diff', 'SMA_7_diff',
+       'EMA_7_diff', 'Volatility_7_diff', 'SMA_30_diff', 'EMA_30_diff',
+       'Volatility_30_diff', 'SMA_60_diff', 'EMA_60_diff',
+       'Volatility_60_diff', 'SMA_2', 'EMA_2', 'Volatility_2', 'SMA_7',
+       'EMA_7', 'Volatility_7', 'SMA_60', 'EMA_60', 'Volatility_60']
+
+data_path: "data/xauusd/xauusd_7h_2009.csv"  # Path to CSV file
+date_col: "DATE"  # Column name for dates
+start_date: ""  # Start date for filtering (empty for all)
+end_date: ""  # End date for filtering (empty for all)
+target_col: "HIGH"  # Primary target column
+problem_type: "univariate"  # ["univariate", "multivariate"]
+test_size: 15  # Number of samples for testing
+model_dir: "models"  # Directory to save models
+log_dir: "logs"  # Directory for logs
+n_steps: 15  # Lookback window size
+m_steps: 1  # Forecast horizon
+horizon: 15  # Maximum forecast steps
+split_ratio: 0.8  # Train/validation split ratio [0.1-0.95]
+exclude_cols: []  # Columns to exclude from dataset
+input_features: ['HIGH','y_diff','Price_return', 'Open_return']  # Input features
+target_features: ['y_diff','Price_return', 'Open_return']  # Target features
+batch_size: 32  # [16, 32, 64, 128, 256]
+epochs: 80  # Training epochs [10-500]
+seasonal_period: 15  # Seasonal period for decomposition [1-365]
+lags: [2, 7, 30, 60]  # Lag periods for features
+rolling_windows: [2, 7, 30, 60]  # Rolling window sizes
+xgb_future_method: 'recursive'  # ['recursive', 'direct', 'multioutput']
+inference_batches: 1  # Number of batches for inference
+watermark_path: 'vrz.png'  # Path to watermark image
+watermark_size: 70  # Watermark size in pixels
+watermark_opacity: 0.1  # Watermark opacity [0-1]
+records: 1000  # Max records to load
+
+# =============================================================================
+# NEW: Output Configuration
+# =============================================================================
+output:
+  # Output format: 'pdf' for PDF report, 'csv' for CSV file, 'parquet' for Parquet file
+  format: 'pdf'  # Options: ['pdf', 'csv', 'parquet']
+  # Directory for output files
+  directory: 'reports'
+  # Filename prefix for output files
+  filename_prefix: 'forecast_report'
+
+# =============================================================================
+# NEW: Model Selection Configuration
+# =============================================================================
+models_to_run:
+  # Univariate models (used when problem_type is 'univariate')
+  univariate:
+    - ulr          # Univariate Linear Regression
+  #  - svr          # Support Vector Regression
+    - nbeats       # N-BEATS Neural Network
+  # Multivariate models (used when problem_type is 'multivariate')  
+
+
+# =============================================================================
+# NEW: Confidence Level Configuration
+# =============================================================================
+confidence:
+  enabled: true  # Enable confidence level prediction for forecasts
+  # Confidence threshold - forecasts below this probability are flagged as uncertain
+  threshold: 0.5
+  # Number of estimators for the Random Forest discriminator
+  n_estimators: 100
+  # Max depth for the Random Forest discriminator
+  max_depth: 10
+  # Test size for discriminator training
+  test_size: 0.4
+
+# =============================================================================
+# NEW: Forecast Validation Configuration
+# =============================================================================
+forecast_validation:
+  # Enable explosion detection for forecasts
+  enabled: true
+  # Maximum allowed deviation from last real data point (as percentage)
+  max_deviation_percent: 50.0
+  # Maximum allowed growth rate between consecutive forecasts
+  max_growth_rate: 2.0
+
+cache:
+  enabled: true  # [true, false]
+  directory: "./joblib_cache"  # Cache directory
+  size_limit_mb: 12480  # Cache size limit in MB
+
+# N-BEATS model configuration
+nbeats:
+  model_type: "interpretable"  # ["interpretable", "blackbox"]
+  hidden_size: 512  # [128, 256, 512, 1024]
+  epochs: 100  # [10-500]
+  batch_size: 32  # [16, 32, 64, 128]
+  learning_rate: 0.001  # [0.00001, 0.0001, 0.001, 0.01, 0.1]
+  patience_es: 20  # Early stopping patience [1-100]
+  patience_rlr: 10  # ReduceLROnPlateau patience [1-50]
+  stacks_config:
+    - type: "trend"  # ["trend", "seasonality"]
+      num_blocks: 3  # [1-10]
+      hidden_size: 256  # [64, 128, 256, 512]
+      degree: 3  # Polynomial degree [1-5]
+    - type: "seasonality"  # ["trend", "seasonality"]
+      num_blocks: 3  # [1-10]
+      hidden_size: 256  # [64, 128, 256, 512]
+      num_harmonics: 6  # [1-20]
+  blackbox_config:
+    num_blocks: 4  # [1-20]
+    num_layers: 4  # [1-10]
+  device: "cpu"  # ["cpu", "cuda"]
+
+# SVR model configuration
+#svr:
+#  kernel: "rbf"  # ["linear", "poly", "rbf", "sigmoid"]
+#  C: 1.0  # Regularization parameter [0.01, 0.1, 1, 10, 100, 1000]
+#  epsilon: 0.1  # Epsilon in epsilon-SVR [0.01, 0.05, 0.1, 0.2, 0.5]
+#  gamma: "scale"  # ["scale", "auto"] or float value [0.001, 0.01, 0.1, 1, 10]
+#  max_iter: 10000  # Maximum iterations [-1, 100, 1000, 10000, 50000]
+#  degree: 3  # Degree for polynomial kernel [1, 2, 3, 4, 5]
+#  coef0: 0.0  # Independent term in kernel [0.0, 0.1, 0.5, 1.0]
+#  shrinking: true  # [true, false]
+#  tol: 0.001  # Tolerance for stopping criterion [0.0001, 0.001, 0.01, 0.1]
+#  cache_size: 200  # Cache size in MB [100, 200, 500, 1000]
+#  verbose: false  # [true, false]
+#
+## XGBoost model configuration
+#xgboost:
+#  n_estimators: 100  # [50, 100, 200, 500]
+#  max_depth: 6  # [3, 5, 6, 8, 10]
+#  learning_rate: 0.1  # [0.01, 0.05, 0.1, 0.2]
+#  subsample: 0.8  # [0.6, 0.8, 1.0]
+#  colsample_bytree: 0.8  # [0.6, 0.8, 1.0]
+#  gamma: 0  # [0, 0.1, 0.2]
+#  reg_alpha: 0  # [0, 0.1, 1]
+#  reg_lambda: 1  # [0, 1, 10]
+#
+## Prophet model configuration
+#prophet:
+#  growth: 'linear'  # ['linear', 'logistic']
+#  seasonality_mode: 'multiplicative'  # ['additive', 'multiplicative']
+#  yearly_seasonality: true
+#  weekly_seasonality: true
+#  daily_seasonality: false
+#  changepoint_prior_scale: 0.05  # [0.001, 0.01, 0.05, 0.1, 0.5]
+#  seasonality_prior_scale: 10.0  # [1, 10, 20]
+#
+## LSTM/CNN-BiLSTM model configuration
+#lstm:
+#  conv_filters: 32  # [16, 32, 64]
+#  lstm_units: 20  # [10, 20, 50, 100]
+#  epochs: 20  # [10, 20, 50]
+#  batch_size: 30  # [16, 32, 64]
+#  learning_rate: 0.001  # [0.0001, 0.001, 0.01]
+#  patience_es: 30  # Early stopping patience
+#  patience_rlr: 5  # ReduceLROnPlateau patience
+#  seed: 42  # Random seed

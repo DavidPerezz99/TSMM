@@ -1,0 +1,10 @@
+# test_sweep.yaml
+n_steps: [28, 57]
+m_steps: [5]
+input_target_sets:
+  - input_features: ['LOW','y_diff']
+    target_features: ['y_diff']
+svr:
+  kernel: ["rbf", "linear"]  # Test both kernels
+  C: [1.0]                   # Single C value
+  gamma: ["scale"]           # Single gamma    

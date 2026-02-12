@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Data and cache
+data/
+joblib_cache/
+logs/
+output/
+reports/
+experiments/
+model_files/
+*.log
+
+# Checkpoints
+*.ckpt
+*.h5
+TSMM_sourceCode.txt
+http_cache.sqlite
+bulk_execution_command.txt
