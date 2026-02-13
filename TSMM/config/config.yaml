@@ -13,12 +13,12 @@ start_date: ""  # Start date for filtering (empty for all)
 end_date: ""  # End date for filtering (empty for all)
 target_col: "HIGH"  # Primary target column
 problem_type: "univariate"  # ["univariate", "multivariate"]
-test_size: 15  # Number of samples for testing
+test_size: 30  # Number of samples for testing
 model_dir: "models"  # Directory to save models
 log_dir: "logs"  # Directory for logs
 n_steps: 15  # Lookback window size
 m_steps: 1  # Forecast horizon
-horizon: 15  # Maximum forecast steps
+horizon: 4  # Maximum forecast steps
 split_ratio: 0.8  # Train/validation split ratio [0.1-0.95]
 exclude_cols: []  # Columns to exclude from dataset
 input_features: ['HIGH','y_diff','Price_return', 'Open_return']  # Input features
@@ -33,7 +33,7 @@ inference_batches: 1  # Number of batches for inference
 watermark_path: 'vrz.png'  # Path to watermark image
 watermark_size: 70  # Watermark size in pixels
 watermark_opacity: 0.1  # Watermark opacity [0-1]
-records: 1000  # Max records to load
+records: 5000  # Max records to load
 
 # =============================================================================
 # NEW: Output Configuration

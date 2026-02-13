@@ -397,6 +397,32 @@ def train_confidence_discriminator(
         return None
     
     try:
+        # Align X_test samples with y_test length to avoid index errors.
+        # In some evaluation flows (e.g., ULR), X_test may represent a
+        # single window or a shorter sequence than the number of labeled
+        # samples in y_test/y_pred. We tile or repeat X_test so that
+        # find_misclassifications can safely index it using sample indices
+        # derived from y_test.
+        try:
+            n_samples = y_test.shape[0]
+        except Exception:
+            n_samples = None
+
+        if n_samples is not None and isinstance(X_test, np.ndarray):
+            # Ensure at least 2D
+            if X_test.ndim == 1:
+                X_test = X_test.reshape(-1, 1)
+
+            if X_test.ndim == 2 and X_test.shape[0] != n_samples:
+                if X_test.shape[0] == 1:
+                    # Single window: repeat for all samples
+                    X_test = np.repeat(X_test, n_samples, axis=0)
+                else:
+                    # Tile rows to cover all samples, then truncate
+                    reps = int(np.ceil(n_samples / X_test.shape[0]))
+                    X_tiled = np.tile(X_test, (reps, 1))
+                    X_test = X_tiled[:n_samples]
+
         discriminator = ConfidenceDiscriminator(
             n_estimators=confidence_config.get('n_estimators', 100),
             max_depth=confidence_config.get('max_depth', 10),
