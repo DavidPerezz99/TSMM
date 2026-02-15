@@ -106,7 +106,7 @@ class CompactPDFReport(FPDF):
         output_path : str
             Path to save the PDF report
         """
-        self._add_summary_page(models_data)
+        self._add_summary_page(models_data, evaluation)
         
         for model_name in models_data.keys():
             self._add_model_page(
@@ -118,7 +118,7 @@ class CompactPDFReport(FPDF):
         
         self.output(output_path)
     
-    def _add_summary_page(self, models_data):
+    def _add_summary_page(self, models_data, evaluation):
         """Page 1: Model summary table and parameters."""
         self.add_page()
         self.set_font('Arial', 'B', 16)
@@ -136,7 +136,9 @@ class CompactPDFReport(FPDF):
         
         self.set_font('Arial', '', 9)
         for model_name, model_data in models_data.items():
-            metrics = model_data.get('metrics', {})
+            metrics = (evaluation.get(model_name, {}) or {}).get('metrics', {})
+            if not metrics:
+                metrics = model_data.get('metrics', {})
             display_name = model_name[:18] + "..." if len(model_name) > 20 else model_name
             
             mae = metrics.get('MAE', 'N/A')
@@ -161,7 +163,7 @@ class CompactPDFReport(FPDF):
         
         # Confusion Matrix Summary (if available)
         has_cm = any(
-            'confusion_matrix' in models_data.get(m, {}) and models_data[m].get('confusion_matrix')
+            (evaluation.get(m, {}) or {}).get('confusion_matrix')
             for m in models_data.keys()
         )
         
@@ -180,7 +182,7 @@ class CompactPDFReport(FPDF):
             
             self.set_font('Arial', '', 9)
             for model_name, model_data in models_data.items():
-                cm_data = model_data.get('confusion_matrix', {})
+                cm_data = (evaluation.get(model_name, {}) or {}).get('confusion_matrix', {})
                 if cm_data:
                     display_name = model_name[:15] + "..." if len(model_name) > 17 else model_name
                     
@@ -260,15 +262,15 @@ class CompactPDFReport(FPDF):
         self.ln(5)
         
         # Add confusion matrix metrics if available
-        self._add_confusion_matrix_box(model_data)
+        self._add_confusion_matrix_box(evaluation_data)
         self.ln(5)
         
         # Add confidence levels if available
-        self._add_confidence_box(model_data)
+        self._add_confidence_box(evaluation_data)
         self.ln(5)
         
         # Add explosion detection if available
-        self._add_explosion_detection_box(model_data)
+        self._add_explosion_detection_box(evaluation_data)
         self.ln(5)
         
         # Add all model plots
@@ -352,9 +354,9 @@ class CompactPDFReport(FPDF):
             else:
                 self.ln(6)
     
-    def _add_confusion_matrix_box(self, model_data):
+    def _add_confusion_matrix_box(self, evaluation_data):
         """Add confusion matrix metrics in a box."""
-        cm_data = model_data.get('confusion_matrix', {})
+        cm_data = evaluation_data.get('confusion_matrix', {})
         
         if not cm_data or not any(k in cm_data for k in ['accuracy', 'precision', 'recall', 'f1']):
             return
@@ -401,9 +403,9 @@ class CompactPDFReport(FPDF):
         self.cell(47, 5, f"False Positives: {fp}", 0, 0, 'L')
         self.cell(47, 5, f"False Negatives: {fn}", 0, 1, 'L')
     
-    def _add_confidence_box(self, model_data):
+    def _add_confidence_box(self, evaluation_data):
         """Add confidence level information."""
-        confidence_levels = model_data.get('confidence_levels', [])
+        confidence_levels = evaluation_data.get('confidence_levels', [])
         
         if not confidence_levels:
             return
@@ -425,9 +427,9 @@ class CompactPDFReport(FPDF):
         self.cell(63, 5, f"Min: {min_conf:.3f}", 0, 0, 'C')
         self.cell(63, 5, f"Max: {max_conf:.3f}", 0, 1, 'C')
     
-    def _add_explosion_detection_box(self, model_data):
+    def _add_explosion_detection_box(self, evaluation_data):
         """Add explosion detection results."""
-        explosion_data = model_data.get('explosion_detection', {})
+        explosion_data = evaluation_data.get('explosion_detection', {})
         
         if not explosion_data or not explosion_data.get('checks_performed'):
             return
@@ -456,15 +458,29 @@ class CompactPDFReport(FPDF):
         self.cell(95, 5, f"Growth Violations: {growth_violations}", 0, 1, 'C')
     
     def _add_all_model_plots(self, model_name, model_data, evaluation_data, forecast_data):
-        """Add ALL plots for a specific model."""
+        """Add model plots, excluding training-fit/training-history figures.
+
+        Report policy:
+        - Include validation/evaluation plots
+        - Include confidence/confusion related plots from evaluation
+        - Include interpretability plots
+        - Exclude training-only plots
+        """
         all_figures = []
-        
-        if 'figures' in model_data and model_data['figures']:
-            all_figures.extend(model_data['figures'])
-        
+
+        # Evaluation figures already exclude training-only plots (kept in
+        # evaluation_data['training_figures']).
         if 'figures' in evaluation_data and evaluation_data['figures']:
             all_figures.extend(evaluation_data['figures'])
-        
+
+        # Include interpretability figures explicitly
+        interp = model_data.get('interpretability', {}) or {}
+        for method_key in ('permutation', 'integrated_gradients', 'shap'):
+            method_data = interp.get(method_key, {}) or {}
+            fig_path = method_data.get('figure_path')
+            if fig_path:
+                all_figures.append(fig_path)
+
         if 'plot_path' in forecast_data and forecast_data['plot_path']:
             all_figures.append(forecast_data['plot_path'])
         
@@ -485,41 +501,33 @@ class CompactPDFReport(FPDF):
         self.ln(5)
         
         plots_added = 0
-        plots_per_row = 2 
-        current_row_plots = 0
         
         for i, fig_path in enumerate(unique_figures):
             try:
                 plot_name = os.path.basename(fig_path).replace('.png', '').replace('_', ' ').title()
-                
-                if self.get_y() > self.HEIGHT - 80:
+
+                # One-plot-per-row layout to prevent overlap
+                required_height = 75
+                if self.get_y() > self.HEIGHT - required_height:
                     self.add_page()
                     self.set_y(30)
-                    current_row_plots = 0
-                
-                if current_row_plots == 0:
-                    x_pos = 10
-                    y_pos = self.get_y()
-                else:
-                    x_pos = 105
-                    y_pos = self.get_y() - 55  
-                
+
+                x_pos = 10
+                y_pos = self.get_y()
+
                 self.set_xy(x_pos, y_pos)
                 self.set_font('Arial', 'B', 9)
                 
-                if len(plot_name) > 25:
-                    plot_name = plot_name[:22] + "..."
-                self.cell(95, 5, plot_name, 0, 1, 'C')
+                if len(plot_name) > 50:
+                    plot_name = plot_name[:47] + "..."
+                self.cell(190, 5, plot_name, 0, 1, 'C')
                 
                 self.set_xy(x_pos, y_pos + 5)
-                self.image(fig_path, x=x_pos, w=95, h=50)
-                
-                current_row_plots += 1
+                self.image(fig_path, x=x_pos, w=190, h=65)
+
                 plots_added += 1
-                
-                if current_row_plots == plots_per_row:
-                    self.set_y(y_pos + 60)  
-                    current_row_plots = 0
+
+                self.set_y(y_pos + 72)
                 
                 try:
                     os.remove(fig_path)
@@ -532,9 +540,6 @@ class CompactPDFReport(FPDF):
                 self.cell(0, 6, f"Error displaying plot: {os.path.basename(fig_path)}", 0, 1)
                 self.ln(3)
 
-        if current_row_plots > 0:
-            self.set_y(self.get_y() + 10)
-        
         if forecast_data and 'forecast_days' in forecast_data:
             self.ln(10)
             self.set_font('Arial', 'B', 12)

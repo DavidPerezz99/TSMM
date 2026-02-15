@@ -658,6 +658,7 @@ def evaluate_models(models, df, config):
             'metrics': {},
             'exog_metrics': {},
             'figures': [],
+            'training_figures': [],
             'confusion_matrix': {},
             'classification_report': {},
             'confidence_levels': [],
@@ -744,7 +745,7 @@ def evaluate_models(models, df, config):
                             y_val_pred[:train_size, 0],
                             title=f"{model_name.upper()} - Training Fit: {target_features[0]}"
                         )
-                        model_eval['figures'].append(train_path)
+                        model_eval['training_figures'].append(train_path)
 
                     # 2. Validation/Test fit plot
                     fig, val_path = save_true_vs_pred_1d(
@@ -890,7 +891,7 @@ def evaluate_models(models, df, config):
                             train_path = tmpfile.name
                         plt.savefig(train_path, bbox_inches='tight')
                         plt.close()
-                        model_eval['figures'].append(train_path)
+                        model_eval['training_figures'].append(train_path)
 
                     # 2. Validation plot
                     fig, val_path = save_true_vs_pred_1d(
@@ -1016,7 +1017,7 @@ def evaluate_models(models, df, config):
                             y_val_pred[:train_size, 0],
                             title=f"SVR - Training Fit: {target_features[0]}"
                         )
-                        model_eval['figures'].append(train_path)
+                        model_eval['training_figures'].append(train_path)
 
                     # 2. Validation plot
                     fig, val_path = save_true_vs_pred_1d(

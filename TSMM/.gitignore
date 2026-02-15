@@ -30,4 +30,3 @@ model_files/
 TSMM_sourceCode.txt
 http_cache.sqlite
 bulk_execution_command.txt
-config/snowflake_credentials.yaml

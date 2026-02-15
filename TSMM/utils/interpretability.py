@@ -188,7 +188,7 @@ def _sequence_permutation_importance(
         plt.xlabel("Permutation Importance (ΔMSE)")
         plt.title(f"{model_name.upper()} - Permutation Importance (Top Features)")
         plt.gca().invert_yaxis()
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(prefix=f"interp_perm_{model_name}_", suffix=".png", delete=False) as tmp:
             fig_path = tmp.name
         plt.tight_layout()
         plt.savefig(fig_path, bbox_inches="tight")
@@ -200,7 +200,8 @@ def _sequence_permutation_importance(
     return {
         "top_features": [
             {"feature": feat, "importance": float(val)} for feat, val in top_items
-        ]
+        ],
+        "figure_path": fig_path if 'fig_path' in locals() else None
     }
 
 
@@ -294,7 +295,7 @@ def _nbeats_integrated_gradients(
         plt.xlabel("Integrated Gradients |attribution|")
         plt.title("N-BEATS - Integrated Gradients (Top Features)")
         plt.gca().invert_yaxis()
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(prefix="interp_ig_nbeats_", suffix=".png", delete=False) as tmp:
             fig_path = tmp.name
         plt.tight_layout()
         plt.savefig(fig_path, bbox_inches="tight")
@@ -306,7 +307,8 @@ def _nbeats_integrated_gradients(
     return {
         "top_features": [
             {"feature": feat, "attribution": float(val)} for feat, val in top_items
-        ]
+        ],
+        "figure_path": fig_path if 'fig_path' in locals() else None
     }
 
 
@@ -442,7 +444,7 @@ def _xgboost_shap_importance(
             plt.xlabel("Mean |SHAP value|")
             plt.title("XGBoost - SHAP Feature Importance (Top Features)")
             plt.gca().invert_yaxis()
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(prefix="interp_shap_xgboost_", suffix=".png", delete=False) as tmp:
                 fig_path = tmp.name
             plt.tight_layout()
             plt.savefig(fig_path, bbox_inches="tight")
@@ -454,7 +456,8 @@ def _xgboost_shap_importance(
         return {
             "top_features": [
                 {"feature": feat, "importance": float(val)} for feat, val in top_feats
-            ]
+            ],
+            "figure_path": fig_path if 'fig_path' in locals() else None
         }
 
     except Exception as e:  # pragma: no cover - defensive

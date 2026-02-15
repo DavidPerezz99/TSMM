@@ -90,6 +90,11 @@ def find_misclassifications(
     tuple
         (misclassified_data, misclassified_indices, correct_indices)
     """
+    # Ensure array-like and at least 2D for safe indexing
+    X_test = np.asarray(X_test)
+    if X_test.ndim == 1:
+        X_test = X_test.reshape(-1, 1)
+
     # Extract the relevant target column
     if y_test.ndim > 1:
         y_actual = y_test[:, target_index]
@@ -408,7 +413,9 @@ def train_confidence_discriminator(
         except Exception:
             n_samples = None
 
-        if n_samples is not None and isinstance(X_test, np.ndarray):
+        if n_samples is not None:
+            X_test = np.asarray(X_test)
+
             # Ensure at least 2D
             if X_test.ndim == 1:
                 X_test = X_test.reshape(-1, 1)
