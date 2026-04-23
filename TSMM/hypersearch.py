@@ -19,10 +19,11 @@ import asyncio
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Iterator
 import yaml
@@ -449,14 +450,128 @@ def generate_factorial_experiments(
 class BulkSearchEngine:
     """Engine for running bulk hyperparameter searches."""
     
-    def __init__(self, base_cfg, sweep_cfg, out_dir, sem):
+    def __init__(self, base_cfg, sweep_cfg, out_dir, sem, summary_dir=None, restart=False, experiment_timeout_sec=None):
         self.base_cfg = base_cfg
         self.sweep_cfg = sweep_cfg
         self.out_dir = Path(out_dir)
+        self.summary_dir = Path(summary_dir) if summary_dir else self.out_dir
         self.sem = sem
+        self.restart = bool(restart)
+        self.experiment_timeout_sec = experiment_timeout_sec
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.summary_dir.mkdir(parents=True, exist_ok=True)
+        self.failure_log_dir = self.out_dir / "failed_logs"
+        self.failure_log_dir.mkdir(parents=True, exist_ok=True)
+        self.summary_dirs = [self.summary_dir]
+        if self.out_dir.resolve() != self.summary_dir.resolve():
+            self.summary_dirs.append(self.out_dir)
         self.jobs = []
         clear_cache()
+
+    def _parse_cfg_index(self, cfg_path: Path) -> int:
+        """Extract numeric index from cfg filename for stable ordering."""
+        match = re.match(r"cfg_(\d+)", cfg_path.stem)
+        return int(match.group(1)) if match else 10**12
+
+    def _sorted_cfg_paths(self, cfg_paths: List[Path]) -> List[Path]:
+        """Sort config files by their generated numeric index."""
+        return sorted(cfg_paths, key=lambda p: (self._parse_cfg_index(p), p.name))
+
+    def _existing_cfg_paths(self) -> List[Path]:
+        """Return existing generated config files, ordered by run index."""
+        return self._sorted_cfg_paths(list(self.out_dir.glob("cfg_*.yaml")))
+
+    def _latest_summary_info(self, cfg_stem: str) -> Optional[Dict[str, Any]]:
+        """Load latest summary artifact for a config stem across known summary dirs."""
+        candidates = []
+        for directory in self.summary_dirs:
+            if not directory.exists():
+                continue
+            candidates.extend(directory.glob(f"{cfg_stem}__summary.json"))
+            candidates.extend(directory.glob(f"{cfg_stem}__*__summary.json"))
+
+        if not candidates:
+            return None
+
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        status = None
+        try:
+            with latest.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            status = payload.get("status")
+        except Exception:
+            status = None
+
+        return {
+            "path": latest,
+            "status": status,
+            "is_failed_suffix": latest.name.endswith("__failed__summary.json"),
+            "is_no_metrics_suffix": latest.name.endswith("__no_metrics__summary.json")
+        }
+
+    def _is_cfg_complete(self, cfg_path: Path) -> bool:
+        """A config is complete only when its latest summary is SUCCESS."""
+        info = self._latest_summary_info(cfg_path.stem)
+        if info is None:
+            return False
+        if info["is_failed_suffix"] or info["is_no_metrics_suffix"]:
+            return False
+        return info.get("status") == "SUCCESS"
+
+    def _find_resume_start_idx(self, cfg_paths: List[Path]) -> Optional[int]:
+        """Find first config that needs execution, rerunning latest incomplete if needed."""
+        if not cfg_paths:
+            return None
+
+        if self.restart:
+            print("Restart requested: running all experiments from the beginning")
+            return 0
+
+        for idx, cfg_path in enumerate(cfg_paths):
+            if not self._is_cfg_complete(cfg_path):
+                latest = self._latest_summary_info(cfg_path.stem)
+                if latest is None:
+                    print(f"Resume: first pending experiment is {cfg_path.name} (no summary found)")
+                else:
+                    print(
+                        "Resume: first incomplete experiment is "
+                        f"{cfg_path.name} (latest status={latest.get('status')}, file={latest['path'].name})"
+                    )
+                return idx
+
+        return None
+
+    def _write_failure_log(self, cfg_path, cmd, returncode, stdout_text, stderr_text, stage="run"):
+        """Write a per-experiment failure log artifact for post-mortem debugging."""
+        payload = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "stage": stage,
+            "config": str(cfg_path),
+            "command": cmd,
+            "returncode": returncode,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+        }
+        out_file = self.failure_log_dir / f"{Path(cfg_path).stem}__failed__log.json"
+        with out_file.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
+
+    def _write_failed_summary(self, cfg_path, stage, error_text):
+        """Write fallback failed summary when search_mode cannot finish and persist one."""
+        summary_file = self.summary_dir / f"{Path(cfg_path).stem}__failed__summary.json"
+        payload = {
+            "config_path": str(Path(cfg_path).resolve()),
+            "status": "FAILED",
+            "metric": {
+                "run_error": {
+                    "stage": stage,
+                    "error": error_text
+                }
+            },
+            "wall_time": datetime.utcnow().timestamp()
+        }
+        with summary_file.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
 
     def expand_grid(self):
         """Yield {param: value} dictionaries for every combination."""
@@ -471,12 +586,17 @@ class BulkSearchEngine:
             return generate_factorial_experiments(self.base_cfg, self.sweep_cfg)
 
     def materialize_configs(self):
-        """Generate and save experiment configuration files."""
+        """Generate and save experiment configuration files, or reuse existing ones."""
+        existing = self._existing_cfg_paths()
+        if existing:
+            print(f"Found {len(existing)} existing config files in {self.out_dir}; reusing for resume")
+            return existing
+
         cfg_paths = []
         for idx, param_patch in enumerate(self.expand_grid(), 1):
             cfg = self.base_cfg.copy()
             deep_merge_dict(cfg, param_patch)
-            cfg_name = f"cfg_{idx:05d}_{uuid.uuid4().hex[:6]}.yaml"
+            cfg_name = f"cfg_{idx:05d}.yaml"
             cfg_path = self.out_dir / cfg_name
             yaml_dump(cfg, cfg_path)
             cfg_paths.append(cfg_path)
@@ -487,27 +607,120 @@ class BulkSearchEngine:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "-1"
         
-        cmd = [sys.executable, "search_mode.py", "--config", str(cfg_path)]
+        cmd = [
+            sys.executable,
+            "search_mode.py",
+            "--config",
+            str(cfg_path),
+            "--summary-dir",
+            str(self.summary_dir),
+            "--bulk-search"
+        ]
         async with self.sem:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, 
-                stdout=asyncio.subprocess.PIPE, 
-                stderr=asyncio.subprocess.PIPE,
-                env=env
-            )
-            out, err = await proc.communicate()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env
+                )
+            except Exception as exc:
+                self._write_failure_log(
+                    cfg_path=cfg_path,
+                    cmd=cmd,
+                    returncode=None,
+                    stdout_text="",
+                    stderr_text=str(exc),
+                    stage="spawn"
+                )
+                print(f"[{cfg_path.name}] finished -> FAIL")
+                print(f"Spawn failed: {exc}", file=sys.stderr)
+                return
+
+            try:
+                if self.experiment_timeout_sec:
+                    out, err = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=float(self.experiment_timeout_sec)
+                    )
+                else:
+                    out, err = await proc.communicate()
+            except asyncio.TimeoutError:
+                proc.kill()
+                out, err = await proc.communicate()
+                out_text = out.decode(errors="replace") if out else ""
+                err_text = err.decode(errors="replace") if err else ""
+                timeout_msg = (
+                    f"Experiment exceeded timeout of {self.experiment_timeout_sec} seconds "
+                    "and was terminated."
+                )
+                self._write_failure_log(
+                    cfg_path=cfg_path,
+                    cmd=cmd,
+                    returncode=None,
+                    stdout_text=out_text,
+                    stderr_text=f"{timeout_msg}\n{err_text}".strip(),
+                    stage="timeout"
+                )
+                self._write_failed_summary(
+                    cfg_path=cfg_path,
+                    stage="timeout",
+                    error_text=timeout_msg
+                )
+                print(f"[{cfg_path.name}] finished -> FAIL (TIMEOUT)")
+                return
+
+            out_text = out.decode(errors="replace") if out else ""
+            err_text = err.decode(errors="replace") if err else ""
             status = "OK" if proc.returncode == 0 else "FAIL"
             print(f"[{cfg_path.name}] finished -> {status}")
             if status == "FAIL":
-                print(err.decode()[:500], file=sys.stderr)
+                self._write_failure_log(
+                    cfg_path=cfg_path,
+                    cmd=cmd,
+                    returncode=proc.returncode,
+                    stdout_text=out_text,
+                    stderr_text=err_text,
+                    stage="run"
+                )
+                if err_text:
+                    print(err_text[:1000], file=sys.stderr)
+                elif out_text:
+                    print(out_text[:1000], file=sys.stderr)
 
     async def launch_all(self):
-        """Launch all experiments."""
-        cfg_paths = self.materialize_configs()
-        print(f"\nLaunching {len(cfg_paths)} experiments...")
+        """Launch all experiments, resuming from first incomplete config by default."""
+        cfg_paths = self._sorted_cfg_paths(self.materialize_configs())
+        start_idx = self._find_resume_start_idx(cfg_paths)
+
+        if start_idx is None:
+            print("All experiments already completed successfully. Nothing to run.")
+            return
+
+        pending_cfg_paths = cfg_paths[start_idx:]
+        print(f"\nLaunching {len(pending_cfg_paths)} experiments (of {len(cfg_paths)} total)...")
         print("-" * 60)
-        tasks = [asyncio.create_task(self._run_one(p)) for p in cfg_paths]
-        await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(self._run_one(p)) for p in pending_cfg_paths]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _find_latest_execution_dir(root_dir: Path) -> Optional[Path]:
+    """Find latest execution directory containing generated cfg files."""
+    if not root_dir.exists():
+        return None
+
+    if any(root_dir.glob("cfg_*.yaml")):
+        return root_dir
+
+    candidates = []
+    for child in root_dir.iterdir():
+        if child.is_dir() and any(child.glob("cfg_*.yaml")):
+            candidates.append(child)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 # -----------------------------------------------------------------------------
@@ -588,8 +801,11 @@ def main_cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run bulk search with smart experiment generation (recommended)
-  python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
+    # Run bulk search with smart experiment generation (creates isolated execution folder)
+    python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
+
+    # Resume the latest bulk execution folder
+    python hypersearch.py resume_bulk --configs-root experiments --max-parallel 4
   
   # Run bulk search with legacy factorial approach (NOT recommended - may create thousands of experiments)
   python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --legacy
@@ -604,9 +820,22 @@ Examples:
     sp = sub.add_parser("bulk_search", help="Run bulk hyperparameter search")
     sp.add_argument("--base-config", required=True, help="Path to base configuration file")
     sp.add_argument("--param-grid", required=True, help="Path to sweep definition file")
-    sp.add_argument("--output-dir", default="generated_cfgs", help="Directory for generated configs")
+    sp.add_argument("--output-dir", default="generated_cfgs", help="Root directory for isolated execution folders")
+    sp.add_argument("--session-name", default=None, help="Optional execution folder name inside --output-dir")
+    sp.add_argument("--summary-dir", default=None, help="Optional summary directory (defaults to the execution folder)")
     sp.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
+    sp.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
     sp.add_argument("--legacy", action="store_true", help="Use legacy factorial expansion (WARNING: may generate many experiments)")
+    sp.add_argument("--restart", action="store_true", help="Ignore resume and run all experiments from the beginning")
+
+    # dedicated resume for latest/incomplete bulk execution
+    sp_resume = sub.add_parser("resume_bulk", help="Resume the latest bulk hyperparameter execution")
+    sp_resume.add_argument("--configs-root", default="generated_cfgs", help="Root directory containing execution folders")
+    sp_resume.add_argument("--config-dir", default=None, help="Explicit execution config directory to resume")
+    sp_resume.add_argument("--summaries-root", default=None, help="Optional summaries root when different from configs root")
+    sp_resume.add_argument("--summary-dir", default=None, help="Explicit summary directory to use")
+    sp_resume.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
+    sp_resume.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
 
     # smart
     sp2 = sub.add_parser("smart_search", help="Rerun top configurations from previous experiments")
@@ -620,6 +849,12 @@ Examples:
     if args.mode == "bulk_search":
         base_cfg = yaml_load(args.base_config)
         sweep_cfg = yaml_load(args.param_grid)
+
+        session_name = args.session_name or datetime.now().strftime("bulk_%Y%m%d_%H%M%S")
+        execution_dir = Path(args.output_dir) / session_name
+        summary_dir = Path(args.summary_dir) if args.summary_dir else execution_dir
+        print(f"Execution folder: {execution_dir}")
+        print(f"Summary folder:   {summary_dir}")
         
         # Enable/disable smart generation
         if args.legacy:
@@ -629,7 +864,41 @@ Examples:
             sweep_cfg['smart_generation'] = True
             print("Using smart experiment generation (recommended)")
         
-        engine = BulkSearchEngine(base_cfg, sweep_cfg, args.output_dir, sem)
+        engine = BulkSearchEngine(
+            base_cfg,
+            sweep_cfg,
+            execution_dir,
+            sem,
+            summary_dir=summary_dir,
+            restart=args.restart,
+            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+        )
+        asyncio.run(engine.launch_all())
+
+    elif args.mode == "resume_bulk":
+        resume_cfg_dir = Path(args.config_dir) if args.config_dir else _find_latest_execution_dir(Path(args.configs_root))
+        if resume_cfg_dir is None:
+            raise SystemExit("[resume_bulk] No execution folder with cfg_*.yaml found.")
+
+        if args.summary_dir:
+            resume_summary_dir = Path(args.summary_dir)
+        elif args.summaries_root:
+            resume_summary_dir = Path(args.summaries_root) / resume_cfg_dir.name
+        else:
+            resume_summary_dir = resume_cfg_dir
+
+        print(f"Resuming config folder:  {resume_cfg_dir}")
+        print(f"Using summary folder:    {resume_summary_dir}")
+
+        engine = BulkSearchEngine(
+            {},
+            {"smart_generation": True},
+            resume_cfg_dir,
+            sem,
+            summary_dir=resume_summary_dir,
+            restart=False,
+            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+        )
         asyncio.run(engine.launch_all())
 
     elif args.mode == "smart_search":

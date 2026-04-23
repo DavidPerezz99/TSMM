@@ -1,0 +1,127 @@
+# Trading Agent configuration (deterministic decision engine)
+
+agent:
+  enabled: true
+  # mode_a: planning/report only
+  # mode_b: active management/execution (requires broker + served models)
+  mode: "mode_a"
+
+  # User policy: Mode A first by default
+  default_start_mode_a: true
+
+  # Whether each action must be manually confirmed.
+  # If false and mode_b active, agent may execute without per-action confirmation.
+  confirm_live_execution: true
+
+  timezone: "America/Bogota"
+
+mode_a:
+  enabled: true
+  max_operations_per_session: 1
+  allow_long: true
+  allow_short: true
+  # Optional explicit model selection for trading-plan generation.
+  # If empty, the app picks the best model by MAE.
+  selected_model: ""
+  use_llm_explanation: false  # Narrative only. Decision logic remains deterministic.
+
+mode_b:
+  enabled: false
+  allow_open_new_positions: true
+  manage_existing_positions: true
+  poll_seconds: 60
+  allow_endpoint_signals: true
+  interrupt_flag_path: "reports/runtime/mode_b_interrupt.flag"
+
+  operation_limits:
+    per_timeframe:
+      "10m": 2
+      "30m": 2
+      "1h": 2
+      "3h": 2
+      "7h": 1
+      "12h": 1
+      "24h": 1
+      "1w": 1
+
+risk:
+  risk_per_trade_pct: 0.5
+  daily_max_loss_pct: 2.0
+  weekly_max_loss_pct: 5.0
+  max_drawdown_pct: 15.0
+  max_open_positions: 3
+
+  stop_loss_pct: 0.8
+  take_profit_pct: 1.6
+  trailing:
+    enabled: true
+    mode: "probability"
+    trail_pct_base: 0.5
+    min_confidence_to_extend: 0.65
+
+  min_confidence_to_trade: 0.55
+  min_cm_accuracy_to_trade: 0.52
+
+execution:
+  default_volume: 0.01
+  allowed_volume_by_timeframe:
+    "10m": 0.01
+    "30m": 0.01
+    "1h": 0.01
+    "3h": 0.01
+    "7h": 0.01
+    "12h": 0.01
+    "24h": 0.01
+    "1w": 0.01
+
+  slippage_bps: 2.0
+  commission_per_trade: 0.0
+  spread_bps: 2.0
+
+broker:
+  active: "mt5"  # mt5 only for initial version
+  mt5:
+    enabled: false
+    login: 0
+    password: ""
+    server: ""
+    path: ""
+
+# Multi-timeframe model endpoints used in Mode B for re-evaluation
+model_endpoints:
+  "10m": "http://127.0.0.1:8000/predict/10m"
+  "30m": "http://127.0.0.1:8000/predict/30m"
+  "1h": "http://127.0.0.1:8000/predict/1h"
+  "3h": "http://127.0.0.1:8000/predict/3h"
+  "7h": "http://127.0.0.1:8000/predict/7h"
+  "12h": "http://127.0.0.1:8000/predict/12h"
+  "24h": "http://127.0.0.1:8000/predict/24h"
+  "1w": "http://127.0.0.1:8000/predict/1w"
+
+reporting:
+  enabled: true
+  output_dir: "reports/trading_plans"
+  filename_prefix: "trading_plan"
+
+probability_maps:
+  enabled: true
+  n_paths: 1200
+  n_price_bins: 70
+
+dashboard:
+  enabled: true
+  master_table_path: ""
+  latest_records: 50000
+  # Legacy alias kept for compatibility with older dashboard builds.
+  raw_data_path: "data/xauusd/xauusd_1m_live.csv"
+  state_path: "reports/runtime/agent_state_latest.json"
+  tiingo_symbol: "xauusd"
+  tiingo_rate: "1min"
+  tiingo_token_env: "TIINGO_API_TOKEN"
+  auto_update_master: true
+  auto_update_every_ticks: 3
+  live_past_minutes: 1440
+  heatmap_minutes: 480
+  pdf_minutes: 360
+  group_minutes: 420
+  refresh_seconds: 20

@@ -27,24 +27,47 @@ import tempfile
 from pathlib import Path
 import seaborn as sns
 from datetime import datetime
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 import os
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.svm import SVR
 from sklearn.linear_model import LinearRegression
+
+TORCH_IMPORT_ERROR = None
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+except Exception as exc:
+    TORCH_IMPORT_ERROR = exc
+
+    class _TorchMissingProxy:
+        def __getattr__(self, _):
+            raise ImportError(
+                "PyTorch is unavailable in this environment. "
+                "Install a compatible CPU/GPU torch build to use N-BEATS."
+            ) from TORCH_IMPORT_ERROR
+
+    class _NNStub:
+        class Module:
+            pass
+
+    torch = _TorchMissingProxy()
+    nn = _NNStub()
+    optim = _TorchMissingProxy()
+    DataLoader = None
+    TensorDataset = None
 
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
 
 
 # N-BEATS Model Classes (from original code)
 class GenericBlock(nn.Module):
-    def __init__(self, input_size, theta_size, hidden_size=512, num_layers=4):
+    def __init__(self, input_size, theta_size, forecast_size=None, hidden_size=512, num_layers=4):
         super(GenericBlock, self).__init__()
         self.input_size = input_size
         self.theta_size = theta_size
+        self.forecast_size = forecast_size if forecast_size is not None else input_size
         self.hidden_size = hidden_size
 
         layers = []
@@ -57,7 +80,7 @@ class GenericBlock(nn.Module):
         self.fc_stack = nn.Sequential(*layers)
         self.theta_fc = nn.Linear(hidden_size, theta_size)
         self.backcast_fc = nn.Linear(theta_size, input_size)
-        self.forecast_fc = nn.Linear(theta_size, input_size)
+        self.forecast_fc = nn.Linear(theta_size, self.forecast_size)
 
     def forward(self, x):
         hidden = self.fc_stack(x)
@@ -245,8 +268,14 @@ class NBeatsStack(nn.Module):
             elif block_type == 'seasonality':
                 block = SeasonalityBlock(input_size, forecast_size, hidden_size=hidden_size, **filtered_kwargs)
             else:
-                theta_size = input_size
-                block = GenericBlock(input_size, theta_size, hidden_size=hidden_size, **filtered_kwargs)
+                theta_size = input_size + forecast_size
+                block = GenericBlock(
+                    input_size,
+                    theta_size,
+                    forecast_size=forecast_size,
+                    hidden_size=hidden_size,
+                    **filtered_kwargs
+                )
             self.blocks.append(block)
 
     def forward(self, x):
@@ -614,6 +643,12 @@ def train_nbeats_model(
     }
 
     try:
+        if TORCH_IMPORT_ERROR is not None:
+            raise ImportError(
+                "N-BEATS requires PyTorch, but torch failed to import in this runtime: "
+                f"{TORCH_IMPORT_ERROR}"
+            ) from TORCH_IMPORT_ERROR
+
         df = df.dropna().reset_index(drop=True)
         X, y = prepare_sequences_nbeats(df, input_features, target_features, n_steps, m_steps)
 

@@ -30,6 +30,16 @@ def parse_cli():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="config/config.yaml",
                    help="Path to the YAML config used for this run")
+    p.add_argument(
+        "--summary-dir",
+        default="experiments",
+        help="Directory where run summaries are written"
+    )
+    p.add_argument(
+        "--bulk-search",
+        action="store_true",
+        help="Run in bulk-search mode (skip model artifact persistence)"
+    )
     return p.parse_args()
 
 
@@ -46,10 +56,28 @@ def _jsonify(obj):
     return obj
 
 
+def _write_failure_summary(config_path: str, stage: str, error: Exception, summary_dir: str):
+    """Write a failure summary so bulk-search always has a run record."""
+    metrics = {
+        "run_error": {
+            "stage": stage,
+            "error": str(error)
+        }
+    }
+    write_run_summary(
+        config_path=config_path,
+        metrics=_jsonify(metrics),
+        summary_dir=summary_dir,
+        suffix="failed"
+    )
+
+
 def main():
     """Main entry point for search mode."""
     args = parse_cli()
     config_path = args.config
+    summary_dir = args.summary_dir
+    is_bulk_search = bool(args.bulk_search)
     
     print(f"[search_mode] Starting with config: {config_path}")
     
@@ -84,7 +112,13 @@ def main():
     except Exception as e:
         print(f"[search_mode] ERROR loading data: {str(e)}")
         logger.error(f"Error loading data: {str(e)}")
-        return
+        try:
+            _write_failure_summary(config_path, "data_loading", e, summary_dir)
+            print("[search_mode] Failure summary written")
+        except Exception as summary_err:
+            print(f"[search_mode] ERROR writing failure summary: {summary_err}")
+            logger.error(f"Error writing failure summary: {summary_err}")
+        sys.exit(11)
     
     all_model_results = {}
     
@@ -113,7 +147,13 @@ def main():
     except Exception as e:
         print(f"[search_mode] ERROR training models: {str(e)}")
         logger.error(f"Error training models: {str(e)}")
-        return
+        try:
+            _write_failure_summary(config_path, "training", e, summary_dir)
+            print("[search_mode] Failure summary written")
+        except Exception as summary_err:
+            print(f"[search_mode] ERROR writing failure summary: {summary_err}")
+            logger.error(f"Error writing failure summary: {summary_err}")
+        sys.exit(12)
     
     # Evaluate models
     try:
@@ -124,7 +164,13 @@ def main():
     except Exception as e:
         print(f"[search_mode] ERROR evaluating models: {str(e)}")
         logger.error(f"Error evaluating models: {str(e)}")
-        return
+        try:
+            _write_failure_summary(config_path, "evaluation", e, summary_dir)
+            print("[search_mode] Failure summary written")
+        except Exception as summary_err:
+            print(f"[search_mode] ERROR writing failure summary: {summary_err}")
+            logger.error(f"Error writing failure summary: {summary_err}")
+        sys.exit(13)
 
     # Save run summary
     try:
@@ -170,6 +216,7 @@ def main():
         write_run_summary(
             config_path=config_path,
             metrics=clean_metrics,
+            summary_dir=summary_dir,
             suffix=summary_suffix
         )
         print("[search_mode] Run summary written successfully")
@@ -178,15 +225,19 @@ def main():
         logger.error(f"Error writing run summary: {str(e)}")
         import traceback
         traceback.print_exc()
-        return
+        sys.exit(14)
     
-    # Save best model
-    try:
-        save_best_model(all_model_results, evaluation, "model_files", logger)
-        print("[search_mode] Best model saved")
-    except Exception as e:
-        print(f"[search_mode] ERROR saving best model: {str(e)}")
-        logger.error(f"Error saving best model: {str(e)}")
+    # Save best model (disabled for bulk hypersearch experiment runs)
+    if is_bulk_search:
+        print("[search_mode] Bulk-search mode: skipping model persistence")
+        logger.info("Bulk-search mode enabled; skipping save_best_model")
+    else:
+        try:
+            save_best_model(all_model_results, evaluation, "model_files", logger)
+            print("[search_mode] Best model saved")
+        except Exception as e:
+            print(f"[search_mode] ERROR saving best model: {str(e)}")
+            logger.error(f"Error saving best model: {str(e)}")
     
     logger.info("Application completed successfully")
     print("[search_mode] Application completed successfully")
