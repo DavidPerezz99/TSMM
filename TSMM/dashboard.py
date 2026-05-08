@@ -13,7 +13,9 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from utils.live_data import read_csv_tail, update_fx_master_table_file
+from utils.live_data import read_csv_tail, update_fx_master_table_file, update_fx_master_table_db
+from utils.market_db import query_ohlc
+from utils.agent_channel import read_channel_messages, set_channel_enabled, is_channel_enabled
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State", "ctx"])
 plotly_go = __import__("plotly.graph_objects", fromlist=["Figure", "Candlestick", "Scatter", "Heatmap", "Surface"])
@@ -30,6 +32,8 @@ go = plotly_go
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADING_CFG_PATH = os.path.join(BASE_DIR, "config", "trading_agent.yaml")
 DEFAULT_STATE_PATH = os.path.join(BASE_DIR, "reports", "runtime", "agent_state_latest.json")
+DEFAULT_TRADING_JOB_STATE_PATH = os.path.join(BASE_DIR, "reports", "runtime", "trading_job_state.json")
+DEFAULT_STARTUP_STATUS_PATH = os.path.join(BASE_DIR, "reports", "runtime", "startup_sync_status.json")
 
 
 def _load_trading_cfg() -> dict:
@@ -52,9 +56,24 @@ def _load_state(path: str) -> dict:
         return {}
 
 
+def _load_startup_sync_status(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _load_data(path: str, latest_records: int = 50000) -> pd.DataFrame:
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE"])
+
+    # SQL-first option: if a SQLite DB path is provided, read from table queries.
+    if str(path).lower().endswith(".db") or str(path).lower().endswith(".sqlite"):
+        return query_ohlc(path, timeframe_minutes=1, latest_records=max(int(latest_records or 1), 1))
+
     df = read_csv_tail(path, max(int(latest_records or 1), 1))
     if "DATE" not in df.columns:
         return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE"])
@@ -192,12 +211,20 @@ def _update_master_from_tiingo(master_table_path: str, symbol: str, rate: str, t
         return f"Missing Tiingo token in env var: {token_key}"
 
     try:
-        result = update_fx_master_table_file(
-            master_table_path=master_table_path,
-            rate=(rate or "1min").strip(),
-            symbol=(symbol or "xauusd").strip().lower(),
-            token=token,
-        )
+        if str(master_table_path).lower().endswith(".db") or str(master_table_path).lower().endswith(".sqlite"):
+            result = update_fx_master_table_db(
+                db_path=master_table_path,
+                rate=(rate or "1min").strip(),
+                symbol=(symbol or "xauusd").strip().lower(),
+                token=token,
+            )
+        else:
+            result = update_fx_master_table_file(
+                master_table_path=master_table_path,
+                rate=(rate or "1min").strip(),
+                symbol=(symbol or "xauusd").strip().lower(),
+                token=token,
+            )
         if not bool(result.get("updated", False)):
             return f"Update failed: {result.get('error', 'unknown error')}"
         return (
@@ -277,6 +304,7 @@ _button_style = {
     "borderRadius": "8px",
     "fontWeight": "600",
     "cursor": "pointer",
+    "transition": "transform 0.1s ease, filter 0.16s ease",
 }
 
 _button_secondary_style = {
@@ -287,6 +315,7 @@ _button_secondary_style = {
     "borderRadius": "8px",
     "fontWeight": "600",
     "cursor": "pointer",
+    "transition": "transform 0.1s ease, filter 0.16s ease",
 }
 
 
@@ -300,7 +329,7 @@ def _dynamic_styles(mode: str):
         "padding": "14px",
         "backgroundColor": t["bg"],
         "minHeight": "100vh",
-        "fontFamily": "Inter, Segoe UI, Arial, sans-serif",
+        "fontFamily": "Manrope, Space Grotesk, Segoe UI, sans-serif",
     }
     main_panel_style = {
         "padding": "14px",
@@ -429,6 +458,15 @@ app.layout = html.Div(
                             dcc.Input(id="state-path", type="text", value=dashboard_cfg.get("state_path", DEFAULT_STATE_PATH), style={"width": "100%"}),
                         ),
                         _control_cell(
+                            "Trading job state path",
+                            dcc.Input(
+                                id="trading-job-state-path",
+                                type="text",
+                                value=((cfg.get("trading_job") or {}).get("state_path") or DEFAULT_TRADING_JOB_STATE_PATH),
+                                style={"width": "100%"},
+                            ),
+                        ),
+                        _control_cell(
                             "Theme",
                             dcc.Dropdown(
                                 id="theme-mode",
@@ -449,20 +487,31 @@ app.layout = html.Div(
                         html.Button("Refresh Dashboard", id="btn-refresh-dashboard", n_clicks=0, style={**_button_style, "marginLeft": "8px"}),
                         html.Button("Interrupt Mode B", id="btn-stop-mode-b", n_clicks=0, style={**_button_secondary_style, "marginLeft": "8px"}),
                         html.Button("Resume Mode B", id="btn-resume-mode-b", n_clicks=0, style={**_button_secondary_style, "marginLeft": "8px"}),
+                        html.Button("Enable Agent Channel", id="btn-enable-channel", n_clicks=0, style={**_button_secondary_style, "marginLeft": "8px"}),
+                        html.Button("Disable Agent Channel", id="btn-disable-channel", n_clicks=0, style={**_button_secondary_style, "marginLeft": "8px"}),
                     ],
                     style={"marginBottom": "8px"},
                 ),
                 html.Div(id="update-master-status", style={"marginTop": "4px", "fontSize": "12px", "color": _theme["success"]}),
                 html.Div(id="auto-update-status", style={"marginTop": "4px", "fontSize": "12px", "color": _theme["muted"]}),
                 html.Div(id="mode-b-control-status", style={"marginTop": "4px", "fontSize": "12px", "color": _theme["muted"]}),
-                html.Div(id="signal-panel", style={"marginTop": "8px", **_panel_card_style}),
+                html.Div(id="agent-channel-status", style={"marginTop": "4px", "fontSize": "12px", "color": _theme["muted"]}),
+                html.Div(id="agent-channel-panel", style={"marginTop": "8px", **_panel_card_style}),
+                html.Div(id="startup-sync-panel", style={"marginTop": "8px", **_panel_card_style}),
+                html.Div(
+                    [
+                        html.Div(id="agent-a-panel", style={**_panel_card_style}),
+                        html.Div(id="agent-b-panel", style={**_panel_card_style}),
+                    ],
+                    style={"marginTop": "8px", "display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"},
+                ),
                 html.Div(dcc.Graph(id="live-plot", config={"displaylogo": False}), id="live-plot-card", style={"marginTop": "10px", **_chart_card_style}),
                 html.Div(
                     [
                         html.Div(dcc.Graph(id="heat2d", config={"displaylogo": False}), id="heat2d-card", style=_chart_card_style),
                         html.Div(dcc.Graph(id="heat3d", config={"displaylogo": False}), id="heat3d-card", style=_chart_card_style),
                     ],
-                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"},
+                    style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(420px, 1fr))", "gap": "10px"},
                 ),
                 html.Div(
                     [
@@ -470,7 +519,7 @@ app.layout = html.Div(
                         html.Div(dcc.Graph(id="pdf-return", config={"displaylogo": False}), id="pdf-return-card", style=_chart_card_style),
                         html.Div(dcc.Graph(id="pdf-vol", config={"displaylogo": False}), id="pdf-vol-card", style=_chart_card_style),
                     ],
-                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"},
+                    style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(320px, 1fr))", "gap": "10px"},
                 ),
             ],
             id="main-panel",
@@ -483,13 +532,14 @@ app.layout = html.Div(
         "padding": "14px",
         "backgroundColor": _theme["bg"],
         "minHeight": "100vh",
-        "fontFamily": "Inter, Segoe UI, Arial, sans-serif",
+        "fontFamily": "Manrope, Space Grotesk, Segoe UI, sans-serif",
     },
 )
 
 
 @app.callback(
-    Output("signal-panel", "children"),
+    Output("agent-a-panel", "children"),
+    Output("agent-b-panel", "children"),
     Output("live-plot", "figure"),
     Output("heat2d", "figure"),
     Output("heat3d", "figure"),
@@ -497,6 +547,7 @@ app.layout = html.Div(
     Output("pdf-return", "figure"),
     Output("pdf-vol", "figure"),
     Output("auto-update-status", "children"),
+    Output("startup-sync-panel", "children"),
     Output("app-root", "style"),
     Output("main-panel", "style"),
     Output("live-plot-card", "style"),
@@ -512,6 +563,7 @@ app.layout = html.Div(
     Input("master-table-path", "value"),
     Input("latest-records", "value"),
     Input("state-path", "value"),
+    Input("trading-job-state-path", "value"),
     Input("live-mins", "value"),
     Input("group-mins", "value"),
     Input("plot-type", "value"),
@@ -524,21 +576,55 @@ app.layout = html.Div(
     Input("tiingo-token-env", "value"),
     Input("theme-mode", "value"),
 )
-def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_records, state_path, live_mins, group_mins, plot_type, heat_mins, pdf_mins, auto_update_enabled, auto_update_every, symbol, rate, token_env, theme_mode):
+def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_records, state_path, trading_job_state_path, live_mins, group_mins, plot_type, heat_mins, pdf_mins, auto_update_enabled, auto_update_every, symbol, rate, token_env, theme_mode):
     auto_status = ""
     _, root_style, main_panel_style, chart_card_style, signal_style, title_style, subtitle_style = _dynamic_styles(theme_mode)
     template = "plotly_dark" if str(theme_mode or "light").lower() == "dark" else "plotly_white"
+    startup_status_path = str(dashboard_cfg.get("startup_status_path", DEFAULT_STARTUP_STATUS_PATH))
+    startup_status = _load_startup_sync_status(startup_status_path)
+
+    result = (startup_status.get("result") or {}) if isinstance(startup_status, dict) else {}
+    attempts = result.get("attempts") if isinstance(result, dict) else []
+    attempts_count = len(attempts) if isinstance(attempts, list) else 0
+    latest_aligned_ts = (
+        result.get("latest_date")
+        if isinstance(result, dict)
+        else startup_status.get("latest_date")
+    )
+    weekend_relaxed = bool(result.get("is_weekend", False)) if isinstance(result, dict) else False
+    startup_ok = bool(startup_status.get("ok", False)) if isinstance(startup_status, dict) else False
+    startup_ts = startup_status.get("timestamp", "N/A") if isinstance(startup_status, dict) else "N/A"
+    startup_reason = startup_status.get("reason") if isinstance(startup_status, dict) else None
+    startup_panel = html.Div(
+        [
+            html.H4("Startup Sync Summary"),
+            html.P(f"Status: {'ALIGNED' if startup_ok else 'NOT ALIGNED / SKIPPED'}"),
+            html.P(f"Pull attempts: {attempts_count}"),
+            html.P(f"Latest aligned timestamp: {latest_aligned_ts or 'N/A'}"),
+            html.P(f"Weekend relaxation applied: {'Yes' if weekend_relaxed else 'No'}"),
+            html.P(f"Last startup sync write: {startup_ts}"),
+            html.P(f"Reason: {startup_reason}") if startup_reason else html.Div(),
+        ],
+        style=signal_style,
+    )
 
     if not master_table_path:
         empty = go.Figure(layout=dict(title="Set Master table CSV path to start dashboard", template="plotly_white"))
-        panel = html.Div(
+        panel_a = html.Div(
             [
-                html.H4("Agent Signals"),
+                html.H4("Agent A Signal"),
                 html.P("Missing required input: Master table CSV path."),
             ],
             style=signal_style,
         )
-        return panel, empty, empty, empty, empty, empty, empty, auto_status, root_style, main_panel_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, title_style, subtitle_style
+        panel_b = html.Div(
+            [
+                html.H4("Agent B Logs / Signals"),
+                html.P("Missing required input: Master table CSV path."),
+            ],
+            style=signal_style,
+        )
+        return panel_a, panel_b, empty, empty, empty, empty, empty, empty, auto_status, startup_panel, root_style, main_panel_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, title_style, subtitle_style
 
     enabled_auto = str(auto_update_enabled or "on").lower() == "on"
     every_n = max(int(auto_update_every or 1), 1)
@@ -551,6 +637,7 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
 
     df = _load_data(master_table_path, latest_records=max(int(latest_records or 50000), 500))
     state = _load_state(state_path)
+    tj_state = _load_state(trading_job_state_path or DEFAULT_TRADING_JOB_STATE_PATH)
 
     if not df.empty:
         end_ts = df["DATE"].max()
@@ -559,19 +646,61 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
     else:
         live_df = df
 
-    # Signals and positions panels
+    # Agent A panel
     mode = state.get("mode", "N/A")
-    plan = state.get("plan", {}) or {}
-    mode_b = state.get("mode_b", {}) or {}
-    positions = state.get("open_positions", []) or []
+    plan = (tj_state.get("plan") or state.get("plan") or {})
+    mode_b = (tj_state.get("mode_b") or state.get("mode_b") or {})
+    positions = (tj_state.get("open_positions") or state.get("open_positions") or [])
 
-    panel = html.Div(
+    panel_a = html.Div(
         [
-            html.H4("Agent Signals"),
-            html.P(f"Mode: {mode}"),
-            html.P(f"Decision: {plan.get('decision', 'N/A')} | Model: {plan.get('model', 'N/A')} | Success prob: {plan.get('success_probability', 'N/A')}"),
-            html.P(f"Mode B consensus: {((mode_b.get('timeframe_signals') or {}).get('consensus') if isinstance(mode_b, dict) else 'N/A')}"),
-            html.P(f"Open positions shown: {len(positions)}"),
+            html.H4("Agent A Signal"),
+            html.P(f"Mode: {tj_state.get('mode', mode)} | Stage: {tj_state.get('stage', 'N/A')} | Status: {tj_state.get('status', 'N/A')}") ,
+            html.P(f"Decision: {plan.get('decision', 'N/A')} | Model: {plan.get('model', 'N/A')}"),
+            html.P(f"Success prob: {plan.get('success_probability', 'N/A')} | Confidence: {plan.get('confidence', 'N/A')} | CM acc: {plan.get('cm_accuracy', 'N/A')}"),
+            html.P(f"Input fooling risk: {plan.get('input_fooling_risk', 'N/A')} | Score: {plan.get('signal_score', 'N/A')}"),
+            html.P(f"Entry: {plan.get('entry', 'N/A')} | SL: {plan.get('stop_loss', 'N/A')} | TP: {plan.get('take_profit', 'N/A')}"),
+            html.P(f"Rationale: {plan.get('rationale', 'N/A')}"),
+            html.Pre("\n".join([str(x) for x in (plan.get("risk_notes") or [])[:6]]) or "No risk notes", style={"whiteSpace": "pre-wrap", "fontSize": "12px"}),
+        ],
+        style=signal_style,
+    )
+
+    # Agent B logs/signals/reasoning panel
+    tf_signals = ((mode_b.get("timeframe_signals") or {}) if isinstance(mode_b, dict) else {})
+    consensus = tf_signals.get("consensus", mode_b.get("consensus", "N/A") if isinstance(mode_b, dict) else "N/A")
+    consensus_score = tf_signals.get("consensus_score", mode_b.get("consensus_score", "N/A") if isinstance(mode_b, dict) else "N/A")
+    tf_map = tf_signals.get("timeframes", {}) if isinstance(tf_signals, dict) else {}
+    tf_lines = []
+    if isinstance(tf_map, dict):
+        for tf, sig in sorted(tf_map.items()):
+            if isinstance(sig, dict):
+                tf_lines.append(
+                    f"{tf}: signal={sig.get('signal', 'N/A')} conf={sig.get('confidence', 'N/A')} status={sig.get('status_code', sig.get('error', 'N/A'))}"
+                )
+
+    assistance = tj_state.get("agent_b_assistance", []) if isinstance(tj_state, dict) else []
+    assist_lines = []
+    for item in (assistance[-5:] if isinstance(assistance, list) else []):
+        if isinstance(item, dict):
+            txt = str(item.get("text") or item.get("error") or "")
+            if len(txt) > 260:
+                txt = txt[:260] + "..."
+            assist_lines.append(
+                f"[{item.get('timestamp', 'N/A')}] ok={item.get('ok', False)} provider={item.get('provider', 'N/A')} :: {txt}"
+            )
+
+    approval_channels = ((cfg.get("agent") or {}).get("approval_channels") or ["popup", "terminal"])
+    panel_b = html.Div(
+        [
+            html.H4("Agent B Logs / Signals / Reasoning"),
+            html.P(f"Consensus: {consensus} | Consensus score: {consensus_score} | Open positions shown: {len(positions)}"),
+            html.P(f"Closed reason: {tj_state.get('closed_reason', 'N/A')} | Last tick: {tj_state.get('last_mode_b_tick', 'N/A')}") ,
+            html.P("Timeframe signals:"),
+            html.Pre("\n".join(tf_lines) or "No timeframe signal snapshots yet.", style={"whiteSpace": "pre-wrap", "fontSize": "12px", "maxHeight": "130px", "overflowY": "auto"}),
+            html.P("Reasoning/log snippets (latest 5):"),
+            html.Pre("\n".join(assist_lines) or "No Agent B reasoning logs yet.", style={"whiteSpace": "pre-wrap", "fontSize": "12px", "maxHeight": "130px", "overflowY": "auto"}),
+            html.P(f"Approvals are handled in a separate popup/terminal flow. Configured channels: {approval_channels}"),
         ],
         style=signal_style,
     )
@@ -595,7 +724,7 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
     pdf_return = _pdf_fig(ret_vals, "Return PDF (latest window)", "Return", template=template)
     pdf_vol = _pdf_fig(vol_vals, "Volatility PDF (latest window)", "Volatility", template=template)
 
-    return panel, live_fig, heat2d, heat3d, pdf_price, pdf_return, pdf_vol, auto_status, root_style, main_panel_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, title_style, subtitle_style
+    return panel_a, panel_b, live_fig, heat2d, heat3d, pdf_price, pdf_return, pdf_vol, auto_status, startup_panel, root_style, main_panel_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, chart_card_style, title_style, subtitle_style
 
 
 @app.callback(
@@ -634,6 +763,75 @@ def mode_b_controls(stop_clicks, resume_clicks, state_path):
 
     status = "INTERRUPTED" if os.path.exists(flag_path) else "RUNNING/AVAILABLE"
     return f"Mode B control status: {status} (flag: {flag_path})"
+
+
+@app.callback(
+    Output("agent-channel-status", "children"),
+    Input("btn-enable-channel", "n_clicks"),
+    Input("btn-disable-channel", "n_clicks"),
+    State("state-path", "value"),
+)
+def channel_controls(enable_clicks, disable_clicks, state_path):
+    del enable_clicks, disable_clicks
+    state_path = state_path or DEFAULT_STATE_PATH
+    runtime_dir = os.path.dirname(state_path)
+    output_dir = os.path.dirname(runtime_dir) if runtime_dir else os.path.join(BASE_DIR, "reports")
+    trig = dash_mod.ctx.triggered_id
+    if trig == "btn-enable-channel":
+        set_channel_enabled(output_dir=output_dir, trading_cfg=cfg, enabled=True)
+    elif trig == "btn-disable-channel":
+        set_channel_enabled(output_dir=output_dir, trading_cfg=cfg, enabled=False)
+
+    enabled = is_channel_enabled(output_dir=output_dir, trading_cfg=cfg)
+    return f"Agent channel: {'ENABLED' if enabled else 'DISABLED'}"
+
+
+@app.callback(
+    Output("agent-channel-panel", "children"),
+    Input("tick", "n_intervals"),
+    State("state-path", "value"),
+)
+def render_agent_channel(_n, state_path):
+    state_path = state_path or DEFAULT_STATE_PATH
+    runtime_dir = os.path.dirname(state_path)
+    output_dir = os.path.dirname(runtime_dir) if runtime_dir else os.path.join(BASE_DIR, "reports")
+    msgs = read_channel_messages(output_dir=output_dir, trading_cfg=cfg, max_lines=80)
+
+    if not msgs:
+        return html.Div(
+            [
+                html.H4("Agent Live Channel"),
+                html.P("No channel messages yet. Channel wakes on user trigger or emergency."),
+            ]
+        )
+
+    items = []
+    for m in msgs[-25:]:
+        ts = m.get("timestamp_utc", "N/A")
+        ch = m.get("channel", "agent")
+        kind = m.get("kind", "info")
+        emergency = bool(m.get("emergency", False))
+        msg = str(m.get("message", ""))
+        dl = m.get("approval_deadline_utc")
+        head = f"[{ts}] {ch}/{kind}{' [EMERGENCY]' if emergency else ''}"
+        if dl:
+            head += f" | deadline={dl}"
+        items.append(
+            html.Div(
+                [
+                    html.Div(head, style={"fontWeight": "700", "fontSize": "12px"}),
+                    html.Div(msg, style={"fontSize": "12px", "whiteSpace": "pre-wrap"}),
+                ],
+                style={"padding": "8px", "border": "1px solid #dbe4f3", "borderRadius": "8px", "marginBottom": "6px", "backgroundColor": "#f8fbff"},
+            )
+        )
+
+    return html.Div(
+        [
+            html.H4("Agent Live Channel"),
+            html.Div(items, style={"maxHeight": "280px", "overflowY": "auto"}),
+        ]
+    )
 
 
 if __name__ == "__main__":

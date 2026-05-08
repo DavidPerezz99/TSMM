@@ -42,6 +42,35 @@ class CompactPDFReport(FPDF):
                 self.watermark_img = None
         
         self.add_page()
+
+    @staticmethod
+    def _sanitize_text(value: Any) -> str:
+        text = '' if value is None else str(value)
+        replacements = {
+            '\u2013': '-',
+            '\u2014': '-',
+            '\u2018': "'",
+            '\u2019': "'",
+            '\u201c': '"',
+            '\u201d': '"',
+            '\u2026': '...',
+            '\u2212': '-',
+            '\ufe0f': '',
+            '\u26a0': 'WARNING',
+            '\u2713': 'OK',
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text.encode('latin-1', errors='replace').decode('latin-1')
+
+    def cell(self, w, h=0, txt='', border=0, ln=0, align='', fill=False, link=''):
+        return super().cell(w, h, self._sanitize_text(txt), border, ln, align, fill, link)
+
+    def multi_cell(self, w, h, txt='', border=0, align='J', fill=False):
+        return super().multi_cell(w, h, self._sanitize_text(txt), border, align, fill)
+
+    def write(self, h, txt='', link=''):
+        return super().write(h, self._sanitize_text(txt), link)
         
     def _process_watermark(self):
         """Process watermark image with opacity adjustment."""
@@ -439,11 +468,11 @@ class CompactPDFReport(FPDF):
         if explosion_data.get('explosion_detected'):
             self.set_draw_color(200, 50, 50)
             self.set_fill_color(255, 240, 240)  # Light red
-            title = '⚠️ Forecast Explosion Detected!'
+            title = 'WARNING: Forecast Explosion Detected!'
         else:
             self.set_draw_color(50, 150, 50)
             self.set_fill_color(240, 255, 240)  # Light green
-            title = '✓ Forecast Validation Passed'
+            title = 'OK: Forecast Validation Passed'
         
         self.rect(10, start_y, 190, 12, 'DF')
         

@@ -14,7 +14,9 @@ Features:
 
 import os
 import sys
+import json
 import yaml
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +32,17 @@ from utils.reporter import CompactPDFReport
 from utils.evaluator import evaluate_models, save_best_model
 from utils.metrics_saver import save_all_models_metrics, save_forecast_to_file
 from utils.interpretability import add_interpretability
+from utils.investing_agent import load_trading_config
+from utils.trading_job import start_trading_job, resume_trading_job, stop_trading_job
+from utils.live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="TSMM Forecasting and Trading Job CLI")
+    parser.add_argument("command", nargs="?", default="forecast", choices=["forecast", "trading-job"])
+    parser.add_argument("action", nargs="?", default="start", choices=["start", "resume", "stop"])
+    parser.add_argument("--plan-model", default=None, help="Optional model name to force for Agent A plan")
+    return parser.parse_args()
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -174,7 +187,7 @@ def run_forecasting_pipeline(config: dict, logger: logging.Logger) -> dict:
     add_interpretability(all_model_results, df, config, logger)
 
     # Save best model
-    save_best_model(all_model_results, evaluation, "model_files", logger)
+    save_best_model(all_model_results, evaluation, "model_files", logger, config=config)
 
     return {
         'models': all_model_results,
@@ -306,8 +319,144 @@ def save_metrics(
     return metrics_path
 
 
+def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logger):
+    """Auto-sync the master source first, then refresh the active config source if needed."""
+    trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
+    trading_cfg = load_trading_config(trading_cfg_path)
+    dash_cfg = (trading_cfg.get('dashboard') or {})
+
+    status_path = str(
+        dash_cfg.get('startup_status_path')
+        or os.path.join('reports', 'runtime', 'startup_sync_status.json')
+    )
+
+    def _save_startup_status(payload: dict):
+        try:
+            os.makedirs(os.path.dirname(status_path) or '.', exist_ok=True)
+            with open(status_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.warning("Could not write startup sync status file %s: %s", status_path, e)
+
+    if not bool(dash_cfg.get('startup_sync_enabled', True)):
+        logger.info("Startup master sync disabled in trading config.")
+        _save_startup_status({
+            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'enabled': False,
+            'ok': False,
+            'reason': 'startup_sync_disabled',
+            'status_path': status_path,
+        })
+        return
+
+    master_path = str(dash_cfg.get('master_table_path') or dash_cfg.get('raw_data_path') or '').strip()
+    if not master_path:
+        logger.warning("Startup master sync skipped: missing master path in dashboard config")
+        _save_startup_status({
+            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'enabled': True,
+            'ok': False,
+            'reason': 'missing_master_path',
+            'status_path': status_path,
+        })
+        return
+
+    token_env = str(dash_cfg.get('tiingo_token_env', 'TIINGO_API_TOKEN')).strip()
+    token = os.environ.get(token_env, '')
+    if not token:
+        logger.warning("Startup master sync skipped: missing Tiingo token in env var %s", token_env)
+        _save_startup_status({
+            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'enabled': True,
+            'ok': False,
+            'reason': f'missing_token_env:{token_env}',
+            'status_path': status_path,
+        })
+        return
+
+    symbol = str(dash_cfg.get('tiingo_symbol', 'xauusd')).strip().lower()
+    rate = str(dash_cfg.get('tiingo_rate', '1min')).strip()
+    max_pulls = int(dash_cfg.get('startup_max_pulls', 2) or 2)
+    freshness_lag_minutes = int(dash_cfg.get('startup_freshness_lag_minutes', 20) or 20)
+
+    logger.info(
+        "Running startup master sync: path=%s symbol=%s rate=%s max_pulls=%s freshness_lag_minutes=%s",
+        master_path,
+        symbol,
+        rate,
+        max_pulls,
+        freshness_lag_minutes,
+    )
+
+    result = bootstrap_master_on_backend_start(
+        master_table_path=master_path,
+        rate=rate,
+        symbol=symbol,
+        token=token,
+        max_pulls=max_pulls,
+        freshness_lag_minutes=freshness_lag_minutes,
+    )
+
+    active_sync_result = None
+    active_data_path = str((active_config or {}).get('data_path') or '').strip()
+    active_records = int((active_config or {}).get('records', 5000) or 5000)
+    active_rolling_windows = list((active_config or {}).get('rolling_windows') or [2, 7, 30, 60])
+    active_n_steps = int((active_config or {}).get('n_steps', 1) or 1)
+    active_horizon = int((active_config or {}).get('horizon', 1) or 1)
+    active_tf_minutes = (active_config or {}).get('data_timeframe_minutes')
+
+    if active_data_path and not active_data_path.lower().endswith(('.db', '.sqlite')):
+        logger.info("Refreshing active config source file from updated master: %s", active_data_path)
+        active_sync_result = sync_dataset_source_from_master(
+            master_table_path=master_path,
+            output_path=active_data_path,
+            timeframe_minutes=active_tf_minutes,
+            records=active_records,
+            rolling_windows=active_rolling_windows,
+            n_steps=active_n_steps,
+            horizon=active_horizon,
+            logger=logger,
+        )
+    elif active_data_path:
+        logger.info("Active config uses SQLite source %s; master sync already updated it if paths match.", active_data_path)
+        if os.path.normcase(os.path.abspath(active_data_path)) == os.path.normcase(os.path.abspath(master_path)):
+            active_sync_result = {
+                'updated': bool(result.get('ok', False)),
+                'output_path': active_data_path,
+                'source': 'master_sync_shared_sqlite',
+                'latest_date': result.get('latest_date'),
+            }
+        else:
+            active_sync_result = {
+                'updated': False,
+                'output_path': active_data_path,
+                'source': 'independent_sqlite_not_synced',
+            }
+
+    logger.info("Startup master sync result: %s", result)
+    _save_startup_status({
+        'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        'enabled': True,
+        'ok': bool(result.get('ok', False)),
+        'master_path': master_path,
+        'symbol': symbol,
+        'rate': rate,
+        'max_pulls': max_pulls,
+        'freshness_lag_minutes': freshness_lag_minutes,
+        'result': result,
+        'active_config_data_path': active_data_path,
+        'active_config_sync_result': active_sync_result,
+        'status_path': status_path,
+    })
+    if not bool(result.get('ok', False)):
+        logger.warning("Startup master sync did not reach aligned state after attempts")
+    if isinstance(active_sync_result, dict) and not bool(active_sync_result.get('updated', False)):
+        logger.warning("Active config source refresh did not update target: %s", active_sync_result)
+
+
 def main():
     """Main entry point for the forecasting application."""
+    args = parse_cli_args()
     
     # Load configuration
     config_path = os.environ.get('CONFIG_PATH', 'config/config.yaml')
@@ -320,34 +469,75 @@ def main():
     logger = setup_logger(log_file)
     
     try:
+        # Trading job manual stop command does not require a forecast run.
+        if args.command == "trading-job" and args.action == "stop":
+            trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
+            trading_cfg = load_trading_config(trading_cfg_path)
+            output_dir = create_output_directory(config)
+            stop_path = stop_trading_job(output_dir, trading_cfg)
+            print(f"Trading job stop flag written: {stop_path}")
+            logger.info("Trading job stop requested via stop flag: %s", stop_path)
+            return
+
+        # Startup sync: refresh master from Tiingo before backend pipeline continues.
+        maybe_sync_master_on_backend_start(config, logger)
+
         # Run forecasting pipeline
         results = run_forecasting_pipeline(config, logger)
         
         # Create output directory
         output_dir = create_output_directory(config)
         
-        # Determine output format
+        # Trading-job start/resume mode.
+        if args.command == "trading-job":
+            trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
+            trading_cfg = load_trading_config(trading_cfg_path)
+
+            if args.action == "resume":
+                job_result = resume_trading_job(
+                    app_config=config,
+                    trading_cfg=trading_cfg,
+                    output_dir=output_dir,
+                    logger=logger,
+                )
+            else:
+                job_result = start_trading_job(
+                    app_config=config,
+                    results=results,
+                    trading_cfg=trading_cfg,
+                    output_dir=output_dir,
+                    logger=logger,
+                    selected_model=args.plan_model,
+                )
+
+            print("\n" + "=" * 60)
+            print("TRADING JOB RESULT")
+            print("=" * 60)
+            print(job_result)
+            print("=" * 60)
+            logger.info("Trading job completed with result: %s", job_result)
+            return
+
+        # Standard forecast/report mode.
         output_config = config.get('output', {})
         output_format = output_config.get('format', 'pdf').lower()
-        
-        # Generate output based on format
+
         if output_format == 'pdf':
             output_filename = generate_output_filename(config, 'pdf')
             output_path = os.path.join(output_dir, output_filename)
             generate_pdf_report(config, results, output_path, logger)
-            
+
         elif output_format in ['csv', 'parquet']:
             output_filename = generate_output_filename(config, output_format)
             output_path = os.path.join(output_dir, output_filename)
             generate_table_output(config, results, output_path, output_format, logger)
-            
+
         else:
             logger.warning(f"Unknown output format: {output_format}. Defaulting to PDF.")
             output_filename = generate_output_filename(config, 'pdf')
             output_path = os.path.join(output_dir, output_filename)
             generate_pdf_report(config, results, output_path, logger)
-        
-        # Always save metrics regardless of output format
+
         metrics_path = save_metrics(results, output_dir, logger)
         
         # Print summary

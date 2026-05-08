@@ -1,0 +1,8 @@
+Start listener in current terminal:
+python scripts/telegram_command_listener.py --trading-config config/trading_agent.yaml
+
+Start listener in visible popup console window (Windows):
+Start-Process -FilePath "cmd.exe" -WorkingDirectory "C:\Users\artur\3D Objects\tsmm\TSMM_beginnerVersion\TSMM" -ArgumentList "/k C:\Users\artur\AppData\Local\Programs\Python\Python311\python.exe scripts\telegram_command_listener.py --trading-config config\trading_agent.yaml"
+
+Live runtime tail (updates every 2 seconds):
+$root = "C:\Users\artur\3D Objects\tsmm\TSMM_beginnerVersion\TSMM\reports\runtime"; while ($true) { $f = Get-ChildItem $root -File | Where-Object { $_.Name -in @("telegram_command_audit.jsonl","telegram_conversation_log.jsonl") } | Sort-Object LastWriteTime -Descending | Select-Object -First 1; Clear-Host; Write-Host ("[{0}] {1}" -f (Get-Date), $f.FullName); Get-Content $f.FullName -Tail 20; Start-Sleep -Seconds 2 }

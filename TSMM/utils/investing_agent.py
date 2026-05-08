@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import sys
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -21,7 +26,21 @@ import requests
 import yaml
 
 from .backtester import run_backtest_from_validation
+from .market_db import query_ohlc
 from .trading_reporter import generate_trading_plan_report
+from .iqoption_adapter import IQOptionAdapter
+
+
+_LAST_ENDPOINT_START_TS: float = 0.0
+
+
+def _resolve_secret(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if value.startswith("env:"):
+        return os.environ.get(value.split(":", 1)[1], "")
+    return value
 
 
 class MT5Adapter:
@@ -38,16 +57,23 @@ class MT5Adapter:
             return False, "MetaTrader5 package not installed"
 
         self._mt5 = mt5
-        path = self.cfg.get("path") or None
+        path = _resolve_secret(self.cfg.get("path", "")) or None
         ok_init = mt5.initialize(path=path) if path else mt5.initialize()
         if not ok_init:
             return False, f"MT5 initialize failed: {mt5.last_error()}"
 
-        login = int(self.cfg.get("login", 0) or 0)
-        password = self.cfg.get("password", "")
-        server = self.cfg.get("server", "")
-        if login and password and server:
-            ok_login = mt5.login(login=login, password=password, server=server)
+        login_raw = _resolve_secret(self.cfg.get("login", ""))
+        try:
+            login = int(login_raw or 0)
+        except Exception:
+            login = 0
+        password = _resolve_secret(self.cfg.get("password", ""))
+        server = _resolve_secret(self.cfg.get("server", ""))
+        if login and password:
+            if server:
+                ok_login = mt5.login(login=login, password=password, server=server)
+            else:
+                ok_login = mt5.login(login=login, password=password)
             if not ok_login:
                 return False, f"MT5 login failed: {mt5.last_error()}"
 
@@ -59,6 +85,179 @@ class MT5Adapter:
                 self._mt5.shutdown()
             except Exception:
                 pass
+
+    def _require_mt5(self):
+        if self._mt5 is None:
+            return False, "MT5 not connected"
+        return True, "ok"
+
+    def place_programmed_order(
+        self,
+        symbol: str,
+        side: str,
+        volume: float,
+        entry: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        if not mt5.symbol_select(symbol, True):
+            return {"ok": False, "message": f"symbol_select failed for {symbol}"}
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return {"ok": False, "message": f"No market tick for {symbol}"}
+
+        side = str(side or "").lower()
+        if side not in {"buy", "sell"}:
+            return {"ok": False, "message": f"Unsupported side: {side}"}
+
+        if side == "buy":
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT if entry <= tick.ask else mt5.ORDER_TYPE_BUY_STOP
+        else:
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT if entry >= tick.bid else mt5.ORDER_TYPE_SELL_STOP
+
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": order_type,
+            "price": float(entry),
+            "sl": float(stop_loss),
+            "tp": float(take_profit),
+            "deviation": 20,
+            "magic": 7070001,
+            "comment": "TSMM programmed order",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            return {"ok": False, "message": "order_send returned None"}
+
+        retcode = int(getattr(result, "retcode", -1))
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            return {
+                "ok": False,
+                "message": f"order_send failed retcode={retcode}",
+                "retcode": retcode,
+            }
+
+        return {
+            "ok": True,
+            "order_ticket": int(getattr(result, "order", 0) or 0),
+            "deal_ticket": int(getattr(result, "deal", 0) or 0),
+            "retcode": retcode,
+        }
+
+    def find_position_by_order(self, order_ticket: int) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        positions = mt5.positions_get() or []
+        for p in positions:
+            p_order = int(getattr(p, "ticket", 0) or 0)
+            if p_order == int(order_ticket):
+                return {
+                    "ok": True,
+                    "position": {
+                        "ticket": int(getattr(p, "ticket", 0) or 0),
+                        "symbol": str(getattr(p, "symbol", "")),
+                        "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                        "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+                        "type": int(getattr(p, "type", -1) or -1),
+                    },
+                }
+
+        # Fallback: latest position for symbol isn't always directly mapped.
+        return {"ok": True, "position": None}
+
+    def get_position_by_ticket(self, ticket: int) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        positions = mt5.positions_get(ticket=int(ticket))
+        if not positions:
+            return {"ok": True, "position": None}
+
+        p = positions[0]
+        return {
+            "ok": True,
+            "position": {
+                "ticket": int(getattr(p, "ticket", 0) or 0),
+                "symbol": str(getattr(p, "symbol", "")),
+                "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+                "type": int(getattr(p, "type", -1) or -1),
+            },
+        }
+
+    def close_position_by_ticket(self, ticket: int) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        pos = mt5.positions_get(ticket=int(ticket))
+        if not pos:
+            return {"ok": True, "message": "Position already closed", "ticket": int(ticket)}
+
+        p = pos[0]
+        symbol = str(getattr(p, "symbol", ""))
+        volume = float(getattr(p, "volume", 0.0) or 0.0)
+        ptype = int(getattr(p, "type", -1) or -1)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return {"ok": False, "message": f"No market tick for {symbol}"}
+
+        if ptype == mt5.POSITION_TYPE_BUY:
+            close_type = mt5.ORDER_TYPE_SELL
+            price = float(tick.bid)
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = float(tick.ask)
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": close_type,
+            "position": int(ticket),
+            "price": price,
+            "deviation": 20,
+            "magic": 7070002,
+            "comment": "TSMM close by Agent B",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            return {"ok": False, "message": "order_send(close) returned None"}
+
+        retcode = int(getattr(result, "retcode", -1))
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            return {
+                "ok": False,
+                "message": f"close order failed retcode={retcode}",
+                "retcode": retcode,
+            }
+
+        return {
+            "ok": True,
+            "ticket": int(ticket),
+            "retcode": retcode,
+            "deal_ticket": int(getattr(result, "deal", 0) or 0),
+        }
 
 
 def load_trading_config(path: str = "config/trading_agent.yaml") -> Dict[str, Any]:
@@ -163,6 +362,14 @@ def _build_mode_a_plan(
 
     min_conf = float(risk.get("min_confidence_to_trade", 0.55))
     min_cm = float(risk.get("min_cm_accuracy_to_trade", 0.52))
+    max_input_fooling_risk = float(risk.get("max_input_fooling_risk", 0.45))
+
+    fooling_info = (evaluation.get(best_model, {}) or {}).get("input_fooling_risk", {}) or {}
+    p_wrong = fooling_info.get("probability_wrong_sign")
+    try:
+        p_wrong = float(p_wrong) if p_wrong is not None else None
+    except Exception:
+        p_wrong = None
 
     allow_long = bool(mode_a.get("allow_long", True))
     allow_short = bool(mode_a.get("allow_short", True))
@@ -194,6 +401,12 @@ def _build_mode_a_plan(
         decision = "hold"
         risk_notes.append("Signal blocked by confidence/confusion thresholds.")
 
+    if p_wrong is not None and p_wrong > max_input_fooling_risk:
+        decision = "hold"
+        risk_notes.append(
+            f"Signal blocked by per-timeframe input fooling risk: p_wrong={p_wrong:.3f} > {max_input_fooling_risk:.3f}"
+        )
+
     if decision == "buy" and not allow_long:
         decision = "hold"
         risk_notes.append("Long operations disabled by config.")
@@ -211,6 +424,7 @@ def _build_mode_a_plan(
         "confidence": round(confidence, 4),
         "cm_accuracy": round(cm_acc, 4),
         "signal_score": round(signal_score, 4),
+        "input_fooling_risk": (round(p_wrong, 4) if p_wrong is not None else None),
         "target_anchor": tf0,
         "feature_forecasts_step1": {
             "OPEN": f_open,
@@ -350,10 +564,359 @@ def _build_probability_heatmaps(
 
 
 def _check_endpoints(model_endpoints: Dict[str, str], timeout_sec: float = 2.0) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for tf, url in (model_endpoints or {}).items():
+    return _check_endpoints_with_payloads(model_endpoints, trading_cfg=None, timeout_sec=timeout_sec)
+
+
+def _tf_to_minutes(label: str) -> int:
+    s = str(label or "").strip().lower()
+    m = re.match(r"^(\d+)([mhw])$", s)
+    if not m:
+        return 1
+    n = int(m.group(1))
+    u = m.group(2)
+    if u == "m":
+        return n
+    if u == "h":
+        return n * 60
+    if u == "w":
+        return n * 7 * 24 * 60
+    return 1
+
+
+def _parse_r2_from_filename(path: str) -> float:
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    m = re.search(r"_(\d{4,6})$", stem)
+    if m:
+        digits = m.group(1)
+        return float(int(digits) / (10 ** (len(digits) - 1)))
+    m2 = re.search(r"(\d+\.\d+)", stem)
+    if m2:
+        return float(m2.group(1))
+    return 0.0
+
+
+def _default_config_root() -> str:
+    return str(Path(__file__).resolve().parents[1] / "config")
+
+
+def _normalize_endpoint_cfg(endpoint_cfg: Any) -> Dict[str, Any]:
+    if isinstance(endpoint_cfg, str):
+        return {"url": endpoint_cfg, "method": "post"}
+    if isinstance(endpoint_cfg, dict):
+        out = dict(endpoint_cfg)
+        out["url"] = str(out.get("url") or out.get("endpoint") or "").strip()
+        out["method"] = str(out.get("method") or out.get("http_method") or "post").strip().lower()
+        return out
+    return {"url": "", "method": "post"}
+
+
+def _discover_endpoint_specs(
+    model_endpoints: Dict[str, Any],
+    config_root: Optional[str] = None,
+    config_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    root = str(config_root or _default_config_root())
+    out: Dict[str, Dict[str, Any]] = {}
+    if not os.path.isdir(root):
+        return out
+
+    overrides = {str(k): str(v) for k, v in (config_overrides or {}).items() if str(k).strip() and str(v).strip()}
+
+    for tf, raw_endpoint_cfg in (model_endpoints or {}).items():
+        tf_label = str(tf or "").strip()
+        endpoint_cfg = _normalize_endpoint_cfg(raw_endpoint_cfg)
+        preferred_model = str(endpoint_cfg.get("preferred_model") or endpoint_cfg.get("model") or "").strip().lower()
+        preferred_config = str(overrides.get(tf_label) or endpoint_cfg.get("config_path") or "").strip()
+        tf_dir = os.path.join(root, f"high{tf_label}Results")
+        if not os.path.isdir(tf_dir):
+            continue
+
+        best: Dict[str, Any] | None = None
+
+        if preferred_config:
+            pref_path = preferred_config
+            if not os.path.isabs(pref_path):
+                pref_path = str((Path(root).parents[0] / pref_path).resolve())
+            if os.path.exists(pref_path):
+                best = {
+                    "timeframe": tf_label,
+                    "model": str(Path(pref_path).parents[0].name),
+                    "config_path": pref_path,
+                    "r2": _parse_r2_from_filename(pref_path),
+                }
+
+        for model_name in os.listdir(tf_dir):
+            if preferred_model and str(model_name).strip().lower() != preferred_model:
+                continue
+            model_dir = os.path.join(tf_dir, model_name)
+            if not os.path.isdir(model_dir):
+                continue
+            for fn in os.listdir(model_dir):
+                if not fn.lower().endswith((".yaml", ".yml")):
+                    continue
+                full = os.path.join(model_dir, fn)
+                rec = {
+                    "timeframe": tf_label,
+                    "model": str(model_name),
+                    "config_path": full,
+                    "r2": _parse_r2_from_filename(full),
+                }
+                if best is None or float(rec["r2"]) > float(best["r2"]):
+                    best = rec
+
+        if best is None:
+            continue
+
         try:
-            r = requests.get(url, timeout=timeout_sec)
+            with open(best["config_path"], "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            best.update(
+                {
+                    "n_steps": int(cfg.get("n_steps", 1) or 1),
+                    "input_features": list(cfg.get("input_features") or []),
+                    "target_features": list(cfg.get("target_features") or []),
+                    "target_col": str(cfg.get("target_col") or "HIGH"),
+                    "rolling_windows": list(cfg.get("rolling_windows") or [2, 7, 30, 60]),
+                }
+            )
+            out[tf_label] = best
+        except Exception:
+            continue
+
+    return out
+
+
+def _load_endpoint_market_frame(master_path: str, timeframe_label: str, latest_records: int) -> pd.DataFrame:
+    p = str(master_path or "").strip()
+    if not p:
+        return pd.DataFrame()
+
+    tf_minutes = _tf_to_minutes(timeframe_label)
+    if p.lower().endswith((".db", ".sqlite")):
+        return query_ohlc(
+            db_path=p,
+            timeframe_minutes=tf_minutes,
+            latest_records=max(int(latest_records or 1), 1),
+            start_date=None,
+            end_date=None,
+        )
+
+    df = pd.read_csv(p)
+    if "DATE" not in df.columns:
+        return pd.DataFrame()
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"]).sort_values("DATE")
+    if df.empty:
+        return df
+
+    if tf_minutes <= 1:
+        return df.tail(max(int(latest_records or 1), 1)).copy()
+
+    w = df.set_index("DATE").copy()
+    if "VOLUME" not in w.columns:
+        w["VOLUME"] = 0.0
+    out = (
+        w.resample(f"{int(tf_minutes)}min")
+        .agg({"OPEN": "first", "HIGH": "max", "LOW": "min", "CLOSE": "last", "VOLUME": "sum"})
+        .dropna(subset=["OPEN", "HIGH", "LOW", "CLOSE"])
+        .reset_index()
+    )
+    return out.tail(max(int(latest_records or 1), 1)).copy()
+
+
+def _enrich_endpoint_features(df: pd.DataFrame, target_col: str, rolling_windows: List[int]) -> pd.DataFrame:
+    out = df.copy().sort_values("DATE").reset_index(drop=True)
+    if out.empty:
+        return out
+    if "VOLUME" not in out.columns:
+        out["VOLUME"] = 0.0
+
+    out["Price_return"] = pd.to_numeric(out["CLOSE"], errors="coerce").diff()
+    out["Open_return"] = pd.to_numeric(out["OPEN"], errors="coerce").diff()
+    out["High_return"] = pd.to_numeric(out["HIGH"], errors="coerce").diff()
+    out["Low_return"] = pd.to_numeric(out["LOW"], errors="coerce").diff()
+    out["daily_return"] = pd.to_numeric(out["CLOSE"], errors="coerce") - pd.to_numeric(out["OPEN"], errors="coerce")
+
+    tgt = pd.to_numeric(out[target_col], errors="coerce") if target_col in out.columns else pd.to_numeric(out["HIGH"], errors="coerce")
+    out["y_diff"] = tgt.diff()
+
+    for window in sorted(set(int(w) for w in (rolling_windows or [2, 7, 30, 60]) if int(w) > 0)):
+        out[f"SMA_{window}"] = tgt.rolling(window=window).mean()
+        out[f"EMA_{window}"] = tgt.ewm(span=window, adjust=False).mean()
+        out[f"Volatility_{window}"] = tgt.rolling(window=window).std()
+        out[f"SMA_{window}_diff"] = out["y_diff"].rolling(window=window).mean()
+        out[f"EMA_{window}_diff"] = out["y_diff"].ewm(span=window, adjust=False).mean()
+        out[f"Volatility_{window}_diff"] = out["y_diff"].rolling(window=window).std()
+
+    return out.dropna().reset_index(drop=True)
+
+
+def _build_endpoint_payloads(
+    model_endpoints: Dict[str, Any],
+    trading_cfg: Optional[Dict[str, Any]] = None,
+    config_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    specs = _discover_endpoint_specs(
+        model_endpoints,
+        config_root=_default_config_root(),
+        config_overrides=config_overrides,
+    )
+    dashboard_cfg = ((trading_cfg or {}).get("dashboard") or {})
+    master_path = str(dashboard_cfg.get("master_table_path") or os.path.join(Path(__file__).resolve().parents[1], "data", "market_data.sqlite"))
+    if not os.path.isabs(master_path):
+        master_path = str((Path(__file__).resolve().parents[1] / master_path).resolve())
+
+    payloads: Dict[str, Dict[str, Any]] = {}
+    for tf, spec in specs.items():
+        n_steps = int(spec.get("n_steps", 1) or 1)
+        rolling_windows = list(spec.get("rolling_windows") or [2, 7, 30, 60])
+        latest_records = max(n_steps + max([int(w) for w in rolling_windows] + [0]) + 5, 200)
+        df = _load_endpoint_market_frame(master_path=master_path, timeframe_label=tf, latest_records=latest_records)
+        if df.empty:
+            payloads[tf] = {"error": f"No market data available for timeframe {tf}"}
+            continue
+
+        enriched = _enrich_endpoint_features(df, target_col=str(spec.get("target_col") or "HIGH"), rolling_windows=rolling_windows)
+        if len(enriched) < n_steps:
+            payloads[tf] = {"error": f"Insufficient enriched rows for timeframe {tf}: need {n_steps}, got {len(enriched)}"}
+            continue
+
+        needed = list(dict.fromkeys(["DATE"] + [str(c) for c in (spec.get("input_features") or [])]))
+        missing = [c for c in needed if c != "DATE" and c not in enriched.columns]
+        if missing:
+            payloads[tf] = {"error": f"Missing engineered columns for timeframe {tf}: {missing}"}
+            continue
+
+        rows_df = enriched[needed].tail(n_steps).copy()
+        rows: List[Dict[str, Any]] = []
+        for _, row in rows_df.iterrows():
+            item: Dict[str, Any] = {"DATE": pd.to_datetime(row["DATE"]).strftime("%Y-%m-%d %H:%M:%S")}
+            for col in needed:
+                if col == "DATE":
+                    continue
+                val = row[col]
+                item[col] = None if pd.isna(val) else float(val)
+            rows.append(item)
+
+        payloads[tf] = {
+            "rows": rows,
+            "timeframe": tf,
+            "model": spec.get("model"),
+            "config_path": spec.get("config_path"),
+            "input_features": list(spec.get("input_features") or []),
+            "n_steps": n_steps,
+        }
+
+    return payloads
+
+
+def _is_local_signal_url(url: str, host: str, port: int) -> bool:
+    u = str(url or "").strip().lower()
+    if not u:
+        return False
+    return u.startswith(f"http://{host.lower()}:{int(port)}") or u.startswith(f"https://{host.lower()}:{int(port)}")
+
+
+def _ensure_local_endpoint_on_demand(trading_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    global _LAST_ENDPOINT_START_TS
+    cfg = ((trading_cfg or {}).get("endpoint_lifecycle") or {})
+    if not bool(cfg.get("on_demand_start", True)):
+        return {"ok": False, "skipped": True, "reason": "on_demand_disabled"}
+
+    host = str(cfg.get("host", "127.0.0.1"))
+    port = int(cfg.get("port", 8000) or 8000)
+    health_url = f"http://{host}:{port}/health"
+    startup_wait = int(cfg.get("startup_wait_seconds", 20) or 20)
+    service_script = str(cfg.get("service_script", "scripts/local_signal_endpoint_service.py"))
+
+    try:
+        r = requests.get(health_url, timeout=2)
+        if r.status_code == 200:
+            return {"ok": True, "already_running": True}
+    except Exception:
+        pass
+
+    now = time.time()
+    if now - _LAST_ENDPOINT_START_TS < 8:
+        return {"ok": False, "skipped": True, "reason": "recent_start_attempt"}
+    _LAST_ENDPOINT_START_TS = now
+
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["TSMM_SIGNAL_HOST"] = host
+    env["TSMM_SIGNAL_PORT"] = str(port)
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+
+    subprocess.Popen(
+        [
+            sys.executable,
+            str((root / service_script).resolve()),
+        ],
+        cwd=str(root),
+        env=env,
+        creationflags=creationflags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for _ in range(max(startup_wait, 5)):
+        time.sleep(1)
+        try:
+            rr = requests.get(health_url, timeout=2)
+            if rr.status_code == 200:
+                return {"ok": True, "started": True, "health_url": health_url}
+        except Exception:
+            continue
+
+    return {"ok": False, "error": "endpoint_start_timeout", "health_url": health_url}
+
+
+def _call_signal_endpoint(endpoint_cfg: Dict[str, Any], payload: Optional[Dict[str, Any]], timeout_sec: float, trading_cfg: Optional[Dict[str, Any]] = None) -> requests.Response:
+    url = str(endpoint_cfg.get("url") or "").strip()
+    method = str(endpoint_cfg.get("method") or "post").strip().lower()
+    headers = endpoint_cfg.get("headers") or {}
+
+    def _do() -> requests.Response:
+        if method == "get":
+            return requests.get(url, timeout=timeout_sec, headers=headers)
+        return requests.post(url, timeout=timeout_sec, headers=headers, json=payload or {})
+
+    try:
+        return _do()
+    except Exception:
+        cfg = ((trading_cfg or {}).get("endpoint_lifecycle") or {})
+        host = str(cfg.get("host", "127.0.0.1"))
+        port = int(cfg.get("port", 8000) or 8000)
+        if _is_local_signal_url(url, host=host, port=port) and bool(cfg.get("on_demand_start", True)):
+            _ensure_local_endpoint_on_demand(trading_cfg)
+            return _do()
+        raise
+
+
+def _check_endpoints_with_payloads(
+    model_endpoints: Dict[str, Any],
+    trading_cfg: Optional[Dict[str, Any]],
+    timeout_sec: float = 2.0,
+    config_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    payloads = _build_endpoint_payloads(
+        model_endpoints,
+        trading_cfg=trading_cfg,
+        config_overrides=config_overrides,
+    )
+    out: Dict[str, Any] = {}
+    for tf, raw_cfg in (model_endpoints or {}).items():
+        endpoint_cfg = _normalize_endpoint_cfg(raw_cfg)
+        payload = payloads.get(str(tf), {})
+        if payload.get("error"):
+            out[tf] = {"ok": False, "error": payload.get("error")}
+            continue
+        try:
+            r = _call_signal_endpoint(endpoint_cfg, payload, timeout_sec=timeout_sec, trading_cfg=trading_cfg)
             out[tf] = {"ok": r.status_code < 500, "status_code": r.status_code}
         except Exception as e:
             out[tf] = {"ok": False, "error": str(e)}
@@ -390,18 +953,39 @@ def _extract_endpoint_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _collect_mode_b_signals(model_endpoints: Dict[str, str], timeout_sec: float = 2.0) -> Dict[str, Any]:
+def _collect_mode_b_signals(
+    model_endpoints: Dict[str, Any],
+    trading_cfg: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = 2.0,
+    config_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     votes = []
     weighted = 0.0
     total_w = 0.0
+    payloads = _build_endpoint_payloads(
+        model_endpoints,
+        trading_cfg=trading_cfg,
+        config_overrides=config_overrides,
+    )
 
-    for tf, url in (model_endpoints or {}).items():
+    for tf, raw_cfg in (model_endpoints or {}).items():
+        endpoint_cfg = _normalize_endpoint_cfg(raw_cfg)
+        payload = payloads.get(str(tf), {})
+        if payload.get("error"):
+            out[tf] = {"signal": 0, "confidence": 0.5, "error": payload.get("error")}
+            continue
         try:
-            r = requests.get(url, timeout=timeout_sec)
+            r = _call_signal_endpoint(endpoint_cfg, payload, timeout_sec=timeout_sec, trading_cfg=trading_cfg)
             data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
             sig = _extract_endpoint_signal(data)
             sig["status_code"] = r.status_code
+            sig["request"] = {
+                "method": str(endpoint_cfg.get("method") or "post").upper(),
+                "url": str(endpoint_cfg.get("url") or ""),
+                "payload_rows": len(payload.get("rows") or []),
+                "model": payload.get("model"),
+            }
             out[tf] = sig
             votes.append(sig["signal"])
             w = max(sig["confidence"], 0.01)
@@ -498,9 +1082,9 @@ def run_investing_agent(
                 "interrupt_flag_path": interrupt_flag_path,
             }
         else:
-            endpoints = _check_endpoints(trading_cfg.get("model_endpoints", {}))
+            endpoints = _check_endpoints_with_payloads(trading_cfg.get("model_endpoints", {}), trading_cfg=trading_cfg)
             if bool((trading_cfg.get("mode_b") or {}).get("allow_endpoint_signals", True)):
-                mtf_signals = _collect_mode_b_signals(trading_cfg.get("model_endpoints", {}))
+                mtf_signals = _collect_mode_b_signals(trading_cfg.get("model_endpoints", {}), trading_cfg=trading_cfg)
             else:
                 mtf_signals = {"timeframes": {}, "consensus": "hold", "consensus_score": 0.0, "n_timeframes": 0}
             mode_b_status = {
@@ -510,14 +1094,28 @@ def run_investing_agent(
                 "live_execution_requested": not bool(agent_cfg.get("confirm_live_execution", True)),
             }
 
-            broker_cfg = (trading_cfg.get("broker", {}) or {}).get("mt5", {}) or {}
-            if (trading_cfg.get("broker", {}) or {}).get("active", "mt5") == "mt5" and broker_cfg.get("enabled", False):
-                adapter = MT5Adapter(broker_cfg)
-                ok, msg = adapter.connect()
-                mode_b_status["mt5_connection"] = {"ok": ok, "message": msg}
-                adapter.shutdown()
+            broker_block = (trading_cfg.get("broker", {}) or {})
+            active_broker = str(broker_block.get("active", "mt5") or "mt5").lower()
+            if active_broker == "mt5":
+                broker_cfg = (broker_block.get("mt5") or {})
+                if broker_cfg.get("enabled", False):
+                    adapter = MT5Adapter(broker_cfg)
+                    ok, msg = adapter.connect()
+                    mode_b_status["mt5_connection"] = {"ok": ok, "message": msg}
+                    adapter.shutdown()
+                else:
+                    warnings.append("Mode B selected but MT5 broker is disabled.")
+            elif active_broker == "iqoption":
+                broker_cfg = (broker_block.get("iqoption") or {})
+                if broker_cfg.get("enabled", False):
+                    adapter = IQOptionAdapter(broker_cfg)
+                    ok, msg = adapter.connect()
+                    mode_b_status["iqoption_connection"] = {"ok": ok, "message": msg}
+                    adapter.shutdown()
+                else:
+                    warnings.append("Mode B selected but IQ Option broker is disabled.")
             else:
-                warnings.append("Mode B selected but MT5 broker is disabled.")
+                warnings.append(f"Mode B selected but broker '{active_broker}' is not supported for connection checks.")
 
     report_cfg = trading_cfg.get("reporting", {}) or {}
     rep_dir = report_cfg.get("output_dir") or os.path.join(output_dir, "trading_plans")

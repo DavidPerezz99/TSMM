@@ -7,7 +7,8 @@ columns: ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'Price_return', 'Open_return',
        'Volatility_60_diff', 'SMA_2', 'EMA_2', 'Volatility_2', 'SMA_7',
        'EMA_7', 'Volatility_7', 'SMA_60', 'EMA_60', 'Volatility_60']
 
-data_path: "data/xauusd/xauusd_7h_2009.csv"  # Path to CSV file
+data_path: "data/market_data.sqlite"  # SQLite market store or CSV file path
+data_timeframe_minutes: 420  # Used only for SQLite sources. 420=7h, 30=30m, 10=10m, 1=1m
 date_col: "DATE"  # Column name for dates
 start_date: ""  # Start date for filtering (empty for all)
 end_date: ""  # End date for filtering (empty for all)
@@ -33,7 +34,7 @@ inference_batches: 1  # Number of batches for inference
 watermark_path: 'vrz.png'  # Path to watermark image
 watermark_size: 70  # Watermark size in pixels
 watermark_opacity: 0.1  # Watermark opacity [0-1]
-records: 5000  # Max records to load
+records: 5000  # Max records to load from CSV or latest grouped candles from SQLite
 
 # =============================================================================
 # NEW: Output Configuration

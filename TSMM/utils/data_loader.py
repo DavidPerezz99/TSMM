@@ -9,6 +9,7 @@ import yaml
 import logging
 import hashlib
 import json
+from utils.market_db import query_ohlc
 
 
 def get_memory():
@@ -61,7 +62,21 @@ def load_data(data_path, date_col, target_col, config):
         Processed dataframe with datetime index
     """
     try:
-        df = pd.read_csv(data_path, parse_dates=[date_col], infer_datetime_format=True)
+        # SQL-first option: load from SQLite ohlc store when data_path points to .db/.sqlite.
+        if str(data_path).lower().endswith('.db') or str(data_path).lower().endswith('.sqlite'):
+            timeframe_minutes = int(config.get('data_timeframe_minutes', 1) or 1)
+            latest_records = int(config.get('records', 50000) or 50000)
+            df = query_ohlc(
+                db_path=data_path,
+                timeframe_minutes=timeframe_minutes,
+                latest_records=latest_records,
+                start_date=(config.get('start_date') or None),
+                end_date=(config.get('end_date') or None),
+            )
+            if df.empty:
+                raise ValueError(f"No rows returned from SQLite source: {data_path}")
+        else:
+            df = pd.read_csv(data_path, parse_dates=[date_col], infer_datetime_format=True)
         
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
         

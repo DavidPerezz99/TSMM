@@ -49,7 +49,7 @@ def main():
         all_model_results.update(model_results)
     
     evaluation, future_forecasts = evaluate_models(all_model_results, df, config)
-    save_best_model(all_model_results, evaluation, "model_files", logger)
+    save_best_model(all_model_results, evaluation, "model_files", logger, config=config)
     
     # Generate PDF report
     report_dir = "reports"

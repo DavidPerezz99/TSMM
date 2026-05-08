@@ -233,7 +233,7 @@ def main():
         logger.info("Bulk-search mode enabled; skipping save_best_model")
     else:
         try:
-            save_best_model(all_model_results, evaluation, "model_files", logger)
+            save_best_model(all_model_results, evaluation, "model_files", logger, config=config)
             print("[search_mode] Best model saved")
         except Exception as e:
             print(f"[search_mode] ERROR saving best model: {str(e)}")

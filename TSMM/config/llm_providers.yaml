@@ -1,0 +1,54 @@
+default_provider: local_transformers
+providers:
+  github_models:
+    enabled: false
+    type: github_models
+    base_url: https://models.inference.ai.azure.com
+    chat_endpoint: /chat/completions
+    model: gpt-4o-mini
+    api_key: env:GITHUB_TOKEN
+    auth_scheme: Bearer
+    temperature: 0.2
+    max_tokens: 900
+    system_prompt: You are a risk-aware trading assistant focused on technical signal
+      integrity.
+  local_ollama:
+    enabled: true
+    type: ollama
+    base_url: http://127.0.0.1:11434
+    model: qwen2.5:7b-instruct
+    temperature: 0.2
+  local_transformers:
+    enabled: true
+    type: local_transformers
+    task: text2text-generation
+    model: google/flan-t5-small
+    temperature: 0.2
+    max_new_tokens: 220
+  openai_compatible:
+    enabled: false
+    type: openai_compatible
+    base_url: https://api.openai.com
+    chat_endpoint: /v1/chat/completions
+    model: gpt-4o-mini
+    api_key: env:OPENAI_API_KEY
+    auth_scheme: Bearer
+    temperature: 0.2
+    system_prompt: You are a risk-aware trading assistant.
+  anthropic:
+    enabled: false
+    type: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-3-5-sonnet-latest
+    api_key: env:ANTHROPIC_API_KEY
+    anthropic_version: '2023-06-01'
+    max_tokens: 600
+    temperature: 0.2
+  huggingface:
+    enabled: false
+    type: huggingface
+    model: mistralai/Mistral-7B-Instruct-v0.3
+    inference_endpoint: ''
+    api_key: env:HUGGINGFACE_API_KEY
+    max_new_tokens: 400
+    temperature: 0.2

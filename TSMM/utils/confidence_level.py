@@ -16,6 +16,7 @@ import logging
 from typing import Dict, List, Tuple, Optional, Any
 import tempfile
 import os
+import re
 
 
 def calculate_features_from_window(window: np.ndarray) -> Dict[str, float]:
@@ -479,6 +480,60 @@ def get_forecast_confidence_levels(
     
     # Return the probability of correct prediction for each window
     return [r['confidence_correct'] for r in results]
+
+
+def resolve_timeframe_key(config: Dict[str, Any]) -> str:
+    """Resolve timeframe key from config, falling back to data_path pattern parsing."""
+    tf = str(config.get('timeframe', '') or '').strip().lower()
+    if tf:
+        return tf
+
+    data_path = str(config.get('data_path', '') or '').lower()
+    # Patterns like xauusd_7h_2009.csv, _10m_, _1w_, etc.
+    m = re.search(r'(?<!\d)(\d+\s*[mhdw])(?!\w)', data_path)
+    if m:
+        return m.group(1).replace(' ', '')
+
+    return 'unknown_tf'
+
+
+def get_discriminator_store_path(
+    config: Dict[str, Any],
+    model_name: str,
+    timeframe_key: str,
+) -> str:
+    confidence_config = config.get('confidence', {}) or {}
+    base_dir = str(confidence_config.get('directory', 'model_files/confidence_discriminators'))
+    os.makedirs(base_dir, exist_ok=True)
+    safe_model = str(model_name).replace('/', '_').replace('\\', '_')
+    safe_tf = str(timeframe_key).replace('/', '_').replace('\\', '_')
+    return os.path.join(base_dir, f'{safe_tf}__{safe_model}.joblib')
+
+
+def save_discriminator_for_context(
+    discriminator: ConfidenceDiscriminator,
+    config: Dict[str, Any],
+    model_name: str,
+    timeframe_key: str,
+) -> str:
+    path = get_discriminator_store_path(config, model_name, timeframe_key)
+    discriminator.save(path)
+    return path
+
+
+def estimate_input_fooling_risk(
+    discriminator: ConfidenceDiscriminator,
+    latest_window: np.ndarray,
+) -> Dict[str, Any]:
+    """Estimate probability that latest input window is problematic for sign prediction."""
+    pred, probs = discriminator.predict_confidence(latest_window)
+    p_correct = float(probs[1] if len(probs) > 1 else probs[0])
+    p_wrong = float(1.0 - p_correct)
+    return {
+        'is_likely_correct': bool(pred == 1),
+        'probability_correct_sign': p_correct,
+        'probability_wrong_sign': p_wrong,
+    }
 
 
 # =============================================================================

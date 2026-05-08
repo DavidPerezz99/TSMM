@@ -8,6 +8,7 @@ estimation.
 
 import numpy as np
 import pandas as pd
+import re
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -624,12 +625,14 @@ def evaluate_models(models, df, config):
     """
     from utils.confidence_level import (
         train_confidence_discriminator, get_forecast_confidence_levels,
-        detect_forecast_explosion
+        detect_forecast_explosion, resolve_timeframe_key,
+        save_discriminator_for_context, estimate_input_fooling_risk
     )
     
     evaluation = {}
     future_forecasts = {}
     confidence_discriminators = {}
+    timeframe_key = resolve_timeframe_key(config)
     
     test_size = config['test_size']
     target = config['target_features'][0]
@@ -797,6 +800,44 @@ def evaluate_models(models, df, config):
                 model_eval['classification_report'] = cm_results['confusion_matrices']
                 model_eval['figures'].extend(cm_results['figures'])
 
+                # Train confidence discriminator (timeframe-scoped)
+                discriminator = train_confidence_discriminator(
+                    model_data, X_val, y_val_true, y_val_pred, config
+                )
+                if discriminator:
+                    confidence_discriminators[model_name] = discriminator
+                    future_windows = np.array([X_last] * min(horizon, 10))
+                    conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
+                    model_eval['confidence_levels'] = conf_levels
+                    try:
+                        disc_path = save_discriminator_for_context(
+                            discriminator=discriminator,
+                            config=config,
+                            model_name=model_name,
+                            timeframe_key=timeframe_key,
+                        )
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'path': disc_path,
+                        }
+                    except Exception as disc_save_err:
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'error': str(disc_save_err),
+                        }
+
+                    try:
+                        model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
+                            discriminator=discriminator,
+                            latest_window=X_last,
+                        )
+                    except Exception as risk_err:
+                        model_eval['input_fooling_risk'] = {
+                            'error': str(risk_err)
+                        }
+
                 # Train confidence discriminator
                 discriminator = train_confidence_discriminator(
                     model_data, X_val, y_val_true, y_val_pred, config
@@ -807,6 +848,34 @@ def evaluate_models(models, df, config):
                     future_windows = np.array([X_last] * min(horizon, 10))  # Simplified
                     conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
                     model_eval['confidence_levels'] = conf_levels
+                    try:
+                        disc_path = save_discriminator_for_context(
+                            discriminator=discriminator,
+                            config=config,
+                            model_name=model_name,
+                            timeframe_key=timeframe_key,
+                        )
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'path': disc_path,
+                        }
+                    except Exception as disc_save_err:
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'error': str(disc_save_err),
+                        }
+
+                    try:
+                        model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
+                            discriminator=discriminator,
+                            latest_window=X_last,
+                        )
+                    except Exception as risk_err:
+                        model_eval['input_fooling_risk'] = {
+                            'error': str(risk_err)
+                        }
 
                 # Detect forecast explosion
                 explosion_result = detect_forecast_explosion(
@@ -942,6 +1011,44 @@ def evaluate_models(models, df, config):
                 model_eval['confusion_matrix'] = cm_results['summary']
                 model_eval['classification_report'] = cm_results['confusion_matrices']
                 model_eval['figures'].extend(cm_results['figures'])
+
+                # Train confidence discriminator (timeframe-scoped)
+                discriminator = train_confidence_discriminator(
+                    model_data, X_val, y_val_true, y_val_pred, config
+                )
+                if discriminator:
+                    confidence_discriminators[model_name] = discriminator
+                    future_windows = np.array([X_last] * min(horizon, 10))
+                    conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
+                    model_eval['confidence_levels'] = conf_levels
+                    try:
+                        disc_path = save_discriminator_for_context(
+                            discriminator=discriminator,
+                            config=config,
+                            model_name=model_name,
+                            timeframe_key=timeframe_key,
+                        )
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'path': disc_path,
+                        }
+                    except Exception as disc_save_err:
+                        model_eval['discriminator'] = {
+                            'timeframe': timeframe_key,
+                            'model': model_name,
+                            'error': str(disc_save_err),
+                        }
+
+                    try:
+                        model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
+                            discriminator=discriminator,
+                            latest_window=X_last,
+                        )
+                    except Exception as risk_err:
+                        model_eval['input_fooling_risk'] = {
+                            'error': str(risk_err)
+                        }
 
                 # Explosion detection
                 explosion_result = detect_forecast_explosion(
@@ -1091,7 +1198,7 @@ def evaluate_models(models, df, config):
     return evaluation, future_forecasts
 
 
-def save_best_model(models, evaluation, model_dir, logger):
+def save_best_model(models, evaluation, model_dir, logger, config=None):
     """Save the best performing model based on MAE."""
     os.makedirs(model_dir, exist_ok=True)
     best_score = float('inf')
@@ -1108,11 +1215,31 @@ def save_best_model(models, evaluation, model_dir, logger):
         logger.error("No valid model found for saving")
         return
     
+    def _infer_timeframe_from_config(cfg: Dict[str, Any]) -> str:
+        if not isinstance(cfg, dict):
+            return "na"
+        tf = str(cfg.get('timeframe', '') or '').strip().lower()
+        if tf:
+            return tf
+        dp = str(cfg.get('data_path', '') or '').strip().lower()
+        m = re.search(r"(\d+[mhdw])", dp)
+        if m:
+            return m.group(1)
+        return "na"
+
     try:
         model_data = models[best_model_name]
         model = model_data['model']
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(model_dir, f"{best_model_name}_{timestamp}.joblib")
+        if config is None and isinstance(model_data, dict):
+            config = model_data.get('config')
+
+        target_slug = str((config or {}).get('target_col', 'na')).strip().lower() if isinstance(config, dict) else 'na'
+        if target_slug not in {'high', 'low', 'open', 'close'}:
+            target_slug = 'na'
+        timeframe_slug = _infer_timeframe_from_config(config or {})
+
+        model_path = os.path.join(model_dir, f"{best_model_name}_{target_slug}_{timeframe_slug}_{timestamp}.joblib")
         
         if best_model_name == 'sarimax':
             if isinstance(model, SARIMAXResults):
@@ -1127,9 +1254,15 @@ def save_best_model(models, evaluation, model_dir, logger):
             artifacts['scaler_X'] = model_data['scaler_X']
         if 'scaler_y' in model_data:
             artifacts['scaler_y'] = model_data['scaler_y']
+        if 'scalers' in model_data and isinstance(model_data.get('scalers'), dict):
+            scalers = model_data.get('scalers') or {}
+            if 'scaler_X' not in artifacts and scalers.get('X') is not None:
+                artifacts['scaler_X'] = scalers.get('X')
+            if 'scaler_y' not in artifacts and scalers.get('y') is not None:
+                artifacts['scaler_y'] = scalers.get('y')
         
         if artifacts:
-            artifacts_path = os.path.join(model_dir, f"{best_model_name}_artifacts_{timestamp}.joblib")
+            artifacts_path = os.path.join(model_dir, f"{best_model_name}_artifacts_{target_slug}_{timeframe_slug}_{timestamp}.joblib")
             joblib.dump(artifacts, artifacts_path)
         
         logger.info(f"Saved best model ({best_model_name}) to {model_path}")

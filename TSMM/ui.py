@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 import yaml
 
-from utils.live_data import update_fx_master_table_file
+from utils.live_data import update_fx_master_table_file, update_fx_master_table_db
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State", "ctx"])
 Dash = dash_mod.Dash
@@ -32,6 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_MAIN = os.path.join(BASE_DIR, "config", "config.yaml")
 CFG_TRADING = os.path.join(BASE_DIR, "config", "trading_agent.yaml")
 CFG_SWEEP = os.path.join(BASE_DIR, "config", "sweep_definition.yaml")
+CFG_LLM = os.path.join(BASE_DIR, "config", "llm_providers.yaml")
 INTERRUPT_FLAG = os.path.join(BASE_DIR, "reports", "runtime", "mode_b_interrupt.flag")
 
 
@@ -71,76 +72,162 @@ _dash_cfg = (_cfg_trading.get("dashboard") or {})
 
 app.layout = html.Div(
     [
-        html.H2("TSMM Configuration UI"),
+        html.Div(
+            [
+                html.H2("TSMM Configuration UI", className="tsmm-title"),
+                html.Div("Professional config controls for forecasting, trading, and refresh operations.", className="tsmm-subtitle"),
+            ],
+            style={"marginBottom": "12px"},
+        ),
         dcc.Tabs(
             [
                 dcc.Tab(
                     label="Main Config",
                     children=[
-                        dcc.Textarea(id="main-text", value=_read_text(CFG_MAIN), style={"width": "100%", "height": "520px"}),
-                        html.Button("Save Main Config", id="save-main", n_clicks=0),
-                        html.Div(id="save-main-status"),
+                        html.Div(
+                            [
+                                dcc.Textarea(id="main-text", value=_read_text(CFG_MAIN), className="tsmm-input", style={"width": "100%", "height": "520px"}),
+                                html.Div(
+                                    [
+                                        html.Button("Save Main Config", id="save-main", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                        html.Div(id="save-main-status", className="tsmm-status-info"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                    style={"marginTop": "10px"},
+                                ),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
+                        ),
                     ],
                 ),
                 dcc.Tab(
                     label="Trading Agent Config",
                     children=[
-                        dcc.Textarea(id="trading-text", value=_read_text(CFG_TRADING), style={"width": "100%", "height": "520px"}),
-                        html.Button("Save Trading Config", id="save-trading", n_clicks=0),
-                        html.Div(id="save-trading-status"),
+                        html.Div(
+                            [
+                                dcc.Textarea(id="trading-text", value=_read_text(CFG_TRADING), className="tsmm-input", style={"width": "100%", "height": "520px"}),
+                                html.Div(
+                                    [
+                                        html.Button("Save Trading Config", id="save-trading", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                        html.Div(id="save-trading-status", className="tsmm-status-info"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                    style={"marginTop": "10px"},
+                                ),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
+                        ),
                     ],
                 ),
                 dcc.Tab(
                     label="Sweep Definition",
                     children=[
-                        dcc.Textarea(id="sweep-text", value=_read_text(CFG_SWEEP), style={"width": "100%", "height": "520px"}),
-                        html.Button("Save Sweep Config", id="save-sweep", n_clicks=0),
-                        html.Div(id="save-sweep-status"),
+                        html.Div(
+                            [
+                                dcc.Textarea(id="sweep-text", value=_read_text(CFG_SWEEP), className="tsmm-input", style={"width": "100%", "height": "520px"}),
+                                html.Div(
+                                    [
+                                        html.Button("Save Sweep Config", id="save-sweep", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                        html.Div(id="save-sweep-status", className="tsmm-status-info"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                    style={"marginTop": "10px"},
+                                ),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
+                        ),
+                    ],
+                ),
+                dcc.Tab(
+                    label="LLM Providers",
+                    children=[
+                        html.Div(
+                            [
+                                html.P("Configure API providers and secrets for Agent A/B LLM assistance."),
+                                dcc.Textarea(id="llm-text", value=_read_text(CFG_LLM), className="tsmm-input", style={"width": "100%", "height": "520px"}),
+                                html.Div(
+                                    [
+                                        html.Button("Save LLM Providers Config", id="save-llm", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                        html.Div(id="save-llm-status", className="tsmm-status-info"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                    style={"marginTop": "10px"},
+                                ),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
+                        ),
                     ],
                 ),
                 dcc.Tab(
                     label="Data Refresh",
                     children=[
-                        html.H4("Master Table Update"),
-                        html.Label("Master table CSV path"),
-                        dcc.Input(
-                            id="master-path",
-                            type="text",
-                            value=_dash_cfg.get("master_table_path") or _data_refresh_cfg.get("raw_data_path", ""),
-                            style={"width": "100%"},
+                        html.Div(
+                            [
+                                html.H4("Master Table Update"),
+                                html.P("Works with CSV and SQLite. Use SQLite path for SQL-first flow.", className="tsmm-status-info"),
+                                html.Div([html.Span("Master table path", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
+                                dcc.Input(
+                                    id="master-path",
+                                    type="text",
+                                    value=_dash_cfg.get("master_table_path") or _data_refresh_cfg.get("raw_data_path", ""),
+                                    className="tsmm-input",
+                                    style={"width": "100%"},
+                                ),
+                                html.Div([html.Span("Tiingo symbol", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
+                                dcc.Input(id="tiingo-symbol", type="text", value=_data_refresh_cfg.get("symbol", "xauusd"), className="tsmm-input", style={"width": "100%"}),
+                                html.Div([html.Span("Tiingo rate", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
+                                dcc.Input(id="tiingo-rate", type="text", value=_data_refresh_cfg.get("rate", "1min"), className="tsmm-input", style={"width": "100%"}),
+                                html.Div([html.Span("Token env var", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
+                                dcc.Input(
+                                    id="token-env",
+                                    type="text",
+                                    value=_dash_cfg.get("tiingo_token_env", _data_refresh_cfg.get("token_env", "TIINGO_API_TOKEN")),
+                                    className="tsmm-input",
+                                    style={"width": "100%"},
+                                ),
+                                html.Div(
+                                    [
+                                        html.Button("Update Master Now", id="update-master-btn", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                        html.Div(id="update-master-ui-status", className="tsmm-status-info"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                    style={"marginTop": "10px"},
+                                ),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
                         ),
-                        html.Br(),
-                        html.Label("Tiingo symbol"),
-                        dcc.Input(id="tiingo-symbol", type="text", value=_data_refresh_cfg.get("symbol", "xauusd"), style={"width": "100%"}),
-                        html.Br(),
-                        html.Label("Tiingo rate"),
-                        dcc.Input(id="tiingo-rate", type="text", value=_data_refresh_cfg.get("rate", "1min"), style={"width": "100%"}),
-                        html.Br(),
-                        html.Label("Token env var"),
-                        dcc.Input(
-                            id="token-env",
-                            type="text",
-                            value=_dash_cfg.get("tiingo_token_env", _data_refresh_cfg.get("token_env", "TIINGO_API_TOKEN")),
-                            style={"width": "100%"},
-                        ),
-                        html.Br(),
-                        html.Button("Update Master Now", id="update-master-btn", n_clicks=0),
-                        html.Div(id="update-master-ui-status", style={"marginTop": "10px"}),
                     ],
                 ),
                 dcc.Tab(
                     label="Mode B Control",
                     children=[
-                        html.Button("Interrupt Mode B", id="stop-b", n_clicks=0),
-                        html.Button("Resume Mode B", id="resume-b", n_clicks=0, style={"marginLeft": "8px"}),
-                        html.Div(id="mode-b-status", style={"marginTop": "10px"}),
-                        html.P("Open dashboard separately with: py -3.11 dashboard.py"),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Button("Interrupt Mode B", id="stop-b", n_clicks=0, className="tsmm-btn tsmm-btn-secondary"),
+                                        html.Button("Resume Mode B", id="resume-b", n_clicks=0, className="tsmm-btn tsmm-btn-primary"),
+                                    ],
+                                    className="tsmm-toolbar",
+                                ),
+                                html.Div(id="mode-b-status", className="tsmm-status-info", style={"marginTop": "10px"}),
+                                html.P("Open dashboard separately with: py -3.11 dashboard.py"),
+                            ],
+                            className="tsmm-card",
+                            style={"padding": "12px"},
+                        ),
                     ],
                 ),
             ]
         ),
     ],
-    style={"padding": "12px"},
+    className="tsmm-shell",
+    style={"padding": "16px"},
 )
 
 
@@ -157,6 +244,11 @@ def save_trading(_, val):
 @app.callback(Output("save-sweep-status", "children"), Input("save-sweep", "n_clicks"), State("sweep-text", "value"), prevent_initial_call=True)
 def save_sweep(_, val):
     return _write_text(CFG_SWEEP, val or "")
+
+
+@app.callback(Output("save-llm-status", "children"), Input("save-llm", "n_clicks"), State("llm-text", "value"), prevent_initial_call=True)
+def save_llm(_, val):
+    return _write_text(CFG_LLM, val or "")
 
 
 @app.callback(Output("mode-b-status", "children"), Input("stop-b", "n_clicks"), Input("resume-b", "n_clicks"))
@@ -187,12 +279,21 @@ def update_master_ui(_, master_path, symbol, rate, token_env):
     if not token:
         return f"Missing token in env var: {token_key}"
 
-    result = update_fx_master_table_file(
-        master_table_path=master_path or "",
-        rate=(rate or "1min").strip(),
-        symbol=(symbol or "xauusd").strip().lower(),
-        token=token,
-    )
+    p = str(master_path or "").strip()
+    if p.lower().endswith(".db") or p.lower().endswith(".sqlite"):
+        result = update_fx_master_table_db(
+            db_path=p,
+            rate=(rate or "1min").strip(),
+            symbol=(symbol or "xauusd").strip().lower(),
+            token=token,
+        )
+    else:
+        result = update_fx_master_table_file(
+            master_table_path=p,
+            rate=(rate or "1min").strip(),
+            symbol=(symbol or "xauusd").strip().lower(),
+            token=token,
+        )
     if not bool(result.get("updated", False)):
         return f"Update failed: {result.get('error', 'unknown error')}"
     return f"Master updated: +{int(result.get('new_rows', 0))} rows | latest={result.get('latest_date', 'N/A')}"

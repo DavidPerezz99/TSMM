@@ -1,127 +1,253 @@
-# Trading Agent configuration (deterministic decision engine)
-
 agent:
   enabled: true
-  # mode_a: planning/report only
-  # mode_b: active management/execution (requires broker + served models)
-  mode: "mode_a"
-
-  # User policy: Mode A first by default
+  mode: mode_a
   default_start_mode_a: true
-
-  # Whether each action must be manually confirmed.
-  # If false and mode_b active, agent may execute without per-action confirmation.
   confirm_live_execution: true
-
-  timezone: "America/Bogota"
-
+  approval_channels:
+  - popup
+  - terminal
+  timezone: America/Bogota
 mode_a:
   enabled: true
   max_operations_per_session: 1
   allow_long: true
   allow_short: true
-  # Optional explicit model selection for trading-plan generation.
-  # If empty, the app picks the best model by MAE.
-  selected_model: ""
-  use_llm_explanation: false  # Narrative only. Decision logic remains deterministic.
-
+  selected_model: ''
+  use_llm_explanation: true
+agent_a_fallback:
+  enabled: true
+  auto_discover: true
+  target_families:
+  - high
+  - low
+  - close
+  - open
+  prefer_timeframes:
+  - 3h
+  - 1h
+  - 30m
+  - 10m
+  - 12h
+  - 24h
+  - 1w
+  max_attempts: 24
+  attempts:
+  - config_path: config/high3hResults/nbeats/top1_09353.yaml
+    timeframe: 3h
+    model: nbeats
+  - config_path: config/high30mResults/nbeats/top1_07163.yaml
+    timeframe: 30m
+    model: nbeats
+  - config_path: config/high10mResults/nbeats/top1_07175.yaml
+    timeframe: 10m
+    model: nbeats
 mode_b:
   enabled: false
   allow_open_new_positions: true
   manage_existing_positions: true
-  poll_seconds: 60
+  poll_seconds: 600
   allow_endpoint_signals: true
-  interrupt_flag_path: "reports/runtime/mode_b_interrupt.flag"
-
+  close_consensus_threshold: 0.25
+  interrupt_flag_path: reports/runtime/mode_b_interrupt.flag
   operation_limits:
     per_timeframe:
-      "10m": 2
-      "30m": 2
-      "1h": 2
-      "3h": 2
-      "7h": 1
-      "12h": 1
-      "24h": 1
-      "1w": 1
-
+      10m: 2
+      30m: 2
+      1h: 2
+      3h: 2
+      7h: 1
+      12h: 1
+      24h: 1
+      1w: 1
 risk:
   risk_per_trade_pct: 0.5
   daily_max_loss_pct: 2.0
   weekly_max_loss_pct: 5.0
   max_drawdown_pct: 15.0
   max_open_positions: 3
-
   stop_loss_pct: 0.8
   take_profit_pct: 1.6
   trailing:
     enabled: true
-    mode: "probability"
+    mode: probability
     trail_pct_base: 0.5
     min_confidence_to_extend: 0.65
-
-  min_confidence_to_trade: 0.55
-  min_cm_accuracy_to_trade: 0.52
-
+  min_confidence_to_trade: 0.5
+  min_cm_accuracy_to_trade: 0.5
+  max_input_fooling_risk: 0.45
 execution:
+  symbol: XAUUSD
   default_volume: 0.01
   allowed_volume_by_timeframe:
-    "10m": 0.01
-    "30m": 0.01
-    "1h": 0.01
-    "3h": 0.01
-    "7h": 0.01
-    "12h": 0.01
-    "24h": 0.01
-    "1w": 0.01
-
+    10m: 0.01
+    30m: 0.01
+    1h: 0.01
+    3h: 0.01
+    7h: 0.01
+    12h: 0.01
+    24h: 0.01
+    1w: 0.01
   slippage_bps: 2.0
   commission_per_trade: 0.0
   spread_bps: 2.0
-
 broker:
-  active: "mt5"  # mt5 only for initial version
+  active: mt5
   mt5:
+    enabled: true
+    login: env:MT5_LOGIN
+    password: env:MT5_PASSWORD
+    server: env:MT5_SERVER
+    path: env:MT5_TERMINAL_PATH
+  iqoption:
     enabled: false
-    login: 0
-    password: ""
-    server: ""
-    path: ""
-
-# Multi-timeframe model endpoints used in Mode B for re-evaluation
+    email: env:IQOPTION_EMAIL
+    password: env:IQOPTION_PASSWORD
+    balance_mode: PRACTICE
 model_endpoints:
-  "10m": "http://127.0.0.1:8000/predict/10m"
-  "30m": "http://127.0.0.1:8000/predict/30m"
-  "1h": "http://127.0.0.1:8000/predict/1h"
-  "3h": "http://127.0.0.1:8000/predict/3h"
-  "7h": "http://127.0.0.1:8000/predict/7h"
-  "12h": "http://127.0.0.1:8000/predict/12h"
-  "24h": "http://127.0.0.1:8000/predict/24h"
-  "1w": "http://127.0.0.1:8000/predict/1w"
-
+  10m: http://127.0.0.1:8000/predict/10m
+  30m: http://127.0.0.1:8000/predict/30m
+  1h: http://127.0.0.1:8000/predict/1h
+  3h: http://127.0.0.1:8000/predict/3h
+  7h:
+    url: http://127.0.0.1:8000/predict/7h
+    model: ulr
+    config_path: config/high7hResults/ulr/top1_07890.yaml
+  12h: http://127.0.0.1:8000/predict/12h
+  24h: http://127.0.0.1:8000/predict/24h
+  1w: http://127.0.0.1:8000/predict/1w
 reporting:
   enabled: true
-  output_dir: "reports/trading_plans"
-  filename_prefix: "trading_plan"
-
+  output_dir: reports/trading_plans
+  filename_prefix: trading_plan
 probability_maps:
   enabled: true
   n_paths: 1200
   n_price_bins: 70
-
+trading_job:
+  session_hours: 7
+  extension_max_hours: 168
+  extension_request_window_minutes: 15
+  approval_timeout_seconds: 900
+  fill_check_seconds: 30
+  max_wait_fill_minutes: 420
+  stop_flag_path: reports/runtime/trading_job_stop.flag
+  state_path: reports/runtime/trading_job_state.json
+llm:
+  enabled: true
+  provider: local_transformers
+  providers_config_path: config\llm_providers.yaml
+  timeout_seconds: 120
+  assist_every_seconds: 300
+  signal_analysis:
+    enabled: true
+    max_context_chars: 14000
+    include_sentiment: true
+    include_technical_metrics: true
+sentiment:
+  enabled: true
+  symbol: GC=F
+  enable_yahoo: true
+  enable_reddit: true
+  enable_tradingview: true
+  tradingview_symbol: XAUUSD
+  enable_x: false
+  x_bearer_env: X_BEARER_TOKEN
+  reddit_query: xauusd gold market
+  x_query: xauusd OR gold OR fed OR inflation
+  max_items_per_source: 12
+memory:
+  enabled: true
+  db_path: reports/runtime/agent_memory.sqlite
+  embedding_dim: 256
+  retrieval_top_k: 6
+  retrieval_kinds:
+  - signal
+  - assistant_note
+  - kb_document
+  ingest_kb_on_start: false
+  knowledge_base_paths: []
+communication:
+  enabled_default: false
+  channel_file_path: reports/runtime/agent_channel.jsonl
+  control_flag_path: reports/runtime/agent_channel_enabled.flag
+  popup_on_channel_message: true
+  popup_on_emergency: true
+approval_policy:
+  normal_timeout_seconds: 7200
+  fast_timeout_seconds: 120
+  emergency_lead_minutes: 5
+  channel_user_triggered_only: true
+emergency:
+  enabled: true
+  require_approval: true
+  score_jump_threshold: 0.55
+email_notifications:
+  enabled: false
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  use_tls: true
+  sender_email: env:TSMM_EMAIL_SENDER
+  receiver_email: env:TSMM_EMAIL_RECEIVER
+  username: env:TSMM_EMAIL_USERNAME
+  password: env:TSMM_EMAIL_APP_PASSWORD
+telegram_notifications:
+  enabled: true
+  bot_token: env:TSMM_TELEGRAM_BOT_TOKEN
+  chat_id: env:TSMM_TELEGRAM_CHAT_ID
+  parse_mode: plain
+  disable_web_page_preview: true
+  send_on_all_messages: false
+telegram_listener:
+  enabled: true
+  allowed_chat_ids: []
+  log_conversations: true
+  reply_on_non_command: true
+  require_secret: false
+  secret_env: TSMM_TELEGRAM_COMMAND_SECRET
+  allowed_commands:
+  - status
+  - deploy
+  - trading
+  - endpoint
+  - ui
+  - resource
+  poll_seconds: 3
+  latest_request_status_interval_seconds: 120
+  command_prefix: /tsmm
+  run_deploy_script: scripts/deploy_agent_pipeline.py
+  default_pipeline_config: config/agent_pipeline.yaml
+  allow_shell_commands: false
+endpoint_lifecycle:
+  on_demand_start: true
+  service_script: scripts/local_signal_endpoint_service.py
+  host: 127.0.0.1
+  port: 8000
+  startup_wait_seconds: 20
+resource_guard:
+  enabled: true
+  cpu_threshold_pct: 95
+  ram_threshold_pct: 95
+  sustained_seconds: 240
+  cooldown_seconds: 600
+  disable_endpoint_on_relief: true
+  disable_uis_on_relief: true
 dashboard:
   enabled: true
-  master_table_path: ""
+  master_table_path: data\market_data.sqlite
+  startup_sync_enabled: true
+  startup_max_pulls: 2
+  startup_freshness_lag_minutes: 20
+  startup_status_path: reports/runtime/startup_sync_status.json
   latest_records: 50000
-  # Legacy alias kept for compatibility with older dashboard builds.
-  raw_data_path: "data/xauusd/xauusd_1m_live.csv"
-  state_path: "reports/runtime/agent_state_latest.json"
-  tiingo_symbol: "xauusd"
-  tiingo_rate: "1min"
-  tiingo_token_env: "TIINGO_API_TOKEN"
+  raw_data_path: data/xauusd/xauusd_1m_live.csv
+  state_path: reports/runtime/agent_state_latest.json
+  tiingo_symbol: xauusd
+  tiingo_rate: 1min
+  tiingo_token_env: TIINGO_API_TOKEN
   auto_update_master: true
-  auto_update_every_ticks: 3
+  auto_update_every_ticks: 1
   live_past_minutes: 1440
   heatmap_minutes: 480
   pdf_minutes: 360
   group_minutes: 420
-  refresh_seconds: 20
+  refresh_seconds: 60
