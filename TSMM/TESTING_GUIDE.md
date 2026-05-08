@@ -179,3 +179,9 @@ python dashboard.py
 ```
 
 Open browser at `http://127.0.0.1:8050`.
+
+## 13) Predictor endpoint POST formats
+
+For the exact POST body format and `ingestion_pipeline.py` templates for each currently available `top1` predictor artifact, see:
+
+- [PREDICTOR_ENDPOINT_FORMATS.md](PREDICTOR_ENDPOINT_FORMATS.md)

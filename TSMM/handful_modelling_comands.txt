@@ -1,0 +1,1 @@
+Set-Location "c:\Users\artur\3D Objects\tsmm\TSMM_beginnerVersion\TSMM"; $env:CONFIG_PATH="config/high10mResults/nbeats/top1_08098.yaml"; & "C:/Users/artur/AppData/Local/Programs/Python/Python311/python.exe" app.py
