@@ -417,18 +417,23 @@ def train_confidence_discriminator(
         if n_samples is not None:
             X_test = np.asarray(X_test)
 
-            # Ensure at least 2D
             if X_test.ndim == 1:
-                X_test = X_test.reshape(-1, 1)
+                # A single flattened sample: repeat the sample for each label.
+                X_test = X_test.reshape(1, -1)
+                X_test = np.repeat(X_test, n_samples, axis=0)
 
-            if X_test.ndim == 2 and X_test.shape[0] != n_samples:
+            elif X_test.ndim == 2 and X_test.shape[0] != n_samples:
+                # A single time-window (n_steps, n_features) used to recursively
+                # generate many predictions should be repeated as a whole window,
+                # not tiled row-wise into unrelated samples.
+                X_test = np.repeat(X_test[np.newaxis, :, :], n_samples, axis=0)
+
+            elif X_test.ndim == 3 and X_test.shape[0] != n_samples:
                 if X_test.shape[0] == 1:
-                    # Single window: repeat for all samples
                     X_test = np.repeat(X_test, n_samples, axis=0)
                 else:
-                    # Tile rows to cover all samples, then truncate
                     reps = int(np.ceil(n_samples / X_test.shape[0]))
-                    X_tiled = np.tile(X_test, (reps, 1))
+                    X_tiled = np.tile(X_test, (reps, 1, 1))
                     X_test = X_tiled[:n_samples]
 
         discriminator = ConfidenceDiscriminator(

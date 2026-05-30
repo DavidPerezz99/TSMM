@@ -21,7 +21,13 @@ from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+
+try:
+    import sitecustomize  # noqa: F401
+except Exception:
+    pass
 
 from utils.logger import setup_logger
 import logging
@@ -33,15 +39,27 @@ from utils.evaluator import evaluate_models, save_best_model
 from utils.metrics_saver import save_all_models_metrics, save_forecast_to_file
 from utils.interpretability import add_interpretability
 from utils.investing_agent import load_trading_config
-from utils.trading_job import start_trading_job, resume_trading_job, stop_trading_job
+from utils.trading_job import start_trading_job, resume_trading_job, stop_trading_job, kill_trading_job, resolve_trading_start_request
 from utils.live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master
+
+
+def _resolve_app_path(path_value: str) -> str:
+    path_str = str(path_value or '').strip()
+    if not path_str:
+        return path_str
+    if os.path.isabs(path_str):
+        return path_str
+    return os.path.join(BASE_DIR, path_str)
 
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="TSMM Forecasting and Trading Job CLI")
     parser.add_argument("command", nargs="?", default="forecast", choices=["forecast", "trading-job"])
-    parser.add_argument("action", nargs="?", default="start", choices=["start", "resume", "stop"])
+    parser.add_argument("action", nargs="?", default="start", choices=["start", "resume", "stop", "kill"])
     parser.add_argument("--plan-model", default=None, help="Optional model name to force for Agent A plan")
+    parser.add_argument("--job-id", default=None, help="Optional trading job id for start/resume/stop/kill")
+    parser.add_argument("--submission-mode", default=None, choices=["programmed", "market"], help="Optional order submission mode override for trading-job start")
+    parser.add_argument("--autonomous-trigger", default=None, choices=["mandatory_session", "autonomous_followup", "opposing_countertrade"], help="Internal autonomous launcher context for trading-job start")
     return parser.parse_args()
 
 
@@ -59,6 +77,7 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
     dict
         Configuration dictionary
     """
+    config_path = _resolve_app_path(config_path)
     with open(config_path) as f:
         config = yaml.safe_load(f)
     return config
@@ -80,6 +99,7 @@ def create_output_directory(config: dict) -> str:
     """
     output_config = config.get('output', {})
     output_dir = output_config.get('directory', 'reports')
+    output_dir = _resolve_app_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -457,10 +477,15 @@ def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logg
 def main():
     """Main entry point for the forecasting application."""
     args = parse_cli_args()
+
+    # Normalize relative paths to the app directory so launches from parent
+    # folders or other shells behave consistently.
+    os.chdir(BASE_DIR)
     
     # Load configuration
     config_path = os.environ.get('CONFIG_PATH', 'config/config.yaml')
     config = load_config(config_path)
+    output_dir = create_output_directory(config)
     
     # Setup logging
     log_dir = config.get('log_dir', 'logs')
@@ -470,44 +495,64 @@ def main():
     
     try:
         # Trading job manual stop command does not require a forecast run.
-        if args.command == "trading-job" and args.action == "stop":
+        if args.command == "trading-job" and args.action in {"stop", "kill"}:
             trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
             trading_cfg = load_trading_config(trading_cfg_path)
             output_dir = create_output_directory(config)
-            stop_path = stop_trading_job(output_dir, trading_cfg)
-            print(f"Trading job stop flag written: {stop_path}")
-            logger.info("Trading job stop requested via stop flag: %s", stop_path)
+            action_result = stop_trading_job(output_dir, trading_cfg, job_id=args.job_id) if args.action == "stop" else kill_trading_job(output_dir, trading_cfg, job_id=args.job_id)
+            print(str(action_result.get("message") or f"Trading job {args.action} request completed."))
+            if bool(action_result.get("ok", False)):
+                logger.info("Trading job %s requested. result=%s", args.action, action_result)
+                return
+            logger.warning("Trading job %s requested but no active jobs were found. requested_job_id=%s", args.action, args.job_id)
             return
 
-        # Startup sync: refresh master from Tiingo before backend pipeline continues.
-        maybe_sync_master_on_backend_start(config, logger)
-
-        # Run forecasting pipeline
-        results = run_forecasting_pipeline(config, logger)
-        
-        # Create output directory
-        output_dir = create_output_directory(config)
-        
-        # Trading-job start/resume mode.
+        trading_cfg = None
+        request_context = {}
+        effective_config = dict(config)
         if args.command == "trading-job":
             trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
             trading_cfg = load_trading_config(trading_cfg_path)
+            if args.action == "start":
+                request_context = resolve_trading_start_request(
+                    output_dir=output_dir,
+                    trading_cfg=trading_cfg,
+                    requested_submission_mode=args.submission_mode,
+                )
+                if args.autonomous_trigger:
+                    request_context["autonomous_trigger"] = str(args.autonomous_trigger).strip().lower()
+                    request_context["autonomous"] = True
+                effective_config["data_timeframe_minutes"] = int(request_context.get("grounding_timeframe_minutes") or effective_config.get("data_timeframe_minutes", 420) or 420)
+
+        # Startup sync: refresh master from Tiingo before backend pipeline continues.
+        maybe_sync_master_on_backend_start(effective_config, logger)
+
+        # Run forecasting pipeline
+        results = run_forecasting_pipeline(effective_config, logger)
+        
+        # Trading-job start/resume mode.
+        if args.command == "trading-job":
+            trading_cfg = trading_cfg or load_trading_config(os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml'))
 
             if args.action == "resume":
                 job_result = resume_trading_job(
-                    app_config=config,
+                    app_config=effective_config,
                     trading_cfg=trading_cfg,
                     output_dir=output_dir,
                     logger=logger,
+                    job_id=args.job_id,
                 )
             else:
                 job_result = start_trading_job(
-                    app_config=config,
+                    app_config=effective_config,
                     results=results,
                     trading_cfg=trading_cfg,
                     output_dir=output_dir,
                     logger=logger,
                     selected_model=args.plan_model,
+                    job_id=args.job_id,
+                    submission_mode_override=str((request_context.get("effective_submission_mode") or args.submission_mode or "programmed")),
+                    request_context=request_context,
                 )
 
             print("\n" + "=" * 60)

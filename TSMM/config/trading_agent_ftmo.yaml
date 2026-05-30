@@ -51,7 +51,7 @@ mode_b:
   poll_seconds: 300
   allow_endpoint_signals: true
   close_consensus_threshold: 0.25
-  interrupt_flag_path: reports/runtime/mode_b_interrupt.flag
+  interrupt_flag_path: reports/runtime/ftmo/mode_b_interrupt.flag
   operation_limits:
     per_timeframe:
       10m: 2
@@ -105,10 +105,10 @@ broker:
   active: mt5
   mt5:
     enabled: true
-    login: env:MT5_LOGIN
-    password: env:MT5_PASSWORD
-    server: env:MT5_SERVER
-    path: env:MT5_TERMINAL_PATH
+    login: env:MT5_FTMO_LOGIN
+    password: env:MT5_FTMO_PASSWORD
+    server: FTMO-Server3
+    path: C:\Program Files\FTMO Global Markets MT5 Terminal\terminal64.exe
   iqoption:
     enabled: false
     email: env:IQOPTION_EMAIL
@@ -159,15 +159,14 @@ trading_job:
   programmed_order_expiration_minutes: 420
   max_wait_fill_minutes: 420
   cleanup_closed_jobs: true
-  stop_flag_path: reports/runtime/trading_job_stop.flag
-  state_path: reports/runtime/trading_job_state.json
 runtime:
-  root_dir: reports/runtime
-  profile_label: Pepperstone
+  root_dir: reports/runtime/ftmo
+  job_id_prefix: FTMO
+  profile_label: FTMO
 account_mirror:
   enabled: true
-  peer_profile: FTMO
-  peer_trading_config_path: config/trading_agent_ftmo.yaml
+  peer_profile: Pepperstone
+  peer_trading_config_path: config/trading_agent.yaml
   mirror_job_starts: true
   mirror_stop_requests: true
   mirror_kill_requests: true
@@ -238,7 +237,7 @@ sentiment:
   max_items_per_source: 12
 memory:
   enabled: true
-  db_path: reports/runtime/agent_memory.sqlite
+  db_path: reports/runtime/ftmo/agent_memory.sqlite
   embedding_dim: 256
   retrieval_top_k: 6
   retrieval_kinds:
@@ -249,8 +248,6 @@ memory:
   knowledge_base_paths: []
 communication:
   enabled_default: false
-  channel_file_path: reports/runtime/agent_channel.jsonl
-  control_flag_path: reports/runtime/agent_channel_enabled.flag
   popup_on_channel_message: false
   popup_on_emergency: false
 operation_feedback:
@@ -319,23 +316,12 @@ telegram_listener:
   poll_seconds: 3
   latest_request_status_interval_seconds: 120
   active_jobs_status_interval_seconds: 300
-  command_prefix: /tsmm
+  command_prefix: /ftmo
+  allow_natural_language: false
   run_deploy_script: scripts/deploy_agent_pipeline.py
-  default_pipeline_config: config/agent_pipeline.yaml
+  default_pipeline_config: config/agent_pipeline_ftmo.yaml
   scheduled_model_refresh:
-    enabled: true
-    market_close_timezone: America/New_York
-    market_close_time: '17:00'
-    catch_up_missed_market_closes: true
-    check_interval_seconds: 60
-    restart_endpoint_after_done: true
-    weekend_utc_quiet_mode: true
-    weekend_quiet_timezone: America/New_York
-    weekend_quiet_start_day: 4
-    weekend_quiet_start_time: '17:00'
-    weekend_quiet_end_day: 6
-    weekend_quiet_end_time: '17:00'
-    weekend_stop_endpoint: true
+    enabled: false
   allow_shell_commands: false
 endpoint_lifecycle:
   on_demand_start: true
@@ -354,22 +340,18 @@ resource_guard:
 boot_recovery:
   enabled: true
   restart_listener: true
-  restart_endpoint: true
+  restart_endpoint: false
   resume_active_jobs: true
   send_telegram_alert: true
   send_console_alert: true
   console_alert_timeout_seconds: 20
-  log_path: reports/runtime/reboot_recovery_last.json
 dashboard:
   enabled: true
   master_table_path: data\market_data.sqlite
   startup_sync_enabled: true
   startup_max_pulls: 2
   startup_freshness_lag_minutes: 20
-  startup_status_path: reports/runtime/startup_sync_status.json
-  latest_records: 50000
   raw_data_path: data/xauusd/xauusd_1m_live.csv
-  state_path: reports/runtime/agent_state_latest.json
   tiingo_symbol: xauusd
   tiingo_rate: 1min
   tiingo_token_env: TIINGO_API_TOKEN

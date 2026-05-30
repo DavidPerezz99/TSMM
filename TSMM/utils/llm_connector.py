@@ -5,6 +5,10 @@ LLM connector for open-source and hosted providers used by trading agents.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
 from typing import Any, Dict, Optional
 
 import requests
@@ -12,6 +16,86 @@ import yaml
 
 
 _PIPELINE_CACHE: Dict[str, Any] = {}
+
+
+def _ollama_base_url(provider_cfg: Dict[str, Any]) -> str:
+    return str(provider_cfg.get("base_url", "http://127.0.0.1:11434")).rstrip("/")
+
+
+def _ollama_healthy(base_url: str, timeout_sec: int = 3) -> bool:
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=timeout_sec)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _candidate_ollama_executables(provider_cfg: Dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+
+    configured = str(provider_cfg.get("executable_path", "")).strip()
+    if configured:
+        candidates.append(configured)
+
+    discovered = shutil.which("ollama")
+    if discovered:
+        candidates.append(discovered)
+
+    home = Path.home()
+    common = [
+        home / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe",
+        Path("C:/Program Files/Ollama/ollama.exe"),
+        home / "AppData" / "Local" / "Ollama" / "ollama.exe",
+    ]
+    candidates.extend(str(path) for path in common)
+
+    ordered: list[str] = []
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _start_ollama_server(provider_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    base_url = _ollama_base_url(provider_cfg)
+    if _ollama_healthy(base_url):
+        return {"ok": True, "already_running": True}
+
+    executable = ""
+    for candidate in _candidate_ollama_executables(provider_cfg):
+        if os.path.exists(candidate):
+            executable = candidate
+            break
+    if not executable:
+        return {"ok": False, "error": "Ollama executable not found"}
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+
+    try:
+        subprocess.Popen(
+            [executable, "serve"],
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to start Ollama: {exc}"}
+
+    startup_wait_seconds = max(int(provider_cfg.get("startup_wait_seconds", 20) or 20), 1)
+    deadline = time.time() + float(startup_wait_seconds)
+    while time.time() < deadline:
+        if _ollama_healthy(base_url):
+            return {"ok": True, "started": True, "executable": executable}
+        time.sleep(1)
+
+    return {"ok": False, "error": f"Ollama did not become healthy at {base_url}", "executable": executable}
 
 
 def load_llm_providers_config(path: str = "config/llm_providers.yaml") -> Dict[str, Any]:
@@ -162,8 +246,16 @@ def _call_huggingface(provider_cfg: Dict[str, Any], prompt: str, timeout_sec: in
 
 
 def _call_ollama(provider_cfg: Dict[str, Any], prompt: str, timeout_sec: int) -> Dict[str, Any]:
-    base_url = str(provider_cfg.get("base_url", "http://127.0.0.1:11434")).rstrip("/")
+    base_url = _ollama_base_url(provider_cfg)
     model = str(provider_cfg.get("model", "llama3.1:8b"))
+    ensure = _start_ollama_server(provider_cfg)
+    if not bool(ensure.get("ok", False)):
+        return {
+            "ok": False,
+            "status_code": 503,
+            "text": "",
+            "raw": ensure,
+        }
     url = f"{base_url}/api/generate"
     payload = {
         "model": model,

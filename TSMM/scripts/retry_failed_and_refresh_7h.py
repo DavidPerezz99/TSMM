@@ -19,20 +19,44 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _dedup_paths(paths: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        try:
+            key = str(Path(p).resolve())
+        except Exception:
+            key = str(Path(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def _dedup_model_files() -> int:
-    pat_art = re.compile(r"^(?P<family>[A-Za-z0-9_]+)_artifacts_(?P<ts>\d{8}_\d{6})\.joblib$")
-    pat_mod = re.compile(r"^(?P<family>[A-Za-z0-9_]+)_(?P<ts>\d{8}_\d{6})\.joblib$")
+    pat_art = re.compile(
+        r"^(?P<model>[A-Za-z0-9_]+)_artifacts_(?P<target>high|low|open|close)_(?P<timeframe>[A-Za-z0-9]+)_(?P<ts>\d{8}_\d{6})\.joblib$",
+        flags=re.IGNORECASE,
+    )
+    pat_mod = re.compile(
+        r"^(?P<model>[A-Za-z0-9_]+)_(?P<target>high|low|open|close)_(?P<timeframe>[A-Za-z0-9]+)_(?P<ts>\d{8}_\d{6})\.joblib$",
+        flags=re.IGNORECASE,
+    )
 
     groups: Dict[str, List[Path]] = {}
     for p in MODEL_DIR.glob("*.joblib"):
         m_art = pat_art.match(p.name)
         if m_art:
-            key = f"{m_art.group('family')}|art"
+            key = f"{m_art.group('model').lower()}|{m_art.group('target').lower()}|{m_art.group('timeframe').lower()}|art"
             groups.setdefault(key, []).append(p)
             continue
         m_mod = pat_mod.match(p.name)
         if m_mod:
-            key = f"{m_mod.group('family')}|mod"
+            key = f"{m_mod.group('model').lower()}|{m_mod.group('target').lower()}|{m_mod.group('timeframe').lower()}|mod"
             groups.setdefault(key, []).append(p)
 
     deleted = 0
@@ -64,6 +88,7 @@ def main() -> int:
 
     queue = list(failed_cfgs)
     queue.append(str(FINAL_7H_CFG))
+    queue = _dedup_paths(queue)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = ROOT / "reports" / "runtime" / f"manual_retrain_retry_{ts}.log"

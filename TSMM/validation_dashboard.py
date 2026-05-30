@@ -25,7 +25,7 @@ State = dash_mod.State
 from utils.agent_validation import run_agent_validation_days, run_agent_backtest_advanced
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRADING_CFG_PATH = os.path.join(BASE_DIR, "config", "trading_agent.yaml")
+TRADING_CFG_PATH = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 MAIN_CFG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
 VALIDATION_ROOT = os.path.join(BASE_DIR, "reports", "agent_validation")
 STATUS_PATH = os.path.join(VALIDATION_ROOT, "status.json")

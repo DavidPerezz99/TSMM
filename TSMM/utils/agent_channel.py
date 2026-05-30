@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List
 
+from utils.runtime_scope import resolve_runtime_file
+
 
 def _iso_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -19,12 +21,26 @@ def _communication_cfg(trading_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_channel_path(output_dir: str, trading_cfg: Dict[str, Any]) -> str:
     cc = _communication_cfg(trading_cfg)
-    return str(cc.get("channel_file_path") or os.path.join(output_dir, "runtime", "agent_channel.jsonl"))
+    return str(
+        resolve_runtime_file(
+            configured_path=cc.get("channel_file_path"),
+            fallback_name="agent_channel.jsonl",
+            output_dir=output_dir,
+            trading_cfg=trading_cfg,
+        )
+    )
 
 
 def get_channel_flag_path(output_dir: str, trading_cfg: Dict[str, Any]) -> str:
     cc = _communication_cfg(trading_cfg)
-    return str(cc.get("control_flag_path") or os.path.join(output_dir, "runtime", "agent_channel_enabled.flag"))
+    return str(
+        resolve_runtime_file(
+            configured_path=cc.get("control_flag_path"),
+            fallback_name="agent_channel_enabled.flag",
+            output_dir=output_dir,
+            trading_cfg=trading_cfg,
+        )
+    )
 
 
 def is_channel_enabled(output_dir: str, trading_cfg: Dict[str, Any]) -> bool:

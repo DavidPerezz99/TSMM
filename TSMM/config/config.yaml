@@ -70,6 +70,8 @@ confidence:
   n_estimators: 100
   # Max depth for the Random Forest discriminator
   max_depth: 10
+  # Past validation rows reserved to train the discriminator
+  validation_rows: 60
   # Test size for discriminator training
   test_size: 0.4
 

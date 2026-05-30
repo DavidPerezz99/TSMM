@@ -32,7 +32,12 @@ import time
 import matplotlib.dates as mdates
 from models.multivariate_models import grid_search_sarimax
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
-import torch
+
+
+def _import_torch():
+    import torch
+
+    return torch
 
 def save_confusion_matrix_plot(
     cm: np.ndarray,
@@ -478,6 +483,7 @@ def recursive_forecast_svr(model, scalers, initial_window, steps, n_steps, n_fea
 def recursive_forecast_nbeats(model, scalers, initial_window, steps, n_steps, n_features,
                             config, max_window, input_features, target_features, m_steps, device='cpu'):
     """Recursive forecasting for N-BEATS models."""
+    torch = _import_torch()
     predictions = []
     current_window = initial_window.copy()
 
@@ -519,6 +525,27 @@ def recursive_forecast_nbeats(model, scalers, initial_window, steps, n_steps, n_
         current_window = np.vstack([current_window[new_features.shape[0]:], new_features])
 
     return np.vstack(predictions)[:steps]
+
+
+def _get_discriminator_validation_rows(config: Dict[str, Any], df_len: int, n_steps: int) -> int:
+    confidence_cfg = config.get('confidence', {}) or {}
+    requested = int(confidence_cfg.get('validation_rows', 60) or 60)
+    max_available = max(int(df_len) - int(n_steps), 1)
+    return max(1, min(requested, max_available))
+
+
+def _prepare_discriminator_validation_slice(
+    df: pd.DataFrame,
+    input_features: List[str],
+    target_features: List[str],
+    n_steps: int,
+    validation_rows: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    val_start = -(validation_rows + n_steps)
+    val_end = -validation_rows
+    X_val = df[input_features].iloc[val_start:val_end].values
+    y_val_true = df[target_features].iloc[-validation_rows:].values
+    return X_val, y_val_true
 
 
 def save_true_vs_pred_1d(y_true, y_pred,
@@ -649,6 +676,7 @@ def evaluate_models(models, df, config):
     n_features = len(input_features)
     rolling_windows = config.get('rolling_windows', [7, 30, 60, 10])
     max_window = max(rolling_windows) if rolling_windows else 60
+    discriminator_validation_rows = _get_discriminator_validation_rows(config, len(df), n_steps)
     
     # Get last real values for explosion detection
     last_real_values = df[target_col].iloc[-n_steps:].values
@@ -801,8 +829,15 @@ def evaluate_models(models, df, config):
                 model_eval['figures'].extend(cm_results['figures'])
 
                 # Train confidence discriminator (timeframe-scoped)
+                X_disc, y_disc_true = _prepare_discriminator_validation_slice(
+                    df, input_features, target_features, n_steps, discriminator_validation_rows
+                )
+                y_disc_pred = recursive_forecast(
+                    model, scalers, X_disc, discriminator_validation_rows,
+                    model_name, n_steps, n_features, config, max_window, input_features, target_features, m_steps
+                )
                 discriminator = train_confidence_discriminator(
-                    model_data, X_val, y_val_true, y_val_pred, config
+                    model_data, X_disc, y_disc_true, y_disc_pred, config
                 )
                 if discriminator:
                     confidence_discriminators[model_name] = discriminator
@@ -1013,8 +1048,16 @@ def evaluate_models(models, df, config):
                 model_eval['figures'].extend(cm_results['figures'])
 
                 # Train confidence discriminator (timeframe-scoped)
+                X_disc, y_disc_true = _prepare_discriminator_validation_slice(
+                    df, input_features, target_features, n_steps, discriminator_validation_rows
+                )
+                y_disc_pred = recursive_forecast_nbeats(
+                    model, scalers, X_disc, discriminator_validation_rows,
+                    n_steps, n_features, config, max_window,
+                    input_features, target_features, m_steps, device
+                )
                 discriminator = train_confidence_discriminator(
-                    model_data, X_val, y_val_true, y_val_pred, config
+                    model_data, X_disc, y_disc_true, y_disc_pred, config
                 )
                 if discriminator:
                     confidence_discriminators[model_name] = discriminator

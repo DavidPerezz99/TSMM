@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -29,6 +29,7 @@ from .backtester import run_backtest_from_validation
 from .market_db import query_ohlc
 from .trading_reporter import generate_trading_plan_report
 from .iqoption_adapter import IQOptionAdapter
+from .runtime_scope import resolve_runtime_file
 
 
 _LAST_ENDPOINT_START_TS: float = 0.0
@@ -41,6 +42,15 @@ def _resolve_secret(value: Any) -> str:
     if value.startswith("env:"):
         return os.environ.get(value.split(":", 1)[1], "")
     return value
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
 
 
 class MT5Adapter:
@@ -91,6 +101,235 @@ class MT5Adapter:
             return False, "MT5 not connected"
         return True, "ok"
 
+    def _position_side_from_type(self, position_type: Any) -> str:
+        mt5 = self._mt5
+        ptype = _int_or_default(position_type, -1)
+        if mt5 is not None:
+            if ptype == int(getattr(mt5, "POSITION_TYPE_BUY", 0)):
+                return "buy"
+            if ptype == int(getattr(mt5, "POSITION_TYPE_SELL", 1)):
+                return "sell"
+        if ptype == 0:
+            return "buy"
+        if ptype in {1, -1}:
+            return "sell"
+        return "unknown"
+
+    def _order_side_from_type(self, order_type: Any) -> str:
+        mt5 = self._mt5
+        otype = _int_or_default(order_type, -1)
+        if mt5 is not None:
+            buy_types = {
+                int(getattr(mt5, "ORDER_TYPE_BUY", 0)),
+                int(getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)),
+                int(getattr(mt5, "ORDER_TYPE_BUY_STOP", 4)),
+                int(getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6)),
+            }
+            sell_types = {
+                int(getattr(mt5, "ORDER_TYPE_SELL", 1)),
+                int(getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)),
+                int(getattr(mt5, "ORDER_TYPE_SELL_STOP", 5)),
+                int(getattr(mt5, "ORDER_TYPE_SELL_STOP_LIMIT", 7)),
+            }
+            if otype in buy_types:
+                return "buy"
+            if otype in sell_types:
+                return "sell"
+        if otype in {0, 2, 4, 6}:
+            return "buy"
+        if otype in {1, 3, 5, 7, -1}:
+            return "sell"
+        return "unknown"
+
+    def _serialize_position(self, p: Any) -> Dict[str, Any]:
+        ptype = _int_or_default(getattr(p, "type", None), -1)
+        return {
+            "ticket": int(getattr(p, "ticket", 0) or 0),
+            "symbol": str(getattr(p, "symbol", "")),
+            "volume": float(getattr(p, "volume", 0.0) or 0.0),
+            "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+            "price_current": float(getattr(p, "price_current", 0.0) or 0.0),
+            "sl": float(getattr(p, "sl", 0.0) or 0.0),
+            "tp": float(getattr(p, "tp", 0.0) or 0.0),
+            "profit": float(getattr(p, "profit", 0.0) or 0.0),
+            "type": ptype,
+            "side": self._position_side_from_type(ptype),
+            "time": int(getattr(p, "time", 0) or 0),
+            "comment": str(getattr(p, "comment", "") or ""),
+            "magic": int(getattr(p, "magic", 0) or 0),
+        }
+
+    def _serialize_order(self, order: Any) -> Dict[str, Any]:
+        otype = _int_or_default(getattr(order, "type", None), -1)
+        volume = float(getattr(order, "volume_current", 0.0) or 0.0)
+        if volume <= 0.0:
+            volume = float(getattr(order, "volume_initial", 0.0) or 0.0)
+        expires_at = int(getattr(order, "time_expiration", 0) or 0)
+        expiration_utc = datetime.utcfromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S") if expires_at > 0 else None
+        return {
+            "order_ticket": int(getattr(order, "ticket", 0) or 0),
+            "symbol": str(getattr(order, "symbol", "")),
+            "volume": volume,
+            "price_open": float(getattr(order, "price_open", 0.0) or 0.0),
+            "sl": float(getattr(order, "sl", 0.0) or 0.0),
+            "tp": float(getattr(order, "tp", 0.0) or 0.0),
+            "type": otype,
+            "side": self._order_side_from_type(otype),
+            "time": int(getattr(order, "time_setup", 0) or getattr(order, "time_setup_msc", 0) or 0),
+            "time_expiration": expires_at,
+            "expiration_utc": expiration_utc,
+            "comment": str(getattr(order, "comment", "") or ""),
+            "magic": int(getattr(order, "magic", 0) or 0),
+        }
+
+    def list_open_positions(self) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        positions = mt5.positions_get() or []
+        return {"ok": True, "positions": [self._serialize_position(p) for p in positions]}
+
+    def list_pending_orders(self) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        orders = mt5.orders_get() or []
+        return {"ok": True, "orders": [self._serialize_order(order) for order in orders]}
+
+    def _candidate_filling_modes(self, symbol: str) -> list[int]:
+        mt5 = self._mt5
+        if mt5 is None:
+            return []
+
+        candidates: list[int] = []
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+        except Exception:
+            symbol_info = None
+
+        preferred_mode = getattr(symbol_info, "filling_mode", None) if symbol_info is not None else None
+        for mode in [preferred_mode, getattr(mt5, "ORDER_FILLING_IOC", None), getattr(mt5, "ORDER_FILLING_FOK", None), getattr(mt5, "ORDER_FILLING_RETURN", None)]:
+            if isinstance(mode, int) and mode not in candidates:
+                candidates.append(mode)
+        return candidates
+
+    def _send_order_with_filling_fallback(self, symbol: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        mt5 = self._mt5
+        if mt5 is None:
+            return {"ok": False, "message": "mt5_not_connected"}
+
+        attempted_modes: list[int] = []
+        last_retcode = -1
+        last_result = None
+        retry_retcode_set = {10013, 10030}
+        for filling_mode in self._candidate_filling_modes(symbol):
+            attempted_modes.append(int(filling_mode))
+            current_request = dict(request)
+            current_request["type_filling"] = int(filling_mode)
+            result = mt5.order_send(current_request)
+            last_result = result
+            if result is None:
+                return {"ok": False, "message": "order_send returned None", "attempted_filling_modes": attempted_modes}
+
+            retcode = int(getattr(result, "retcode", -1))
+            last_retcode = retcode
+            if retcode == mt5.TRADE_RETCODE_DONE:
+                return {
+                    "ok": True,
+                    "result": result,
+                    "retcode": retcode,
+                    "type_filling": int(filling_mode),
+                    "attempted_filling_modes": attempted_modes,
+                }
+            if retcode not in retry_retcode_set:
+                return {
+                    "ok": False,
+                    "message": f"order_send failed retcode={retcode}",
+                    "retcode": retcode,
+                    "type_filling": int(filling_mode),
+                    "attempted_filling_modes": attempted_modes,
+                }
+
+        return {
+            "ok": False,
+            "message": f"order_send failed retcode={last_retcode}",
+            "retcode": last_retcode,
+            "result": last_result,
+            "attempted_filling_modes": attempted_modes,
+        }
+
+    def _deal_reason_label(self, reason_code: int) -> str:
+        mt5 = self._mt5
+        if mt5 is None:
+            return str(int(reason_code))
+
+        reason_map = {
+            int(getattr(mt5, "DEAL_REASON_CLIENT", -1001)): "client",
+            int(getattr(mt5, "DEAL_REASON_MOBILE", -1002)): "mobile",
+            int(getattr(mt5, "DEAL_REASON_WEB", -1003)): "web",
+            int(getattr(mt5, "DEAL_REASON_EXPERT", -1004)): "expert",
+            int(getattr(mt5, "DEAL_REASON_SL", -1005)): "sl",
+            int(getattr(mt5, "DEAL_REASON_TP", -1006)): "tp",
+            int(getattr(mt5, "DEAL_REASON_SO", -1007)): "so",
+            int(getattr(mt5, "DEAL_REASON_VMARGIN", -1008)): "vmargin",
+            int(getattr(mt5, "DEAL_REASON_ROLLOVER", -1009)): "rollover",
+        }
+        return reason_map.get(int(reason_code), str(int(reason_code)))
+
+    def get_position_close_outcome(self, ticket: int, lookback_hours: int = 168) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        start = datetime.utcnow().timestamp() - max(int(lookback_hours), 1) * 60 * 60
+        end = datetime.utcnow().timestamp()
+        try:
+            deals = mt5.history_deals_get(start, end) or []
+        except Exception as exc:
+            return {"ok": False, "message": f"history_deals_get failed: {exc}"}
+
+        out_deals = []
+        out_entry_codes = {
+            int(getattr(mt5, "DEAL_ENTRY_OUT", -2001)),
+            int(getattr(mt5, "DEAL_ENTRY_OUT_BY", -2002)),
+        }
+
+        for deal in deals:
+            position_id = int(getattr(deal, "position_id", 0) or 0)
+            if position_id != int(ticket):
+                continue
+            entry_code = int(getattr(deal, "entry", -1) or -1)
+            if entry_code not in out_entry_codes:
+                continue
+            out_deals.append(deal)
+
+        if not out_deals:
+            return {"ok": True, "found": False, "ticket": int(ticket)}
+
+        deal = sorted(out_deals, key=lambda item: int(getattr(item, "time", 0) or 0))[-1]
+        reason_code = int(getattr(deal, "reason", -1) or -1)
+        return {
+            "ok": True,
+            "found": True,
+            "ticket": int(ticket),
+            "deal_ticket": int(getattr(deal, "ticket", 0) or 0),
+            "position_id": int(getattr(deal, "position_id", 0) or 0),
+            "order": int(getattr(deal, "order", 0) or 0),
+            "time": int(getattr(deal, "time", 0) or 0),
+            "price": float(getattr(deal, "price", 0.0) or 0.0),
+            "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+            "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+            "symbol": str(getattr(deal, "symbol", "") or ""),
+            "reason_code": reason_code,
+            "reason_label": self._deal_reason_label(reason_code),
+            "comment": str(getattr(deal, "comment", "") or ""),
+        }
+
     def place_programmed_order(
         self,
         symbol: str,
@@ -99,6 +338,7 @@ class MT5Adapter:
         entry: float,
         stop_loss: float,
         take_profit: float,
+        expiration_utc: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         ok, msg = self._require_mt5()
         if not ok:
@@ -135,6 +375,9 @@ class MT5Adapter:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_RETURN,
         }
+        if expiration_utc is not None:
+            request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+            request["expiration"] = int(expiration_utc.replace(tzinfo=timezone.utc).timestamp())
 
         result = mt5.order_send(request)
         if result is None:
@@ -153,6 +396,97 @@ class MT5Adapter:
             "order_ticket": int(getattr(result, "order", 0) or 0),
             "deal_ticket": int(getattr(result, "deal", 0) or 0),
             "retcode": retcode,
+            "expiration_utc": expiration_utc.strftime("%Y-%m-%d %H:%M:%S") if expiration_utc is not None else None,
+        }
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        volume: float,
+        stop_loss: float,
+        take_profit: float,
+    ) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        if not mt5.symbol_select(symbol, True):
+            return {"ok": False, "message": f"symbol_select failed for {symbol}"}
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return {"ok": False, "message": f"No market tick for {symbol}"}
+
+        side = str(side or "").lower()
+        if side not in {"buy", "sell"}:
+            return {"ok": False, "message": f"Unsupported side: {side}"}
+
+        if side == "buy":
+            order_type = mt5.ORDER_TYPE_BUY
+            price = float(tick.ask)
+            position_type = int(getattr(mt5, "POSITION_TYPE_BUY", 0))
+        else:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = float(tick.bid)
+            position_type = int(getattr(mt5, "POSITION_TYPE_SELL", 1))
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": order_type,
+            "price": price,
+            "sl": float(stop_loss),
+            "tp": float(take_profit),
+            "deviation": 20,
+            "magic": 7070001,
+            "comment": "TSMM market order",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+
+        send_res = self._send_order_with_filling_fallback(symbol, request)
+        if not send_res.get("ok"):
+            return send_res
+        result = send_res.get("result")
+        retcode = int(send_res.get("retcode", -1) or -1)
+
+        matched_position = None
+        order_ticket = int(getattr(result, "order", 0) or 0)
+        if order_ticket > 0:
+            pos = mt5.positions_get(ticket=order_ticket) or []
+            if pos:
+                matched_position = pos[0]
+
+        if matched_position is None:
+            positions = mt5.positions_get(symbol=symbol) or []
+            for p in positions:
+                if _int_or_default(getattr(p, "type", None), -1) != position_type:
+                    continue
+                if int(getattr(p, "magic", 0) or 0) != 7070001:
+                    continue
+                if str(getattr(p, "comment", "") or "") != "TSMM market order":
+                    continue
+                if abs(float(getattr(p, "volume", 0.0) or 0.0) - float(volume)) > 1e-9:
+                    continue
+                if stop_loss and abs(float(getattr(p, "sl", 0.0) or 0.0) - float(stop_loss)) > 0.05:
+                    continue
+                if take_profit and abs(float(getattr(p, "tp", 0.0) or 0.0) - float(take_profit)) > 0.05:
+                    continue
+                matched_position = p
+                break
+
+        return {
+            "ok": True,
+            "order_ticket": order_ticket,
+            "deal_ticket": int(getattr(result, "deal", 0) or 0),
+            "retcode": retcode,
+            "position": self._serialize_position(matched_position) if matched_position is not None else None,
+            "execution_price": price,
+            "execution_mode": "market",
+            "type_filling": send_res.get("type_filling"),
+            "attempted_filling_modes": send_res.get("attempted_filling_modes") or [],
         }
 
     def find_position_by_order(self, order_ticket: int) -> Dict[str, Any]:
@@ -162,22 +496,197 @@ class MT5Adapter:
 
         mt5 = self._mt5
         positions = mt5.positions_get() or []
+
         for p in positions:
             p_order = int(getattr(p, "ticket", 0) or 0)
             if p_order == int(order_ticket):
-                return {
-                    "ok": True,
-                    "position": {
-                        "ticket": int(getattr(p, "ticket", 0) or 0),
-                        "symbol": str(getattr(p, "symbol", "")),
-                        "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                        "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                        "type": int(getattr(p, "type", -1) or -1),
-                    },
-                }
+                return {"ok": True, "position": self._serialize_position(p)}
 
-        # Fallback: latest position for symbol isn't always directly mapped.
+        # Some MT5 pending fills do not preserve the order ticket on the resulting
+        # position, so fall back to recent order metadata and match by strategy keys.
+        try:
+            start = datetime.utcnow().timestamp() - 7 * 24 * 60 * 60
+            end = datetime.utcnow().timestamp()
+            history_orders = mt5.history_orders_get(start, end) or []
+        except Exception:
+            history_orders = []
+
+        matched_order = None
+        for order in reversed(list(history_orders)):
+            if int(getattr(order, "ticket", 0) or 0) == int(order_ticket):
+                matched_order = order
+                break
+
+        if matched_order is not None:
+            position_id = int(getattr(matched_order, "position_id", 0) or 0)
+            if position_id:
+                pos = mt5.positions_get(ticket=position_id) or []
+                if pos:
+                    return {"ok": True, "position": self._serialize_position(pos[0])}
+
+            symbol = str(getattr(matched_order, "symbol", "") or "")
+            magic = int(getattr(matched_order, "magic", 0) or 0)
+            comment = str(getattr(matched_order, "comment", "") or "")
+            volume_initial = float(getattr(matched_order, "volume_initial", 0.0) or 0.0)
+            price_open = float(getattr(matched_order, "price_open", 0.0) or 0.0)
+            sl = float(getattr(matched_order, "sl", 0.0) or 0.0)
+            tp = float(getattr(matched_order, "tp", 0.0) or 0.0)
+
+            for p in positions:
+                if symbol and str(getattr(p, "symbol", "") or "") != symbol:
+                    continue
+                if magic and int(getattr(p, "magic", 0) or 0) != magic:
+                    continue
+                if comment and str(getattr(p, "comment", "") or "") != comment:
+                    continue
+                if volume_initial and abs(float(getattr(p, "volume", 0.0) or 0.0) - volume_initial) > 1e-9:
+                    continue
+                if price_open and abs(float(getattr(p, "price_open", 0.0) or 0.0) - price_open) > 0.05:
+                    continue
+                if sl and abs(float(getattr(p, "sl", 0.0) or 0.0) - sl) > 0.05:
+                    continue
+                if tp and abs(float(getattr(p, "tp", 0.0) or 0.0) - tp) > 0.05:
+                    continue
+                return {"ok": True, "position": self._serialize_position(p)}
+
         return {"ok": True, "position": None}
+
+    def find_live_position_by_plan(
+        self,
+        symbol: str,
+        volume: float,
+        entry: float,
+        stop_loss: float,
+        take_profit: float,
+        price_tolerance: float = 0.05,
+        volume_tolerance: float = 1e-9,
+    ) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        positions = mt5.positions_get() or []
+        target_symbol = str(symbol or "").strip()
+        target_volume = float(volume or 0.0)
+        target_entry = float(entry or 0.0)
+        target_sl = float(stop_loss or 0.0)
+        target_tp = float(take_profit or 0.0)
+        tol = max(float(price_tolerance or 0.05), 0.0)
+        vol_tol = max(float(volume_tolerance or 1e-9), 0.0)
+
+        for p in positions:
+            if target_symbol and str(getattr(p, "symbol", "") or "") != target_symbol:
+                continue
+            if target_volume and abs(float(getattr(p, "volume", 0.0) or 0.0) - target_volume) > vol_tol:
+                continue
+            if target_entry and abs(float(getattr(p, "price_open", 0.0) or 0.0) - target_entry) > tol:
+                continue
+            if target_sl and abs(float(getattr(p, "sl", 0.0) or 0.0) - target_sl) > tol:
+                continue
+            if target_tp and abs(float(getattr(p, "tp", 0.0) or 0.0) - target_tp) > tol:
+                continue
+            return {"ok": True, "position": self._serialize_position(p)}
+
+        return {"ok": True, "position": None}
+
+    def find_pending_order_by_plan(
+        self,
+        symbol: str,
+        volume: float,
+        entry: float,
+        stop_loss: float,
+        take_profit: float,
+        price_tolerance: float = 0.05,
+        volume_tolerance: float = 1e-9,
+    ) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        orders = mt5.orders_get() or []
+        target_symbol = str(symbol or "").strip()
+        target_volume = float(volume or 0.0)
+        target_entry = float(entry or 0.0)
+        target_sl = float(stop_loss or 0.0)
+        target_tp = float(take_profit or 0.0)
+        tol = max(float(price_tolerance or 0.05), 0.0)
+        vol_tol = max(float(volume_tolerance or 1e-9), 0.0)
+
+        for order in orders:
+            if target_symbol and str(getattr(order, "symbol", "") or "") != target_symbol:
+                continue
+            live_volume = float(getattr(order, "volume_current", 0.0) or 0.0)
+            if live_volume <= 0.0:
+                live_volume = float(getattr(order, "volume_initial", 0.0) or 0.0)
+            if target_volume and abs(live_volume - target_volume) > vol_tol:
+                continue
+            if target_entry and abs(float(getattr(order, "price_open", 0.0) or 0.0) - target_entry) > tol:
+                continue
+            if target_sl and abs(float(getattr(order, "sl", 0.0) or 0.0) - target_sl) > tol:
+                continue
+            if target_tp and abs(float(getattr(order, "tp", 0.0) or 0.0) - target_tp) > tol:
+                continue
+            return {"ok": True, "order": self._serialize_order(order)}
+
+        return {"ok": True, "order": None}
+
+    def get_pending_order_by_ticket(self, order_ticket: int) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        orders = mt5.orders_get(ticket=int(order_ticket)) or []
+        if not orders:
+            return {"ok": True, "order": None}
+
+        return {"ok": True, "order": self._serialize_order(orders[0])}
+
+    def cancel_pending_order(self, order_ticket: int) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        pending = mt5.orders_get(ticket=int(order_ticket))
+        if not pending:
+            return {
+                "ok": True,
+                "order_ticket": int(order_ticket),
+                "skipped": True,
+                "reason": "order_not_pending",
+            }
+
+        request = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": int(order_ticket),
+        }
+        result = mt5.order_send(request)
+        if result is None:
+            return {
+                "ok": False,
+                "message": "order_send(cancel) returned None",
+                "order_ticket": int(order_ticket),
+                "last_error": mt5.last_error(),
+                "request": request,
+            }
+
+        retcode = int(getattr(result, "retcode", -1))
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            return {
+                "ok": False,
+                "message": f"cancel order failed retcode={retcode}",
+                "retcode": retcode,
+                "order_ticket": int(order_ticket),
+            }
+
+        return {
+            "ok": True,
+            "order_ticket": int(order_ticket),
+            "retcode": retcode,
+        }
 
     def get_position_by_ticket(self, ticket: int) -> Dict[str, Any]:
         ok, msg = self._require_mt5()
@@ -190,15 +699,69 @@ class MT5Adapter:
             return {"ok": True, "position": None}
 
         p = positions[0]
+        return {"ok": True, "position": self._serialize_position(p)}
+
+    def modify_position_risk(
+        self,
+        ticket: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        positions = mt5.positions_get(ticket=int(ticket))
+        if not positions:
+            return {"ok": False, "message": f"Position not found for ticket={int(ticket)}"}
+
+        p = positions[0]
+        current_sl = float(getattr(p, "sl", 0.0) or 0.0)
+        current_tp = float(getattr(p, "tp", 0.0) or 0.0)
+        desired_sl = float(stop_loss) if stop_loss is not None else current_sl
+        desired_tp = float(take_profit) if take_profit is not None else current_tp
+
+        if abs(desired_sl - current_sl) < 1e-9 and abs(desired_tp - current_tp) < 1e-9:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "risk_levels_unchanged",
+                "ticket": int(ticket),
+                "position": self._serialize_position(p),
+            }
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": str(getattr(p, "symbol", "") or ""),
+            "position": int(ticket),
+            "sl": float(desired_sl),
+            "tp": float(desired_tp),
+            "magic": 7070002,
+            "comment": "TSMM Agent B risk update",
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            return {"ok": False, "message": "order_send(sltp) returned None"}
+
+        retcode = int(getattr(result, "retcode", -1))
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            return {
+                "ok": False,
+                "message": f"modify risk failed retcode={retcode}",
+                "retcode": retcode,
+                "ticket": int(ticket),
+            }
+
+        refreshed = mt5.positions_get(ticket=int(ticket)) or []
         return {
             "ok": True,
-            "position": {
-                "ticket": int(getattr(p, "ticket", 0) or 0),
-                "symbol": str(getattr(p, "symbol", "")),
-                "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                "type": int(getattr(p, "type", -1) or -1),
-            },
+            "ticket": int(ticket),
+            "retcode": retcode,
+            "stop_loss": float(desired_sl),
+            "take_profit": float(desired_tp),
+            "position": self._serialize_position(refreshed[0]) if refreshed else None,
         }
 
     def close_position_by_ticket(self, ticket: int) -> Dict[str, Any]:
@@ -214,7 +777,7 @@ class MT5Adapter:
         p = pos[0]
         symbol = str(getattr(p, "symbol", ""))
         volume = float(getattr(p, "volume", 0.0) or 0.0)
-        ptype = int(getattr(p, "type", -1) or -1)
+        ptype = _int_or_default(getattr(p, "type", None), -1)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return {"ok": False, "message": f"No market tick for {symbol}"}
@@ -237,26 +800,27 @@ class MT5Adapter:
             "magic": 7070002,
             "comment": "TSMM close by Agent B",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_RETURN,
         }
 
-        result = mt5.order_send(request)
-        if result is None:
-            return {"ok": False, "message": "order_send(close) returned None"}
-
-        retcode = int(getattr(result, "retcode", -1))
-        if retcode != mt5.TRADE_RETCODE_DONE:
+        send_res = self._send_order_with_filling_fallback(symbol, request)
+        if not send_res.get("ok"):
+            if str(send_res.get("message") or "") == "order_send returned None":
+                return {"ok": False, "message": "order_send(close) returned None"}
             return {
                 "ok": False,
-                "message": f"close order failed retcode={retcode}",
-                "retcode": retcode,
+                "message": str(send_res.get("message") or "close order failed"),
+                "retcode": int(send_res.get("retcode", -1) or -1),
+                "attempted_filling_modes": send_res.get("attempted_filling_modes") or [],
             }
+        result = send_res.get("result")
+        retcode = int(send_res.get("retcode", -1) or -1)
 
         return {
             "ok": True,
             "ticket": int(ticket),
             "retcode": retcode,
             "deal_ticket": int(getattr(result, "deal", 0) or 0),
+            "type_filling": send_res.get("type_filling"),
         }
 
 
@@ -284,6 +848,20 @@ def _choose_best_model(evaluation: Dict[str, Any], preferred_model: Optional[str
 
 def _latest_price(df, target_col: str) -> float:
     return float(df[target_col].iloc[-1])
+
+
+def _signal_interpretation_mode(trading_cfg: Dict[str, Any]) -> str:
+    raw = str(((trading_cfg.get("agent") or {}).get("signal_interpretation") or "momentum")).strip().lower()
+    if raw in {"contrarian", "mean_reversion", "mean-reversion", "fade"}:
+        return "contrarian"
+    return "momentum"
+
+
+def _apply_signal_interpretation(signal_value: float, trading_cfg: Dict[str, Any]) -> float:
+    value = float(signal_value or 0.0)
+    if _signal_interpretation_mode(trading_cfg) == "contrarian":
+        return -value
+    return value
 
 
 def _build_mode_a_plan(
@@ -354,6 +932,8 @@ def _build_mode_a_plan(
     if abs(signal_score) < 1e-9:
         signal_score = 1.0 if float(first_pred) > 0 else -1.0
 
+    raw_signal_score = float(signal_score)
+    signal_score = _apply_signal_interpretation(raw_signal_score, trading_cfg)
     direction = "buy" if signal_score > 0 else "sell"
 
     cm_acc = float(((evaluation.get(best_model, {}) or {}).get("confusion_matrix", {}) or {}).get("accuracy", 0.0) or 0.0)
@@ -373,6 +953,8 @@ def _build_mode_a_plan(
 
     allow_long = bool(mode_a.get("allow_long", True))
     allow_short = bool(mode_a.get("allow_short", True))
+    block_on_confidence_thresholds = bool(mode_a.get("block_on_confidence_thresholds", False))
+    block_on_input_fooling_risk = bool(mode_a.get("block_on_input_fooling_risk", False))
 
     entry = _latest_price(df, app_config["target_col"])
     sl_pct = float(risk.get("stop_loss_pct", 0.8)) / 100.0
@@ -388,7 +970,7 @@ def _build_mode_a_plan(
     decision = direction
     rationale = (
         f"Model={best_model}, score={signal_score:.2f}, "
-        f"forecast_sign={float(first_pred):.4f}, cm_accuracy={cm_acc:.3f}, confidence={confidence:.3f}, "
+        f"forecast_sign={float(first_pred):.4f}, raw_score={raw_signal_score:.2f}, cm_accuracy={cm_acc:.3f}, confidence={confidence:.3f}, "
         f"features=[{', '.join(score_parts[:6])}]"
     )
     risk_notes: List[str] = [
@@ -396,16 +978,30 @@ def _build_mode_a_plan(
         f"Daily max loss={risk.get('daily_max_loss_pct', 2.0)}%",
         f"Max open positions={risk.get('max_open_positions', 3)}",
     ]
+    if _signal_interpretation_mode(trading_cfg) == "contrarian":
+        risk_notes.append("Signal interpretation=contrarian: sell strength and buy weakness.")
 
-    if confidence < min_conf or cm_acc < min_cm:
-        decision = "hold"
-        risk_notes.append("Signal blocked by confidence/confusion thresholds.")
+    confidence_threshold_breached = confidence < min_conf or cm_acc < min_cm
+    if confidence_threshold_breached:
+        if block_on_confidence_thresholds:
+            decision = "hold"
+            risk_notes.append("Signal blocked by confidence/confusion thresholds.")
+        else:
+            risk_notes.append(
+                "Confidence/confusion thresholds were breached, but the 7h base plan remains active by policy."
+            )
 
-    if p_wrong is not None and p_wrong > max_input_fooling_risk:
-        decision = "hold"
-        risk_notes.append(
-            f"Signal blocked by per-timeframe input fooling risk: p_wrong={p_wrong:.3f} > {max_input_fooling_risk:.3f}"
-        )
+    input_fooling_risk_breached = p_wrong is not None and p_wrong > max_input_fooling_risk
+    if input_fooling_risk_breached:
+        if block_on_input_fooling_risk:
+            decision = "hold"
+            risk_notes.append(
+                f"Signal blocked by per-timeframe input fooling risk: p_wrong={p_wrong:.3f} > {max_input_fooling_risk:.3f}"
+            )
+        else:
+            risk_notes.append(
+                f"Input fooling risk is elevated (p_wrong={p_wrong:.3f} > {max_input_fooling_risk:.3f}), but the 7h base plan remains active by policy."
+            )
 
     if decision == "buy" and not allow_long:
         decision = "hold"
@@ -424,7 +1020,11 @@ def _build_mode_a_plan(
         "confidence": round(confidence, 4),
         "cm_accuracy": round(cm_acc, 4),
         "signal_score": round(signal_score, 4),
+        "raw_signal_score": round(raw_signal_score, 4),
+        "signal_interpretation": _signal_interpretation_mode(trading_cfg),
         "input_fooling_risk": (round(p_wrong, 4) if p_wrong is not None else None),
+        "confidence_threshold_breached": bool(confidence_threshold_breached),
+        "input_fooling_risk_breached": bool(input_fooling_risk_breached),
         "target_anchor": tf0,
         "feature_forecasts_step1": {
             "OPEN": f_open,
@@ -438,6 +1038,264 @@ def _build_mode_a_plan(
         "rationale": rationale,
         "risk_notes": risk_notes,
     }
+
+
+def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cfg = (trading_cfg.get("agent_a_fallback") or {})
+    target_families = [
+        str(x).strip().lower()
+        for x in (cfg.get("target_families") or ["high", "low", "close", "open"])
+        if str(x).strip()
+    ]
+    endpoint_map = dict(trading_cfg.get("model_endpoints") or {})
+    project_root = Path(__file__).resolve().parents[1]
+    config_root = project_root / "config"
+    if not config_root.exists() or not endpoint_map:
+        return []
+
+    discovered: List[Dict[str, Any]] = []
+    for tf in endpoint_map.keys():
+        tf_label = str(tf).strip()
+        if not tf_label:
+            continue
+        for family in target_families:
+            tf_dir = config_root / f"{family}{tf_label}Results"
+            if not tf_dir.exists() or not tf_dir.is_dir():
+                continue
+
+            best_path: Path | None = None
+            best_model = ""
+            best_r2 = -1.0
+            for model_dir in [d for d in tf_dir.iterdir() if d.is_dir()]:
+                for cfg_file in list(model_dir.glob("*.yaml")) + list(model_dir.glob("*.yml")):
+                    r2 = _parse_r2_from_filename(str(cfg_file))
+                    if r2 > best_r2:
+                        best_r2 = r2
+                        best_path = cfg_file
+                        best_model = model_dir.name
+
+            if best_path is None:
+                continue
+
+            discovered.append(
+                {
+                    "family": family,
+                    "timeframe": tf_label,
+                    "model": best_model,
+                    "config_path": str(best_path),
+                    "r2": float(best_r2),
+                }
+            )
+
+    timeframe_priority = {"7h": 0, "3h": 1, "1h": 2, "30m": 3, "10m": 4, "12h": 5, "24h": 6, "1w": 7}
+    return sorted(
+        discovered,
+        key=lambda x: (int(timeframe_priority.get(str(x.get("timeframe")), 999)), -float(x.get("r2", 0.0))),
+    )
+
+
+def _collect_agent_a_enrichment_signals(
+    trading_cfg: Dict[str, Any],
+    timeout_sec: float = 3.0,
+) -> Dict[str, Any]:
+    model_endpoints = dict(trading_cfg.get("model_endpoints") or {})
+    if not model_endpoints:
+        return {"enabled": False, "reason": "No model endpoints configured", "signals": {}, "consensus": "hold", "consensus_score": 0.0}
+
+    candidates = _discover_agent_a_enrichment_candidates(trading_cfg)
+    if not candidates:
+        return {"enabled": False, "reason": "No pretrained enrichment candidates discovered", "signals": {}, "consensus": "hold", "consensus_score": 0.0}
+
+    timeframe_weights = {
+        "7h": 2.4,
+        "3h": 1.8,
+        "1h": 1.4,
+        "30m": 1.1,
+        "10m": 0.9,
+        "12h": 1.6,
+        "24h": 1.5,
+        "1w": 1.7,
+    }
+
+    signals: Dict[str, Any] = {}
+    weighted = 0.0
+    total_w = 0.0
+
+    for item in candidates:
+        tf = str(item.get("timeframe") or "").strip()
+        endpoint_cfg = model_endpoints.get(tf)
+        if endpoint_cfg is None:
+            continue
+
+        try:
+            sig_bundle = _collect_mode_b_signals(
+                model_endpoints={tf: endpoint_cfg},
+                trading_cfg=trading_cfg,
+                timeout_sec=timeout_sec,
+                config_overrides={tf: str(item.get("config_path") or "")},
+            )
+            tf_sig = ((sig_bundle.get("timeframes") or {}).get(tf) or {})
+            conf = float(tf_sig.get("confidence", 0.5) or 0.5)
+            signal = int(tf_sig.get("signal", 0) or 0)
+            tf_weight = float(timeframe_weights.get(tf, 1.0))
+            vote_weight = max(conf, 0.01) * tf_weight
+
+            key = f"{item.get('family')}:{tf}"
+            signals[key] = {
+                "family": item.get("family"),
+                "timeframe": tf,
+                "model": item.get("model"),
+                "config_path": item.get("config_path"),
+                "r2": item.get("r2"),
+                "signal": signal,
+                "confidence": conf,
+                "vote_weight": vote_weight,
+                "raw": tf_sig.get("raw"),
+                "error": tf_sig.get("error"),
+            }
+
+            weighted += vote_weight * signal
+            total_w += vote_weight
+        except Exception as e:
+            key = f"{item.get('family')}:{tf}"
+            signals[key] = {
+                "family": item.get("family"),
+                "timeframe": tf,
+                "model": item.get("model"),
+                "config_path": item.get("config_path"),
+                "r2": item.get("r2"),
+                "signal": 0,
+                "confidence": 0.5,
+                "vote_weight": 0.0,
+                "error": str(e),
+            }
+
+    consensus_score = weighted / total_w if total_w > 0 else 0.0
+    consensus = "buy" if consensus_score > 0.1 else ("sell" if consensus_score < -0.1 else "hold")
+    return {
+        "enabled": True,
+        "signals": signals,
+        "consensus": consensus,
+        "consensus_score": float(consensus_score),
+        "n_signals": len(signals),
+    }
+
+
+def _collect_all_model_assessment_signals(
+    trading_cfg: Dict[str, Any],
+    timeout_sec: float = 3.0,
+) -> Dict[str, Any]:
+    enrichment = _collect_agent_a_enrichment_signals(trading_cfg=trading_cfg, timeout_sec=timeout_sec)
+    if bool(enrichment.get("enabled")) and int(enrichment.get("n_signals", 0) or 0) > 0:
+        return {
+            "assessment_scope": "all_models",
+            "signals": dict(enrichment.get("signals") or {}),
+            "consensus": str(enrichment.get("consensus") or "hold"),
+            "consensus_score": float(enrichment.get("consensus_score", 0.0) or 0.0),
+            "n_signals": int(enrichment.get("n_signals", 0) or 0),
+            "avg_confidence": float(enrichment.get("avg_confidence", 0.0) or 0.0),
+            "source": "agent_a_enrichment",
+        }
+
+    mtf = _collect_mode_b_signals(trading_cfg.get("model_endpoints", {}), trading_cfg=trading_cfg, timeout_sec=timeout_sec)
+    return {
+        "assessment_scope": "timeframe_endpoints",
+        "timeframes": dict(mtf.get("timeframes") or {}),
+        "consensus": str(mtf.get("consensus") or "hold"),
+        "consensus_score": float(mtf.get("consensus_score", 0.0) or 0.0),
+        "n_timeframes": int(mtf.get("n_timeframes", 0) or 0),
+        "source": "mode_b_fallback",
+        "fallback_reason": str(enrichment.get("reason") or "agent_a_enrichment_unavailable"),
+    }
+
+
+def _apply_agent_a_enrichment_to_plan(
+    plan: Dict[str, Any],
+    enrichment: Dict[str, Any],
+) -> Dict[str, Any]:
+    def _recompute_risk_levels(payload: Dict[str, Any], side: str) -> None:
+        entry = payload.get("entry")
+        stop_loss = payload.get("stop_loss")
+        take_profit = payload.get("take_profit")
+        try:
+            entry_f = float(entry)
+            stop_f = float(stop_loss)
+            take_f = float(take_profit)
+        except Exception:
+            return
+
+        sl_distance = abs(entry_f - stop_f)
+        tp_distance = abs(take_f - entry_f)
+        if side == "buy":
+            payload["stop_loss"] = round(entry_f - sl_distance, 6)
+            payload["take_profit"] = round(entry_f + tp_distance, 6)
+        elif side == "sell":
+            payload["stop_loss"] = round(entry_f + sl_distance, 6)
+            payload["take_profit"] = round(entry_f - tp_distance, 6)
+
+    out = dict(plan or {})
+    if not bool((enrichment or {}).get("enabled")):
+        out["enrichment"] = enrichment or {"enabled": False}
+        return out
+
+    consensus = str(enrichment.get("consensus") or "hold").lower()
+    consensus_score = float(enrichment.get("consensus_score", 0.0) or 0.0)
+    signals = dict(enrichment.get("signals") or {})
+    usable = [v for v in signals.values() if not v.get("error")]
+    avg_conf = float(np.mean([float(v.get("confidence", 0.5) or 0.5) for v in usable])) if usable else 0.5
+
+    primary_decision = str(out.get("decision") or "hold").lower()
+    primary_signal = 0.0
+    if primary_decision == "buy":
+        primary_signal = 1.0
+    elif primary_decision == "sell":
+        primary_signal = -1.0
+    else:
+        raw_score = float(out.get("signal_score", 0.0) or 0.0)
+        primary_signal = 1.0 if raw_score > 0 else (-1.0 if raw_score < 0 else 0.0)
+
+    alignment = "neutral"
+    if primary_signal > 0 and consensus == "buy":
+        alignment = "aligned"
+    elif primary_signal < 0 and consensus == "sell":
+        alignment = "aligned"
+    elif consensus in {"buy", "sell"} and primary_signal != 0:
+        alignment = "opposed"
+
+    base_conf = float(out.get("confidence", 0.5) or 0.5)
+    out["confidence"] = round(float(np.clip(0.7 * base_conf + 0.3 * avg_conf, 0.0, 1.0)), 4)
+    out["enrichment"] = {
+        "enabled": True,
+        "consensus": consensus,
+        "consensus_score": round(consensus_score, 4),
+        "alignment": alignment,
+        "n_signals": int(enrichment.get("n_signals", 0) or 0),
+        "avg_confidence": round(avg_conf, 4),
+        "signals": signals,
+    }
+
+    out.setdefault("risk_notes", [])
+    out["risk_notes"].append(
+        f"Pretrained consensus={consensus} score={consensus_score:.3f} across {int(enrichment.get('n_signals', 0) or 0)} refreshed family/timeframe signals."
+    )
+    out["rationale"] = str(out.get("rationale") or "") + (
+        f" | enriched_consensus={consensus}, enriched_score={consensus_score:.3f}, alignment={alignment}"
+    )
+
+    prior_decision = str(out.get("decision") or "hold").lower()
+    if str(out.get("decision") or "hold").lower() in {"buy", "sell"} and alignment == "opposed" and abs(consensus_score) >= 0.2:
+        if consensus in {"buy", "sell"}:
+            out["decision"] = consensus
+            out["risk_notes"].append("Primary signal side overridden by stronger pretrained multi-timeframe consensus.")
+        else:
+            out["decision"] = "hold"
+            out["risk_notes"].append("Signal blocked by opposing pretrained multi-timeframe consensus.")
+
+    final_decision = str(out.get("decision") or "hold").lower()
+    if final_decision in {"buy", "sell"} and final_decision != prior_decision:
+        _recompute_risk_levels(out, final_decision)
+
+    return out
 
 
 def _estimate_signal_success_probability(plan: Dict[str, Any], backtest: Dict[str, Any]) -> float:
@@ -946,6 +1804,9 @@ def _extract_endpoint_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         confidence = 0.5
 
+    interpreted_signal = _apply_signal_interpretation(float(signal), payload.get("_trading_cfg") or {})
+    signal = 1 if interpreted_signal > 0 else (-1 if interpreted_signal < 0 else 0)
+
     return {
         "signal": signal,
         "confidence": float(np.clip(confidence, 0.0, 1.0)),
@@ -978,7 +1839,9 @@ def _collect_mode_b_signals(
         try:
             r = _call_signal_endpoint(endpoint_cfg, payload, timeout_sec=timeout_sec, trading_cfg=trading_cfg)
             data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            sig = _extract_endpoint_signal(data)
+            signal_payload = dict(data or {}) if isinstance(data, dict) else {"raw": data}
+            signal_payload["_trading_cfg"] = trading_cfg or {}
+            sig = _extract_endpoint_signal(signal_payload)
             sig["status_code"] = r.status_code
             sig["request"] = {
                 "method": str(endpoint_cfg.get("method") or "post").upper(),
@@ -1030,7 +1893,15 @@ def run_investing_agent(
 
     # External interrupt flag (for UI/dashboard stop control)
     mb_cfg = (trading_cfg.get("mode_b") or {})
-    interrupt_flag_path = mb_cfg.get("interrupt_flag_path", os.path.join(output_dir, "runtime", "mode_b_interrupt.flag"))
+    interrupt_flag_path = str(
+        resolve_runtime_file(
+            configured_path=mb_cfg.get("interrupt_flag_path"),
+            fallback_name="mode_b_interrupt.flag",
+            output_dir=output_dir,
+            trading_cfg=trading_cfg,
+            base_dir=Path(output_dir).parent,
+        )
+    )
     interrupt_mode_b = bool(interrupt_mode_b or (interrupt_flag_path and os.path.exists(interrupt_flag_path)))
 
     plan = _build_mode_a_plan(
@@ -1041,6 +1912,13 @@ def run_investing_agent(
         results.get("future_forecasts", {}),
         preferred_model=selected_model,
     )
+
+    mode_a_cfg = (trading_cfg.get("mode_a") or {})
+    if bool(mode_a_cfg.get("use_pretrained_consensus", True)):
+        enrichment = _collect_agent_a_enrichment_signals(trading_cfg=trading_cfg, timeout_sec=3.0)
+        plan = _apply_agent_a_enrichment_to_plan(plan, enrichment)
+    else:
+        enrichment = {"enabled": False, "reason": "Disabled in mode_a config"}
 
     backtest = run_backtest_from_validation(
         results.get("df"),
@@ -1147,6 +2025,7 @@ def run_investing_agent(
             "total_return_pct": backtest.get("total_return_pct"),
             "max_drawdown_pct": backtest.get("max_drawdown_pct"),
         },
+        "enrichment": enrichment,
         "mode_b": mode_b_status,
         "open_positions": (backtest.get("trades") or [])[-3:],
         "signal_success_probability": success_probability,
@@ -1161,6 +2040,7 @@ def run_investing_agent(
         "mode": mode,
         "plan": plan,
         "backtest": backtest,
+        "enrichment": enrichment,
         "signal_success_probability": success_probability,
         "heatmaps": heatmaps,
         "mode_b": mode_b_status,

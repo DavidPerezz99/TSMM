@@ -7,8 +7,34 @@ from __future__ import annotations
 import os
 import sqlite3
 from typing import Optional
+import logging
 
 import pandas as pd
+
+
+def _aggregate_recent_minutes(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
+
+    tf = int(max(timeframe_minutes, 1))
+    out = df.copy()
+    out["DATE"] = pd.to_datetime(out["DATE"], errors="coerce")
+    out = out.dropna(subset=["DATE"]).sort_values("DATE")
+    if out.empty:
+        return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
+
+    out = out.set_index("DATE")
+    grouped = out.resample(f"{tf}min").agg(
+        {
+            "OPEN": "first",
+            "HIGH": "max",
+            "LOW": "min",
+            "CLOSE": "last",
+            "VOLUME": "sum",
+        }
+    )
+    grouped = grouped.dropna(subset=["OPEN", "HIGH", "LOW", "CLOSE"]).reset_index()
+    return grouped[["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]]
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -221,10 +247,198 @@ def create_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
         conn.close()
 
 
-def create_timeframe_views(db_path: str, timeframes_minutes: list[int]) -> list[str]:
+def create_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
+    """Create or refresh a materialized grouped OHLC table from ohlc_1m."""
+    tf = int(max(timeframe_minutes, 1))
+    table_name = f"ohlc_{tf}m_cache"
+    init_market_db(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} AS
+            WITH base AS (
+                SELECT
+                    DATE,
+                    OPEN,
+                    HIGH,
+                    LOW,
+                    CLOSE,
+                    VOLUME,
+                    (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
+                    CAST(strftime('%s', DATE) AS INTEGER) AS ts
+                FROM ohlc_1m
+            ),
+            agg AS (
+                SELECT
+                    datetime(bucket_id * {tf} * 60, 'unixepoch') AS DATE,
+                    MAX(HIGH) AS HIGH,
+                    MIN(LOW) AS LOW,
+                    SUM(COALESCE(VOLUME, 0.0)) AS VOLUME,
+                    MIN(ts) AS first_ts,
+                    MAX(ts) AS last_ts
+                FROM base
+                GROUP BY bucket_id
+            )
+            SELECT
+                agg.DATE AS DATE,
+                b_open.OPEN AS OPEN,
+                agg.HIGH AS HIGH,
+                agg.LOW AS LOW,
+                b_close.CLOSE AS CLOSE,
+                agg.VOLUME AS VOLUME
+            FROM agg
+            LEFT JOIN base b_open ON b_open.ts = agg.first_ts
+            LEFT JOIN base b_close ON b_close.ts = agg.last_ts
+            ORDER BY agg.DATE
+            """
+        )
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_date ON {table_name}(DATE)")
+        conn.commit()
+        return table_name
+    finally:
+        conn.close()
+
+
+def create_timeframe_views(
+    db_path: str,
+    timeframes_minutes: list[int],
+    include_cache_tables: bool = False,
+) -> list[str]:
     created = []
     for tf in timeframes_minutes:
         created.append(create_timeframe_view(db_path, int(tf)))
+        if include_cache_tables:
+            create_timeframe_cache_table(db_path, int(tf))
+    return created
+
+
+def ensure_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
+    tf = int(max(timeframe_minutes, 1))
+    view_name = f"ohlc_{tf}m"
+    init_market_db(db_path)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='view' AND name=?",
+            (view_name,),
+        ).fetchone()
+        if row:
+            return view_name
+
+        conn.execute(
+            f"""
+            CREATE VIEW IF NOT EXISTS {view_name} AS
+            WITH base AS (
+                SELECT
+                    DATE,
+                    OPEN,
+                    HIGH,
+                    LOW,
+                    CLOSE,
+                    VOLUME,
+                    (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
+                    CAST(strftime('%s', DATE) AS INTEGER) AS ts
+                FROM ohlc_1m
+            ),
+            agg AS (
+                SELECT
+                    datetime(bucket_id * {tf} * 60, 'unixepoch') AS DATE,
+                    MAX(HIGH) AS HIGH,
+                    MIN(LOW) AS LOW,
+                    SUM(COALESCE(VOLUME, 0.0)) AS VOLUME,
+                    MIN(ts) AS first_ts,
+                    MAX(ts) AS last_ts
+                FROM base
+                GROUP BY bucket_id
+            )
+            SELECT
+                agg.DATE AS DATE,
+                b_open.OPEN AS OPEN,
+                agg.HIGH AS HIGH,
+                agg.LOW AS LOW,
+                b_close.CLOSE AS CLOSE,
+                agg.VOLUME AS VOLUME
+            FROM agg
+            LEFT JOIN base b_open ON b_open.ts = agg.first_ts
+            LEFT JOIN base b_close ON b_close.ts = agg.last_ts
+            ORDER BY agg.DATE
+            """
+        )
+        conn.commit()
+        return view_name
+    finally:
+        conn.close()
+
+
+def ensure_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
+    tf = int(max(timeframe_minutes, 1))
+    table_name = f"ohlc_{tf}m_cache"
+    init_market_db(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        if row:
+            conn.commit()
+            return table_name
+
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} AS
+            WITH base AS (
+                SELECT
+                    DATE,
+                    OPEN,
+                    HIGH,
+                    LOW,
+                    CLOSE,
+                    VOLUME,
+                    (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
+                    CAST(strftime('%s', DATE) AS INTEGER) AS ts
+                FROM ohlc_1m
+            ),
+            agg AS (
+                SELECT
+                    datetime(bucket_id * {tf} * 60, 'unixepoch') AS DATE,
+                    MAX(HIGH) AS HIGH,
+                    MIN(LOW) AS LOW,
+                    SUM(COALESCE(VOLUME, 0.0)) AS VOLUME,
+                    MIN(ts) AS first_ts,
+                    MAX(ts) AS last_ts
+                FROM base
+                GROUP BY bucket_id
+            )
+            SELECT
+                agg.DATE AS DATE,
+                b_open.OPEN AS OPEN,
+                agg.HIGH AS HIGH,
+                agg.LOW AS LOW,
+                b_close.CLOSE AS CLOSE,
+                agg.VOLUME AS VOLUME
+            FROM agg
+            LEFT JOIN base b_open ON b_open.ts = agg.first_ts
+            LEFT JOIN base b_close ON b_close.ts = agg.last_ts
+            ORDER BY agg.DATE
+            """
+        )
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_date ON {table_name}(DATE)")
+        conn.commit()
+        return table_name
+    finally:
+        conn.close()
+
+
+def ensure_timeframe_artifacts(db_path: str, timeframes_minutes: list[int]) -> list[str]:
+    created = []
+    for tf in timeframes_minutes:
+        ensure_timeframe_view(db_path, int(tf))
+        created.append(ensure_timeframe_cache_table(db_path, int(tf)))
     return created
 
 
@@ -265,45 +479,36 @@ def query_ohlc(
             return df
 
         tf = int(max(timeframe_minutes, 1))
-        sql = f"""
-            WITH base AS (
-                SELECT
-                    DATE,
-                    OPEN,
-                    HIGH,
-                    LOW,
-                    CLOSE,
-                    VOLUME,
-                    (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
-                    CAST(strftime('%s', DATE) AS INTEGER) AS ts
+        table_name = f"ohlc_{tf}m_cache"
+
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+
+        if row:
+            sql = f"""
+                SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
+                FROM {table_name}
+                WHERE {where_sql}
+                ORDER BY DATE DESC
+                LIMIT ?
+            """
+            df = pd.read_sql_query(sql, conn, params=params + [int(max(latest_records, 1))])
+        else:
+            # Avoid write-time cache builds and expensive grouped SQL over the
+            # full minute table. Read only the recent minute slice via the DATE
+            # index, then aggregate in pandas.
+            minute_limit = max(int(max(latest_records, 1)) * tf + tf, tf * 4)
+            sql = f"""
+                SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
                 FROM ohlc_1m
                 WHERE {where_sql}
-            ),
-            agg AS (
-                SELECT
-                    datetime(bucket_id * {tf} * 60, 'unixepoch') AS DATE,
-                    MAX(HIGH) AS HIGH,
-                    MIN(LOW) AS LOW,
-                    SUM(COALESCE(VOLUME, 0.0)) AS VOLUME,
-                    MIN(ts) AS first_ts,
-                    MAX(ts) AS last_ts
-                FROM base
-                GROUP BY bucket_id
-            )
-            SELECT
-                agg.DATE,
-                b_open.OPEN AS OPEN,
-                agg.HIGH,
-                agg.LOW,
-                b_close.CLOSE AS CLOSE,
-                agg.VOLUME
-            FROM agg
-            LEFT JOIN base b_open ON b_open.ts = agg.first_ts
-            LEFT JOIN base b_close ON b_close.ts = agg.last_ts
-            ORDER BY agg.DATE DESC
-            LIMIT ?
-        """
-        df = pd.read_sql_query(sql, conn, params=params + [int(max(latest_records, 1))])
+                ORDER BY DATE DESC
+                LIMIT ?
+            """
+            recent_df = pd.read_sql_query(sql, conn, params=params + [int(minute_limit)])
+            df = _aggregate_recent_minutes(recent_df, tf).tail(int(max(latest_records, 1))).reset_index(drop=True)
         if df.empty:
             return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
         df = df.sort_values("DATE").reset_index(drop=True)

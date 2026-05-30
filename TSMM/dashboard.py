@@ -16,6 +16,7 @@ import pandas as pd
 from utils.live_data import read_csv_tail, update_fx_master_table_file, update_fx_master_table_db
 from utils.market_db import query_ohlc
 from utils.agent_channel import read_channel_messages, set_channel_enabled, is_channel_enabled
+from utils.runtime_scope import resolve_runtime_dir, resolve_runtime_file
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State", "ctx"])
 plotly_go = __import__("plotly.graph_objects", fromlist=["Figure", "Candlestick", "Scatter", "Heatmap", "Surface"])
@@ -30,10 +31,7 @@ go = plotly_go
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRADING_CFG_PATH = os.path.join(BASE_DIR, "config", "trading_agent.yaml")
-DEFAULT_STATE_PATH = os.path.join(BASE_DIR, "reports", "runtime", "agent_state_latest.json")
-DEFAULT_TRADING_JOB_STATE_PATH = os.path.join(BASE_DIR, "reports", "runtime", "trading_job_state.json")
-DEFAULT_STARTUP_STATUS_PATH = os.path.join(BASE_DIR, "reports", "runtime", "startup_sync_status.json")
+TRADING_CFG_PATH = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 
 
 def _load_trading_cfg() -> dict:
@@ -44,6 +42,22 @@ def _load_trading_cfg() -> dict:
             return yaml.safe_load(f) or {}
     except Exception:
         return {}
+
+
+def _runtime_root() -> str:
+    return str(resolve_runtime_dir(base_dir=BASE_DIR, trading_cfg=_load_trading_cfg()))
+
+
+def _default_state_path() -> str:
+    return os.path.join(_runtime_root(), "agent_state_latest.json")
+
+
+def _default_trading_job_state_path() -> str:
+    return os.path.join(_runtime_root(), "trading_job_state.json")
+
+
+def _default_startup_status_path() -> str:
+    return os.path.join(_runtime_root(), "startup_sync_status.json")
 
 
 def _load_state(path: str) -> dict:
@@ -455,14 +469,14 @@ app.layout = html.Div(
                         ),
                         _control_cell(
                             "State JSON path",
-                            dcc.Input(id="state-path", type="text", value=dashboard_cfg.get("state_path", DEFAULT_STATE_PATH), style={"width": "100%"}),
+                            dcc.Input(id="state-path", type="text", value=dashboard_cfg.get("state_path", _default_state_path()), style={"width": "100%"}),
                         ),
                         _control_cell(
                             "Trading job state path",
                             dcc.Input(
                                 id="trading-job-state-path",
                                 type="text",
-                                value=((cfg.get("trading_job") or {}).get("state_path") or DEFAULT_TRADING_JOB_STATE_PATH),
+                                value=((cfg.get("trading_job") or {}).get("state_path") or _default_trading_job_state_path()),
                                 style={"width": "100%"},
                             ),
                         ),
@@ -580,7 +594,7 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
     auto_status = ""
     _, root_style, main_panel_style, chart_card_style, signal_style, title_style, subtitle_style = _dynamic_styles(theme_mode)
     template = "plotly_dark" if str(theme_mode or "light").lower() == "dark" else "plotly_white"
-    startup_status_path = str(dashboard_cfg.get("startup_status_path", DEFAULT_STARTUP_STATUS_PATH))
+    startup_status_path = str(dashboard_cfg.get("startup_status_path", _default_startup_status_path()))
     startup_status = _load_startup_sync_status(startup_status_path)
 
     result = (startup_status.get("result") or {}) if isinstance(startup_status, dict) else {}
@@ -637,7 +651,7 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
 
     df = _load_data(master_table_path, latest_records=max(int(latest_records or 50000), 500))
     state = _load_state(state_path)
-    tj_state = _load_state(trading_job_state_path or DEFAULT_TRADING_JOB_STATE_PATH)
+    tj_state = _load_state(trading_job_state_path or _default_trading_job_state_path())
 
     if not df.empty:
         end_ts = df["DATE"].max()
@@ -748,10 +762,16 @@ def update_master_table(_, master_table_path, symbol, rate, token_env):
 )
 def mode_b_controls(stop_clicks, resume_clicks, state_path):
     del stop_clicks, resume_clicks
-    state_path = state_path or DEFAULT_STATE_PATH
-    runtime_dir = os.path.dirname(state_path)
-    os.makedirs(runtime_dir, exist_ok=True)
-    flag_path = os.path.join(runtime_dir, "mode_b_interrupt.flag")
+    state_path = state_path or _default_state_path()
+    flag_path = str(
+        resolve_runtime_file(
+            configured_path=((cfg.get("mode_b") or {}).get("interrupt_flag_path")),
+            fallback_name="mode_b_interrupt.flag",
+            trading_cfg=cfg,
+            base_dir=BASE_DIR,
+        )
+    )
+    os.makedirs(os.path.dirname(flag_path), exist_ok=True)
 
     trig = dash_mod.ctx.triggered_id
     if trig == "btn-stop-mode-b":
@@ -773,9 +793,8 @@ def mode_b_controls(stop_clicks, resume_clicks, state_path):
 )
 def channel_controls(enable_clicks, disable_clicks, state_path):
     del enable_clicks, disable_clicks
-    state_path = state_path or DEFAULT_STATE_PATH
-    runtime_dir = os.path.dirname(state_path)
-    output_dir = os.path.dirname(runtime_dir) if runtime_dir else os.path.join(BASE_DIR, "reports")
+    state_path = state_path or _default_state_path()
+    output_dir = os.path.join(BASE_DIR, "reports")
     trig = dash_mod.ctx.triggered_id
     if trig == "btn-enable-channel":
         set_channel_enabled(output_dir=output_dir, trading_cfg=cfg, enabled=True)
@@ -792,9 +811,8 @@ def channel_controls(enable_clicks, disable_clicks, state_path):
     State("state-path", "value"),
 )
 def render_agent_channel(_n, state_path):
-    state_path = state_path or DEFAULT_STATE_PATH
-    runtime_dir = os.path.dirname(state_path)
-    output_dir = os.path.dirname(runtime_dir) if runtime_dir else os.path.join(BASE_DIR, "reports")
+    state_path = state_path or _default_state_path()
+    output_dir = os.path.join(BASE_DIR, "reports")
     msgs = read_channel_messages(output_dir=output_dir, trading_cfg=cfg, max_lines=80)
 
     if not msgs:

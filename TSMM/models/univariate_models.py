@@ -6,30 +6,31 @@ including ULR, SVR, N-BEATS, XGBoost, Prophet, SARIMAX, and LSTM.
 All models generate the 4 required plots: training fit, validation fit, scatter plot, and future forecast.
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')  
-import matplotlib.pyplot as plt
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from prophet import Prophet
-from xgboost import XGBRegressor
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import holidays 
 import logging
-import matplotlib.dates as mdates
-import tempfile
 import os
+import tempfile
 import time
-import seaborn as sns
 from datetime import datetime
 
 from models.multivariate_models import (
     grid_search_sarimax, train_cnn_bilstm_model, 
     multiVrecurrent_LR, train_nbeats_model, multiVrecurrent_SVR
 )
+import holidays
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from prophet import Prophet
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from xgboost import XGBRegressor
+
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
 
 

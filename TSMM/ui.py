@@ -18,6 +18,7 @@ from datetime import datetime
 import yaml
 
 from utils.live_data import update_fx_master_table_file, update_fx_master_table_db
+from utils.runtime_scope import resolve_runtime_file
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State", "ctx"])
 Dash = dash_mod.Dash
@@ -30,10 +31,9 @@ State = dash_mod.State
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_MAIN = os.path.join(BASE_DIR, "config", "config.yaml")
-CFG_TRADING = os.path.join(BASE_DIR, "config", "trading_agent.yaml")
+CFG_TRADING = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 CFG_SWEEP = os.path.join(BASE_DIR, "config", "sweep_definition.yaml")
 CFG_LLM = os.path.join(BASE_DIR, "config", "llm_providers.yaml")
-INTERRUPT_FLAG = os.path.join(BASE_DIR, "reports", "runtime", "mode_b_interrupt.flag")
 
 
 def _load_yaml(path: str) -> dict:
@@ -69,6 +69,14 @@ _cfg_main = _load_yaml(CFG_MAIN)
 _cfg_trading = _load_yaml(CFG_TRADING)
 _data_refresh_cfg = (_cfg_main.get("data_refresh") or {})
 _dash_cfg = (_cfg_trading.get("dashboard") or {})
+INTERRUPT_FLAG = str(
+    resolve_runtime_file(
+        configured_path=((_cfg_trading.get("mode_b") or {}).get("interrupt_flag_path")),
+        fallback_name="mode_b_interrupt.flag",
+        trading_cfg=_cfg_trading,
+        base_dir=BASE_DIR,
+    )
+)
 
 app.layout = html.Div(
     [

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List
 
 import requests
 
@@ -33,6 +35,26 @@ def _resolve_secret(value: str) -> str:
             return resolved
         return _read_windows_user_env(env_name)
     return value
+
+
+def _load_subscriber_chat_ids(subscribers_path: str | None, default_chat_id: str = "") -> List[str]:
+    chat_ids: List[str] = []
+    if default_chat_id:
+        chat_ids.append(str(default_chat_id).strip())
+    raw_path = str(subscribers_path or "").strip()
+    if not raw_path:
+        return [chat_id for chat_id in chat_ids if chat_id]
+
+    try:
+        payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+    except Exception:
+        return [chat_id for chat_id in chat_ids if chat_id]
+
+    for chat_id in payload.get("chat_ids") or []:
+        resolved_chat_id = str(chat_id or "").strip()
+        if resolved_chat_id and resolved_chat_id not in chat_ids:
+            chat_ids.append(resolved_chat_id)
+    return [chat_id for chat_id in chat_ids if chat_id]
 
 
 def send_telegram_notification(telegram_cfg: Dict[str, Any], message: str) -> Dict[str, Any]:
@@ -90,3 +112,38 @@ def send_telegram_notification(telegram_cfg: Dict[str, Any], message: str) -> Di
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def send_telegram_broadcast(
+    telegram_cfg: Dict[str, Any],
+    message: str,
+    subscribers_path: str | None = None,
+    extra_chat_ids: List[str] | None = None,
+) -> Dict[str, Any]:
+    cfg = dict(telegram_cfg or {})
+    default_chat_id = _resolve_secret(str(cfg.get("chat_id", ""))).strip()
+    target_chat_ids = _load_subscriber_chat_ids(subscribers_path, default_chat_id=default_chat_id)
+    for chat_id in extra_chat_ids or []:
+        resolved_chat_id = str(chat_id or "").strip()
+        if resolved_chat_id and resolved_chat_id not in target_chat_ids:
+            target_chat_ids.append(resolved_chat_id)
+
+    if not target_chat_ids:
+        return send_telegram_notification(cfg, message)
+
+    results = []
+    ok = False
+    for chat_id in target_chat_ids:
+        scoped_cfg = dict(cfg)
+        scoped_cfg["chat_id"] = chat_id
+        result = send_telegram_notification(scoped_cfg, message)
+        results.append(result)
+        if bool(result.get("ok", False)):
+            ok = True
+
+    return {
+        "ok": ok,
+        "chat_ids": target_chat_ids,
+        "results": results,
+        "error": None if ok else "telegram_broadcast_failed",
+    }

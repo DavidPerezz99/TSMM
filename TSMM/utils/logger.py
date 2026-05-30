@@ -11,6 +11,7 @@ def setup_logger(log_file: str) -> logging.Logger:
     """
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
+    logger.propagate = False
 
     # Avoid duplicate handlers when called multiple times in the same process
     logger.handlers = []
@@ -33,5 +34,11 @@ def setup_logger(log_file: str) -> logging.Logger:
     # Attach handlers
     logger.addHandler(fh)
     logger.addHandler(ch)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers = []
+    root_logger.addHandler(fh)
+    root_logger.addHandler(ch)
 
     return logger

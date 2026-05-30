@@ -35,7 +35,8 @@ if str(ROOT) not in sys.path:
 
 from scripts.migrate_market_data_to_sqlite import migrate_master_csv  # noqa: E402
 from utils.market_db import create_timeframe_views  # noqa: E402
-from utils.notification_telegram import send_telegram_notification  # noqa: E402
+from utils.notification_telegram import send_telegram_broadcast  # noqa: E402
+from utils.runtime_scope import resolve_runtime_dir  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +69,15 @@ def _as_abs(path_str: str) -> Path:
     return p if p.is_absolute() else (ROOT / p)
 
 
+def _resolve_secret(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip()
+    if raw.startswith("env:"):
+        return os.environ.get(raw.split(":", 1)[1], "")
+    return raw
+
+
 def _parse_retrain_targets(value: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     for token in [t.strip() for t in str(value or "").split(",") if t.strip()]:
@@ -93,6 +103,10 @@ def _stage_log_path() -> Path:
     return ROOT / "reports" / "runtime" / "deployment_pipeline_stage_log.jsonl"
 
 
+def _forecast_runtime_log_dir() -> Path:
+    return ROOT / "reports" / "runtime" / "forecast_runs"
+
+
 def _deploy_stop_flag_path() -> Path:
     return ROOT / "reports" / "runtime" / "deployment_pipeline_stop.flag"
 
@@ -108,6 +122,17 @@ def _log_stage(stage: str, status: str, payload: Dict[str, Any]) -> None:
     }
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _tail_text(path: Path, max_chars: int = 1200) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    text = text[-max_chars:]
+    return text.strip()
 
 
 def _should_stop_deploy() -> bool:
@@ -332,20 +357,77 @@ def _resolve_top1_config(timeframe: str, model: str) -> Optional[Path]:
 
 def _discover_retrain_targets_all_families() -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
+    winner_models = {"nbeats", "ulr"}
+
     for family, timeframe, root_dir in _discover_result_dirs_by_family():
+        best_model = ""
+        best_cfg: Optional[Path] = None
+        best_r2 = -1.0
+
         for model_dir in [d for d in root_dir.iterdir() if d.is_dir()]:
-            cands = list(model_dir.glob("top*.yaml")) + list(model_dir.glob("top*.yml"))
+            model_name = str(model_dir.name).strip().lower()
+            if model_name not in winner_models:
+                continue
+
+            cands = list(model_dir.glob("top1*.yaml")) + list(model_dir.glob("top1*.yml"))
+            if not cands:
+                cands = list(model_dir.glob("top*.yaml")) + list(model_dir.glob("top*.yml"))
             if not cands:
                 continue
-            best = sorted(cands, key=_parse_r2_from_name, reverse=True)[0]
-            out.append(
-                {
-                    "family": family,
-                    "timeframe": str(timeframe),
-                    "model": str(model_dir.name),
-                    "config_path": str(best),
-                }
-            )
+
+            model_best = sorted(cands, key=_parse_r2_from_name, reverse=True)[0]
+            r2 = _parse_r2_from_name(model_best)
+            if r2 > best_r2:
+                best_r2 = r2
+                best_cfg = model_best
+                best_model = model_name
+
+        if best_cfg is None:
+            continue
+
+        out.append(
+            {
+                "family": family,
+                "timeframe": str(timeframe),
+                "model": best_model,
+                "config_path": str(best_cfg),
+            }
+        )
+
+    return out
+
+
+def _dedup_retrain_jobs(jobs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Keep first-seen retrain jobs and drop duplicates by config path or tf/family/model key."""
+    out: List[Dict[str, str]] = []
+    seen_cfg: Set[str] = set()
+    seen_key: Set[Tuple[str, str, str]] = set()
+
+    for job in jobs:
+        family = str(job.get("family") or "high").strip().lower()
+        timeframe = str(job.get("timeframe") or "").strip()
+        model = str(job.get("model") or "").strip().lower()
+        cfg_path = str(job.get("config_path") or "").strip()
+
+        norm_cfg = ""
+        if cfg_path:
+            try:
+                norm_cfg = str(Path(cfg_path).resolve())
+            except Exception:
+                norm_cfg = str(Path(cfg_path))
+
+        tf_key = (family, timeframe, model)
+        if norm_cfg and norm_cfg in seen_cfg:
+            continue
+        if timeframe and model and tf_key in seen_key:
+            continue
+
+        out.append(job)
+        if norm_cfg:
+            seen_cfg.add(norm_cfg)
+        if timeframe and model:
+            seen_key.add(tf_key)
+
     return out
 
 
@@ -412,7 +494,8 @@ def _refresh_master_and_views(pipeline_cfg: Dict[str, Any], dry_run: bool = Fals
         }
 
     mig = migrate_master_csv(str(master_csv), str(db_path), chunksize=chunksize)
-    created = create_timeframe_views(str(db_path), views)
+    create_cache_tables = bool(refresh_cfg.get("create_cache_tables", False))
+    created = create_timeframe_views(str(db_path), views, include_cache_tables=create_cache_tables)
 
     if bool(refresh_cfg.get("update_trading_config", True)):
         trading_cfg_path = ROOT / "config" / "trading_agent.yaml"
@@ -424,17 +507,38 @@ def _refresh_master_and_views(pipeline_cfg: Dict[str, Any], dry_run: bool = Fals
     return {
         "migration": mig,
         "created_views": created,
+        "created_cache_tables": bool(create_cache_tables),
     }
 
 
-def _model_file_key(path: Path) -> Optional[Tuple[str, str, bool]]:
-    # Returns (family, timestamp, is_artifacts) for model/artifact files with timestamp naming.
-    m_art = re.match(r"^(?P<family>[A-Za-z0-9_]+)_artifacts_(?P<ts>\d{8}_\d{6})\.joblib$", path.name)
+def _model_file_key(path: Path) -> Optional[Tuple[str, str, str, bool]]:
+    # Returns (model, target, timeframe, is_artifacts) + timestamp grouping key.
+    m_art = re.match(
+        r"^(?P<model>[A-Za-z0-9_]+)_artifacts_(?P<target>high|low|open|close)_(?P<timeframe>[A-Za-z0-9]+)_(?P<ts>\d{8}_\d{6})\.joblib$",
+        path.name,
+        flags=re.IGNORECASE,
+    )
     if m_art:
-        return m_art.group("family"), m_art.group("ts"), True
-    m_mod = re.match(r"^(?P<family>[A-Za-z0-9_]+)_(?P<ts>\d{8}_\d{6})\.joblib$", path.name)
+        family_key = f"{m_art.group('model').lower()}__{m_art.group('target').lower()}__{m_art.group('timeframe').lower()}"
+        return family_key, m_art.group("ts"), path.parent.as_posix(), True
+
+    m_mod = re.match(
+        r"^(?P<model>[A-Za-z0-9_]+)_(?P<target>high|low|open|close)_(?P<timeframe>[A-Za-z0-9]+)_(?P<ts>\d{8}_\d{6})\.joblib$",
+        path.name,
+        flags=re.IGNORECASE,
+    )
     if m_mod:
-        return m_mod.group("family"), m_mod.group("ts"), False
+        family_key = f"{m_mod.group('model').lower()}__{m_mod.group('target').lower()}__{m_mod.group('timeframe').lower()}"
+        return family_key, m_mod.group("ts"), path.parent.as_posix(), False
+
+    # Backward compatibility for legacy timestamped files that omitted target/timeframe.
+    m_art_legacy = re.match(r"^(?P<family>[A-Za-z0-9_]+)_artifacts_(?P<ts>\d{8}_\d{6})\.joblib$", path.name)
+    if m_art_legacy:
+        return m_art_legacy.group("family").lower(), m_art_legacy.group("ts"), path.parent.as_posix(), True
+
+    m_mod_legacy = re.match(r"^(?P<family>[A-Za-z0-9_]+)_(?P<ts>\d{8}_\d{6})\.joblib$", path.name)
+    if m_mod_legacy:
+        return m_mod_legacy.group("family").lower(), m_mod_legacy.group("ts"), path.parent.as_posix(), False
     return None
 
 
@@ -484,7 +588,7 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
         if not base.exists() or not base.is_dir():
             continue
 
-        # Group timestamped model/artifact files by folder + family.
+        # Group timestamped model/artifact files by folder + model/target/timeframe.
         per_group: Dict[Tuple[str, str], Dict[str, Set[str]]] = {}
         for f in base.rglob("*.joblib"):
             if not f.is_file():
@@ -494,15 +598,15 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
             if mk is None:
                 kept_files_count += 1
                 continue
-            family, ts, is_art = mk
-            group_key = (str(f.parent), family)
+            family_key, ts, folder_key, is_art = mk
+            group_key = (folder_key, family_key)
             per_group.setdefault(group_key, {"models": set(), "artifacts": set()})
             if is_art:
                 per_group[group_key]["artifacts"].add(ts)
             else:
                 per_group[group_key]["models"].add(ts)
 
-        for (folder, family), stamps in per_group.items():
+        for (folder, family_key), stamps in per_group.items():
             model_ts = sorted(stamps["models"], reverse=True)
             art_ts = sorted(stamps["artifacts"], reverse=True)
             keep_model_ts = set(model_ts[:keep_recent_model_generations])
@@ -511,8 +615,14 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
             # Keep matching artifacts for kept model generations.
             keep_art_ts.update(t for t in art_ts if t in keep_model_ts)
 
+            model_name, target_name, timeframe_name = (family_key.split("__", 2) + ["", ""])[:3]
+
             for ts in model_ts[keep_recent_model_generations:]:
-                p = Path(folder) / f"{family}_{ts}.joblib"
+                if target_name and timeframe_name:
+                    fname = f"{model_name}_{target_name}_{timeframe_name}_{ts}.joblib"
+                else:
+                    fname = f"{family_key}_{ts}.joblib"
+                p = Path(folder) / fname
                 if p.exists() and p.is_file():
                     if dry_run:
                         deleted_files.append(str(p))
@@ -526,7 +636,11 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
                 if (not delete_orphan_artifacts) and (ts not in keep_model_ts):
                     kept_files_count += 1
                     continue
-                p = Path(folder) / f"{family}_artifacts_{ts}.joblib"
+                if target_name and timeframe_name:
+                    fname = f"{model_name}_artifacts_{target_name}_{timeframe_name}_{ts}.joblib"
+                else:
+                    fname = f"{family_key}_artifacts_{ts}.joblib"
+                p = Path(folder) / fname
                 if p.exists() and p.is_file():
                     if dry_run:
                         deleted_files.append(str(p))
@@ -536,7 +650,9 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
 
     runtime_cleaned: List[str] = []
     if prune_runtime_flags:
-        runtime_dir = ROOT / "reports" / "runtime"
+        trading_cfg_path = _as_abs(str(((pipeline_cfg.get("trading") or {}).get("trading_config_path", "config/trading_agent.yaml"))))
+        trading_cfg = _load_yaml(trading_cfg_path)
+        runtime_dir = resolve_runtime_dir(base_dir=ROOT, trading_cfg=trading_cfg)
         runtime_dir.mkdir(parents=True, exist_ok=True)
 
         pid_specs = [
@@ -557,8 +673,8 @@ def _optimize_storage(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> Di
                 runtime_cleaned.append(str(p))
 
         stale_flags = [
-            runtime_dir / "deployment_pipeline_stop.flag",
             runtime_dir / "mode_b_interrupt.flag",
+            _deploy_stop_flag_path(),
         ]
         for p in stale_flags:
             if p.exists():
@@ -607,40 +723,56 @@ def _run_forecast(
 
     env = os.environ.copy()
     env["CONFIG_PATH"] = str(cfg_path)
-    proc = subprocess.Popen(
-        [sys.executable, "app.py", "forecast"],
-        cwd=str(ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    runtime_log_dir = _forecast_runtime_log_dir()
+    runtime_log_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    safe_cfg = re.sub(r"[^A-Za-z0-9_.-]+", "_", cfg_path.stem)
+    run_log_path = runtime_log_dir / f"{safe_cfg}_{ts}.log"
 
-    started = time.time()
-    last_heartbeat = started
-    hb_interval = max(int(heartbeat_seconds or 60), 10)
-    while proc.poll() is None:
-        time.sleep(2)
-        now = time.time()
-        if progress_callback and (now - last_heartbeat) >= hb_interval:
-            progress_callback(
-                {
-                    "config_path": str(cfg_path),
-                    "pid": int(proc.pid),
-                    "elapsed_seconds": int(now - started),
-                }
-            )
-            last_heartbeat = now
+    with run_log_path.open("a", encoding="utf-8") as run_log:
+        run_log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START config={cfg_path}\n")
+        run_log.flush()
+        proc = subprocess.Popen(
+            [sys.executable, "app.py", "forecast"],
+            cwd=str(ROOT),
+            env=env,
+            stdout=run_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
 
-    stdout, stderr = proc.communicate()
+        started = time.time()
+        last_heartbeat = started
+        hb_interval = max(int(heartbeat_seconds or 60), 10)
+        while proc.poll() is None:
+            time.sleep(2)
+            now = time.time()
+            if progress_callback and (now - last_heartbeat) >= hb_interval:
+                progress_callback(
+                    {
+                        "config_path": str(cfg_path),
+                        "pid": int(proc.pid),
+                        "elapsed_seconds": int(now - started),
+                        "run_log_path": str(run_log_path),
+                        "log_tail": _tail_text(run_log_path, max_chars=1000),
+                    }
+                )
+                last_heartbeat = now
 
+        proc.wait()
+        run_log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] END rc={int(proc.returncode or 0)}\n")
+        run_log.flush()
+
+    log_tail = _tail_text(run_log_path, max_chars=1200)
     return {
         "config_path": str(cfg_path),
         "returncode": int(proc.returncode or 0),
         "ok": (proc.returncode or 0) == 0,
-        "stdout_tail": (stdout or "")[-1200:],
-        "stderr_tail": (stderr or "")[-1200:],
+        "stdout_tail": log_tail,
+        "stderr_tail": "",
         "duration_seconds": int(time.time() - started),
+        "run_log_path": str(run_log_path),
+        "log_tail": log_tail,
     }
 
 
@@ -710,7 +842,26 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
     plan_model = str(tcfg.get("plan_model", "")).strip()
     exec_cfg = _as_abs(str(tcfg.get("execution_config", "config/high7hResults/ulr/top1_07890.yaml")))
     trading_cfg = _as_abs(str(tcfg.get("trading_config_path", "config/trading_agent.yaml")))
-    mt5_terminal_path = str(tcfg.get("mt5_terminal_path", "")).strip()
+    pipeline_mt5_terminal_path = _resolve_secret(tcfg.get("mt5_terminal_path", ""))
+    trading_cfg_payload = _load_yaml(trading_cfg)
+    trading_cfg_mt5_terminal_path = _resolve_secret(
+        ((trading_cfg_payload.get("broker") or {}).get("mt5") or {}).get("path", "")
+    )
+
+    # Keep terminal selection account-scoped by preferring the per-account trading config.
+    mt5_terminal_path = trading_cfg_mt5_terminal_path or pipeline_mt5_terminal_path
+    if trading_cfg_mt5_terminal_path:
+        mt5_terminal_path_source = "trading_config.broker.mt5.path"
+    elif pipeline_mt5_terminal_path:
+        mt5_terminal_path_source = "pipeline.trading.mt5_terminal_path"
+    else:
+        mt5_terminal_path_source = "unset"
+
+    mt5_path_conflict = bool(
+        trading_cfg_mt5_terminal_path
+        and pipeline_mt5_terminal_path
+        and (trading_cfg_mt5_terminal_path != pipeline_mt5_terminal_path)
+    )
 
     cmd = [sys.executable, "app.py", "trading-job", "start"]
     if plan_model:
@@ -723,6 +874,10 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
             "config_path": str(exec_cfg),
             "trading_config_path": str(trading_cfg),
             "mt5_terminal_path": mt5_terminal_path,
+            "mt5_terminal_path_source": mt5_terminal_path_source,
+            "mt5_terminal_path_from_trading_config": trading_cfg_mt5_terminal_path,
+            "mt5_terminal_path_from_pipeline": pipeline_mt5_terminal_path,
+            "mt5_terminal_path_conflict": mt5_path_conflict,
         }
 
     env = os.environ.copy()
@@ -753,19 +908,28 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
         "pid": int(p.pid),
         "pid_file": str(pid_file),
         "cmd": cmd,
+        "mt5_terminal_path": mt5_terminal_path,
+        "mt5_terminal_path_source": mt5_terminal_path_source,
+        "mt5_terminal_path_conflict": mt5_path_conflict,
     }
 
 
 def _send_telegram(summary: Dict[str, Any], trading_cfg_path: Path) -> Dict[str, Any]:
     trading_cfg = _load_yaml(trading_cfg_path)
     telegram_cfg = (trading_cfg.get("telegram_notifications") or {})
+    runtime_dir = resolve_runtime_dir(base_dir=ROOT, trading_cfg=trading_cfg)
+    account_label = str(((trading_cfg.get("runtime") or {}).get("profile_label") or "TSMM")).strip() or "TSMM"
     msg = (
-        "TSMM pipeline deployed. "
+        f"{account_label} pipeline deployed. "
         f"llm_provider={summary.get('llm', {}).get('chosen_provider')}; "
         f"endpoint_ok={summary.get('endpoint', {}).get('ok')}; "
         f"trading_started={summary.get('trading', {}).get('started', False)}"
     )
-    return send_telegram_notification(telegram_cfg, msg)
+    return send_telegram_broadcast(
+        telegram_cfg,
+        msg,
+        subscribers_path=str(runtime_dir / "telegram_subscribers.json"),
+    )
 
 
 def main() -> int:
@@ -867,6 +1031,8 @@ def main() -> int:
         auto_jobs = _discover_retrain_targets_all_families()
         if auto_jobs:
             retrain_jobs = auto_jobs
+
+    retrain_jobs = _dedup_retrain_jobs(retrain_jobs)
 
     retrain_results = []
     retrain_interval_seconds = int(models_cfg.get("retrain_progress_log_interval_seconds", 60) or 60)

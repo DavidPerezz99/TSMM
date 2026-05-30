@@ -40,6 +40,14 @@ Retrain selected targets during deploy:
 python scripts/deploy_agent_pipeline.py --pipeline-config config/agent_pipeline.yaml --retrain 7h:ulr,3h:nbeats
 ```
 
+FTMO profile deploy using the live FTMO account already connected through the local MT5 terminal:
+
+```powershell
+$env:MT5_FTMO_LOGIN="531158622"
+$env:MT5_FTMO_PASSWORD="<set-your-ftmo-password>"
+python scripts/deploy_agent_pipeline.py --pipeline-config config/agent_pipeline_ftmo.yaml --dry-run
+```
+
 ## 2) Trading job operations
 
 Start trading job:
@@ -64,6 +72,24 @@ Stop trading job gracefully:
 
 ```powershell
 python app.py trading-job stop
+```
+
+Stop one specific trading job gracefully:
+
+```powershell
+python app.py trading-job stop --job-id YOUR_JOB_ID
+```
+
+Hard-kill all active trading jobs:
+
+```powershell
+python app.py trading-job kill
+```
+
+Hard-kill one specific trading job:
+
+```powershell
+python app.py trading-job kill --job-id YOUR_JOB_ID
 ```
 
 Runtime state file:
@@ -94,6 +120,14 @@ Start listener (always-on process):
 python scripts/telegram_command_listener.py --trading-config config/trading_agent.yaml
 ```
 
+Start the FTMO listener in parallel with its own runtime scope and command prefix:
+
+```powershell
+$env:MT5_FTMO_LOGIN="531158622"
+$env:MT5_FTMO_PASSWORD="<set-your-ftmo-password>"
+python scripts/telegram_command_listener.py --trading-config config/trading_agent_ftmo.yaml
+```
+
 Start listener in a visible popup console (Windows):
 
 ```powershell
@@ -112,6 +146,8 @@ Supported Telegram commands (from allowed chat IDs):
 - /tsmm deploy stop
 - /tsmm trading start
 - /tsmm trading start --plan-model ulr
+
+When both listeners are running on the same Telegram bot, use `/tsmm ...` for the default Pepperstone profile and `/ftmo ...` for the FTMO profile.
 - /tsmm trading resume
 - /tsmm trading status
 - /tsmm trading stop
@@ -120,6 +156,13 @@ Supported Telegram commands (from allowed chat IDs):
 - /tsmm ui stop
 - /tsmm resource status
 - /tsmm resource relieve
+
+Telegram agent-chat bridge:
+
+- Use `transfer to agent` to switch the chat into dedicated LLM mode.
+- Use `say copilot <prompt>` to queue a request for the active VS Code Copilot session.
+- The request is stored under `reports/runtime/copilot_bridge/requests/` and can be inspected from VS Code with `python scripts/copilot_bridge.py list`.
+- Reply back to Telegram from this VS Code session with `python scripts/copilot_bridge.py reply --request-id <id> --message "..."`.
 
 Async request tracking behavior:
 
@@ -190,6 +233,18 @@ Behavior:
 - Guard event log file: reports/runtime/resource_guard_events.jsonl
 - Guard state file: reports/runtime/resource_guard_state.json
 
+Post-reboot runtime recovery:
+
+```powershell
+python scripts/recover_runtime_after_reboot.py
+```
+
+Dry-run the recovery plan:
+
+```powershell
+python scripts/recover_runtime_after_reboot.py --dry-run
+```
+
 ## 8) Notes on Agent A fallback behavior
 
 If Agent A returns hold/no-trade, fallback attempts are evaluated from config/trading_agent.yaml:
@@ -206,3 +261,35 @@ Automatic fallback discovery is also supported:
 - agent_a_fallback.max_attempts: cap for auto-generated attempts
 
 Each attempt can override CONFIG_PATH and selected model. Attempt outcomes are persisted into trading job state under agent_a_fallback_attempts.
+
+## 9) Operation feedback datastore and weekly summary
+
+Operation feedback is enabled by default in `config/trading_agent.yaml` and `config/trading_agent_ftmo.yaml` under `operation_feedback`.
+
+Purpose:
+
+- Capture time-sensitive lifecycle evidence for each operation (Agent A planning, approval/order flow, Agent B supervision samples, close outcomes).
+- Preserve performance snapshots for drift analysis (`confidence`, `cm_accuracy`, `success_probability`, `input_fooling_risk`, backtest priors).
+- Keep date-partitioned logs and per-job logs for fast scanning by date or job id.
+
+Default storage layout (runtime-scoped):
+
+- Daily JSONL: `reports/runtime[/ftmo]/operation_feedback/daily/YYYY/MM/DD/operations_YYYYMMDD.jsonl`
+- Per-job JSONL: `reports/runtime[/ftmo]/operation_feedback/by_job/<job_id>.jsonl`
+
+Generate weekly summary (JSON + Markdown):
+
+```powershell
+python scripts/operation_feedback_weekly_summary.py --days 7
+```
+
+Optional explicit range:
+
+```powershell
+python scripts/operation_feedback_weekly_summary.py --start-date 2026-05-22 --end-date 2026-05-28
+```
+
+Default summary outputs:
+
+- `reports/runtime[/ftmo]/operation_feedback/weekly/operation_feedback_weekly_YYYYMMDD.json`
+- `reports/runtime[/ftmo]/operation_feedback/weekly/operation_feedback_weekly_YYYYMMDD.md`

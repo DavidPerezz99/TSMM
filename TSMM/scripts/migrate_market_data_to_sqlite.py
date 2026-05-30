@@ -37,6 +37,11 @@ def parse_args():
         help="Set dashboard.master_table_path in config/trading_agent.yaml to DB path",
     )
     p.add_argument(
+        "--create-cache-tables",
+        action="store_true",
+        help="Also materialize timeframe cache tables after creating views",
+    )
+    p.add_argument(
         "--trading-config",
         default="config/trading_agent.yaml",
         help="Trading config path to update when --update-trading-config is set",
@@ -94,7 +99,11 @@ def main():
     if str(args.views).strip():
         vals = [v.strip() for v in str(args.views).split(",") if v.strip()]
         tfs = [int(v) for v in vals]
-        views = create_timeframe_views(args.db_path, tfs)
+        views = create_timeframe_views(
+            args.db_path,
+            tfs,
+            include_cache_tables=bool(args.create_cache_tables),
+        )
 
     result["created_views"] = views
     print("Migration summary:")

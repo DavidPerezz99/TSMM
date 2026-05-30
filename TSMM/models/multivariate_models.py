@@ -5,32 +5,12 @@ This module provides training functions for multivariate time series forecasting
 including MLR, SARIMAX, and LSTM. All models generate the 4 required plots.
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')  
-import matplotlib.pyplot as plt
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Conv1D, LeakyReLU, Bidirectional, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import layers
-import tensorflow as tf
+import os
 import itertools
 import logging
-import holidays
 import tempfile
-from pathlib import Path
-import seaborn as sns
 from datetime import datetime
-import os
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.svm import SVR
-from sklearn.linear_model import LinearRegression
+from pathlib import Path
 
 TORCH_IMPORT_ERROR = None
 try:
@@ -57,6 +37,20 @@ except Exception as exc:
     optim = _TorchMissingProxy()
     DataLoader = None
     TensorDataset = None
+
+import holidays
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
 
@@ -1249,6 +1243,21 @@ def train_cnn_bilstm_model(
     }
 
     try:
+        try:
+            from tensorflow.keras.models import Sequential
+            from tensorflow.keras.layers import LSTM, Dense, Conv1D, LeakyReLU, Bidirectional, Dropout
+            from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+            from tensorflow.keras.regularizers import l2
+            from tensorflow.keras.optimizers import Adam
+            from tensorflow.keras import layers
+            import tensorflow as tf
+        except Exception as tf_exc:
+            raise ImportError(
+                "TensorFlow is unavailable in this environment. "
+                "Install a compatible TensorFlow build and Visual C++ runtime "
+                "to use LSTM/CNN-BiLSTM model paths."
+            ) from tf_exc
+
         df = df.dropna().reset_index(drop=True)
         X, y = prepare_sequences(df, input_features, target_features,
                                  n_steps, m_steps)
