@@ -4,7 +4,8 @@ agent:
   default_start_mode_a: true
   confirm_live_execution: true
   signal_interpretation: contrarian
-  followup_agent_a_requires_approval: false
+  followup_agent_a_requires_approval: true
+  followup_agent_a_submission_mode: programmed
   approval_channels:
   - telegram
   timezone: America/Bogota
@@ -139,9 +140,9 @@ trading_job:
   prevent_new_programmed_when_open_position: false
   prevent_new_programmed_when_pending_exists: false
   intentional_same_side_stacking:
-    enabled: true
+    enabled: false
     max_same_side_orders: 3
-    auto_enable_on_high_confidence: true
+    auto_enable_on_high_confidence: false
     auto_stack_confidence_threshold: 0.54
     auto_stack_target_orders: 2
   session_hours: 7
@@ -183,9 +184,10 @@ opposing_countertrade:
   mirror_parity_wait_seconds: 45
   mirror_parity_poll_seconds: 3
 autonomous_trading:
-  enabled: true
+  enabled: false
   timezone: America/Bogota
   scan_interval_seconds: 300
+  block_after_manual_or_external_close: true
   pending_order_maintenance:
     enabled: true
     assessment_timeout_seconds: 3.0
@@ -292,7 +294,11 @@ telegram_listener:
   log_conversations: true
   reply_on_non_command: true
   auto_resume_waiting_jobs_enabled: true
-  auto_resume_waiting_jobs_interval_seconds: 60
+  auto_resume_waiting_jobs_interval_seconds: 15
+  adopt_manual_entries: true
+  adopt_any_running_positions: true
+  rebind_existing_non_agent_b: true
+  seed_missing_sltp_on_adopt: true
   ai_agent:
     enabled: true
     provider: local_ollama
@@ -314,6 +320,7 @@ telegram_listener:
   - ui
   - resource
   poll_seconds: 3
+  trading_start_state_wait_seconds: 3.0
   latest_request_status_interval_seconds: 120
   active_jobs_status_interval_seconds: 300
   command_prefix: /ftmo
@@ -348,6 +355,7 @@ boot_recovery:
 dashboard:
   enabled: true
   master_table_path: data\market_data.sqlite
+  sql_symbol: XAUUSD
   startup_sync_enabled: true
   startup_max_pulls: 2
   startup_freshness_lag_minutes: 20
@@ -355,6 +363,10 @@ dashboard:
   tiingo_symbol: xauusd
   tiingo_rate: 1min
   tiingo_token_env: TIINGO_API_TOKEN
+  tiingo_token_envs:
+  - TIINGO_API_TOKEN
+  - TIINGO_API_TOKEN_ALT
+  tiingo_token_rotation_state_path: reports/runtime/tiingo_token_rotation_state.json
   auto_update_master: true
   auto_update_every_ticks: 1
   live_past_minutes: 1440

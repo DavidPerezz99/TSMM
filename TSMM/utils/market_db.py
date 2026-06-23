@@ -12,6 +12,44 @@ import logging
 import pandas as pd
 
 
+DEFAULT_MARKET_SYMBOL = "XAUUSD"
+SYMBOL_ALIASES = {
+    "SPXUSD": "US500",
+    "US500USD": "US500",
+    "SP500": "US500",
+    "US500": "US500",
+}
+
+
+def normalize_market_symbol(symbol: Optional[str]) -> str:
+    raw = str(symbol or DEFAULT_MARKET_SYMBOL).strip().upper().replace("=", "")
+    compact = "".join(ch for ch in raw if ch.isalnum() or ch == "_")
+    if not compact:
+        compact = DEFAULT_MARKET_SYMBOL
+    return str(SYMBOL_ALIASES.get(compact, compact))
+
+
+def _symbol_suffix(symbol: Optional[str]) -> str:
+    normalized = normalize_market_symbol(symbol)
+    if normalized == DEFAULT_MARKET_SYMBOL:
+        return ""
+    return f"_{normalized.lower()}"
+
+
+def master_table_name(symbol: Optional[str] = DEFAULT_MARKET_SYMBOL) -> str:
+    return f"ohlc_1m{_symbol_suffix(symbol)}"
+
+
+def timeframe_view_name(timeframe_minutes: int, symbol: Optional[str] = DEFAULT_MARKET_SYMBOL) -> str:
+    tf = int(max(timeframe_minutes, 1))
+    return f"ohlc_{tf}m{_symbol_suffix(symbol)}"
+
+
+def timeframe_cache_table_name(timeframe_minutes: int, symbol: Optional[str] = DEFAULT_MARKET_SYMBOL) -> str:
+    tf = int(max(timeframe_minutes, 1))
+    return f"ohlc_{tf}m_cache{_symbol_suffix(symbol)}"
+
+
 def _aggregate_recent_minutes(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
@@ -24,7 +62,7 @@ def _aggregate_recent_minutes(df: pd.DataFrame, timeframe_minutes: int) -> pd.Da
         return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
 
     out = out.set_index("DATE")
-    grouped = out.resample(f"{tf}min").agg(
+    grouped = out.resample(f"{tf}min", origin="epoch").agg(
         {
             "OPEN": "first",
             "HIGH": "max",
@@ -45,12 +83,23 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def init_market_db(db_path: str) -> None:
+def init_market_db(db_path: str, symbol: str = DEFAULT_MARKET_SYMBOL) -> None:
+    table_name = master_table_name(symbol)
+    idx_name = f"idx_{table_name}_date"
     conn = _connect(db_path)
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS ohlc_1m (
+            CREATE TABLE IF NOT EXISTS market_symbols (
+                symbol TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
                 DATE TEXT PRIMARY KEY,
                 OPEN REAL,
                 HIGH REAL,
@@ -60,7 +109,15 @@ def init_market_db(db_path: str) -> None:
             )
             """
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_ohlc_1m_date ON ohlc_1m(DATE)")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table_name}(DATE)")
+        conn.execute(
+            """
+            INSERT INTO market_symbols(symbol, table_name)
+            VALUES (?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET table_name=excluded.table_name
+            """,
+            (normalize_market_symbol(symbol), table_name),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -139,18 +196,19 @@ def normalize_ohlc_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def upsert_ohlc_1m(db_path: str, df: pd.DataFrame) -> int:
+def upsert_ohlc_1m(db_path: str, df: pd.DataFrame, symbol: str = DEFAULT_MARKET_SYMBOL) -> int:
     clean = normalize_ohlc_df(df)
     if clean.empty:
         return 0
 
-    init_market_db(db_path)
+    table_name = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         rows = list(clean.itertuples(index=False, name=None))
         conn.executemany(
-            """
-            INSERT INTO ohlc_1m (DATE, OPEN, HIGH, LOW, CLOSE, VOLUME)
+            f"""
+            INSERT INTO {table_name} (DATE, OPEN, HIGH, LOW, CLOSE, VOLUME)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(DATE) DO UPDATE SET
                 OPEN=excluded.OPEN,
@@ -167,38 +225,54 @@ def upsert_ohlc_1m(db_path: str, df: pd.DataFrame) -> int:
         conn.close()
 
 
-def import_csv_to_db(csv_path: str, db_path: str) -> int:
+def import_csv_to_db(csv_path: str, db_path: str, symbol: str = DEFAULT_MARKET_SYMBOL) -> int:
     df = pd.read_csv(csv_path)
-    return upsert_ohlc_1m(db_path, df)
+    return upsert_ohlc_1m(db_path, df, symbol=symbol)
 
 
-def get_latest_date(db_path: str) -> Optional[str]:
+def get_latest_date(db_path: str, symbol: str = DEFAULT_MARKET_SYMBOL) -> Optional[str]:
     if not os.path.exists(db_path):
         return None
+    table_name = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
-        row = conn.execute("SELECT MAX(DATE) FROM ohlc_1m").fetchone()
+        row = conn.execute(f"SELECT MAX(DATE) FROM {table_name}").fetchone()
         return str(row[0]) if row and row[0] else None
     finally:
         conn.close()
 
 
-def get_row_count(db_path: str, table: str = "ohlc_1m") -> int:
+def get_row_count(
+    db_path: str,
+    table: Optional[str] = None,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> int:
     if not os.path.exists(db_path):
         return 0
+    table_name = str(table or "").strip() or master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
-        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
         return int(row[0]) if row else 0
     finally:
         conn.close()
 
 
-def create_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
-    """Create or replace a grouped OHLC SQL view from ohlc_1m."""
+def create_timeframe_view(
+    db_path: str,
+    timeframe_minutes: int,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> str:
+    """Create or replace a grouped OHLC SQL view from symbol-scoped minute candles."""
     tf = int(max(timeframe_minutes, 1))
-    view_name = f"ohlc_{tf}m"
-    init_market_db(db_path)
+    if tf <= 1:
+        init_market_db(db_path, symbol=symbol)
+        return master_table_name(symbol)
+    view_name = timeframe_view_name(tf, symbol=symbol)
+    table_1m = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         conn.execute(f"DROP VIEW IF EXISTS {view_name}")
@@ -215,7 +289,7 @@ def create_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
                     VOLUME,
                     (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
                     CAST(strftime('%s', DATE) AS INTEGER) AS ts
-                FROM ohlc_1m
+                FROM {table_1m}
             ),
             agg AS (
                 SELECT
@@ -247,11 +321,16 @@ def create_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
         conn.close()
 
 
-def create_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
-    """Create or refresh a materialized grouped OHLC table from ohlc_1m."""
+def create_timeframe_cache_table(
+    db_path: str,
+    timeframe_minutes: int,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> str:
+    """Create or refresh a materialized grouped OHLC table from symbol-scoped minute candles."""
     tf = int(max(timeframe_minutes, 1))
-    table_name = f"ohlc_{tf}m_cache"
-    init_market_db(db_path)
+    table_name = timeframe_cache_table_name(tf, symbol=symbol)
+    source_table = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         conn.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -268,7 +347,7 @@ def create_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
                     VOLUME,
                     (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
                     CAST(strftime('%s', DATE) AS INTEGER) AS ts
-                FROM ohlc_1m
+                FROM {source_table}
             ),
             agg AS (
                 SELECT
@@ -305,19 +384,28 @@ def create_timeframe_views(
     db_path: str,
     timeframes_minutes: list[int],
     include_cache_tables: bool = False,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
 ) -> list[str]:
     created = []
     for tf in timeframes_minutes:
-        created.append(create_timeframe_view(db_path, int(tf)))
+        created.append(create_timeframe_view(db_path, int(tf), symbol=symbol))
         if include_cache_tables:
-            create_timeframe_cache_table(db_path, int(tf))
+            create_timeframe_cache_table(db_path, int(tf), symbol=symbol)
     return created
 
 
-def ensure_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
+def ensure_timeframe_view(
+    db_path: str,
+    timeframe_minutes: int,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> str:
     tf = int(max(timeframe_minutes, 1))
-    view_name = f"ohlc_{tf}m"
-    init_market_db(db_path)
+    if tf <= 1:
+        init_market_db(db_path, symbol=symbol)
+        return master_table_name(symbol)
+    view_name = timeframe_view_name(tf, symbol=symbol)
+    source_table = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         row = conn.execute(
@@ -340,7 +428,7 @@ def ensure_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
                     VOLUME,
                     (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
                     CAST(strftime('%s', DATE) AS INTEGER) AS ts
-                FROM ohlc_1m
+                FROM {source_table}
             ),
             agg AS (
                 SELECT
@@ -372,10 +460,15 @@ def ensure_timeframe_view(db_path: str, timeframe_minutes: int) -> str:
         conn.close()
 
 
-def ensure_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
+def ensure_timeframe_cache_table(
+    db_path: str,
+    timeframe_minutes: int,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> str:
     tf = int(max(timeframe_minutes, 1))
-    table_name = f"ohlc_{tf}m_cache"
-    init_market_db(db_path)
+    table_name = timeframe_cache_table_name(tf, symbol=symbol)
+    source_table = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         conn.execute("PRAGMA busy_timeout=5000;")
@@ -401,7 +494,7 @@ def ensure_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
                     VOLUME,
                     (CAST(strftime('%s', DATE) AS INTEGER) / ({tf} * 60)) AS bucket_id,
                     CAST(strftime('%s', DATE) AS INTEGER) AS ts
-                FROM ohlc_1m
+                FROM {source_table}
             ),
             agg AS (
                 SELECT
@@ -434,11 +527,15 @@ def ensure_timeframe_cache_table(db_path: str, timeframe_minutes: int) -> str:
         conn.close()
 
 
-def ensure_timeframe_artifacts(db_path: str, timeframes_minutes: list[int]) -> list[str]:
+def ensure_timeframe_artifacts(
+    db_path: str,
+    timeframes_minutes: list[int],
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> list[str]:
     created = []
     for tf in timeframes_minutes:
-        ensure_timeframe_view(db_path, int(tf))
-        created.append(ensure_timeframe_cache_table(db_path, int(tf)))
+        ensure_timeframe_view(db_path, int(tf), symbol=symbol)
+        created.append(ensure_timeframe_cache_table(db_path, int(tf), symbol=symbol))
     return created
 
 
@@ -448,8 +545,10 @@ def query_ohlc(
     latest_records: int = 50000,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    symbol: str = DEFAULT_MARKET_SYMBOL,
 ) -> pd.DataFrame:
-    init_market_db(db_path)
+    source_table = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
     try:
         where = ["1=1"]
@@ -466,7 +565,7 @@ def query_ohlc(
         if int(timeframe_minutes) <= 1:
             sql = f"""
                 SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
-                FROM ohlc_1m
+                FROM {source_table}
                 WHERE {where_sql}
                 ORDER BY DATE DESC
                 LIMIT ?
@@ -479,7 +578,7 @@ def query_ohlc(
             return df
 
         tf = int(max(timeframe_minutes, 1))
-        table_name = f"ohlc_{tf}m_cache"
+        table_name = timeframe_cache_table_name(tf, symbol=symbol)
 
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -502,7 +601,7 @@ def query_ohlc(
             minute_limit = max(int(max(latest_records, 1)) * tf + tf, tf * 4)
             sql = f"""
                 SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
-                FROM ohlc_1m
+                FROM {source_table}
                 WHERE {where_sql}
                 ORDER BY DATE DESC
                 LIMIT ?

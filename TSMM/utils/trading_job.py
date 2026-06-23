@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -30,7 +31,7 @@ from .llm_connector import load_llm_providers_config, call_llm
 from .market_sentiment import aggregate_market_sentiment
 from .agent_memory import AgentMemoryStore
 from .agent_channel import publish_channel_message
-from .live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master
+from .live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master, resolve_tiingo_token_candidates
 from .notification_email import send_email_notification
 from .notification_telegram import send_telegram_broadcast
 from .operation_feedback_store import (
@@ -108,6 +109,7 @@ def _launch_account_mirror_start(
     selected_model: Optional[str],
     source_job_id: str,
     request_context: Optional[Dict[str, Any]] = None,
+    source_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     mirror_cfg = _account_mirror_cfg(trading_cfg)
     if not bool(mirror_cfg.get("enabled", False)):
@@ -149,6 +151,20 @@ def _launch_account_mirror_start(
     env["TSMM_ACCOUNT_MIRROR_SOURCE_JOB_ID"] = source_job_id
     env["TSMM_ACCOUNT_MIRROR_SOURCE_CONFIG_PATH"] = current_cfg_path
     env["TSMM_ACCOUNT_MIRROR_SOURCE_PROFILE"] = _account_profile_label(trading_cfg)
+
+    # When a source plan is provided, force the mirror to copy the exact trade
+    # instead of running independent Agent A analysis.
+    if isinstance(source_plan, dict) and source_plan:
+        # Only copy the fields that define the trade decision — not internal metadata.
+        copy_keys = (
+            "decision", "model", "entry", "stop_loss", "take_profit", "volume",
+            "confidence", "cm_accuracy", "signal_score", "success_probability",
+            "input_fooling_risk", "order_submission_mode",
+            "analysis_grounding_timeframe", "analysis_grounding_timeframe_minutes",
+        )
+        forced_plan = {k: v for k, v in source_plan.items() if k in copy_keys and v is not None}
+        forced_plan["source"] = "account_mirror_exact_copy"
+        env["TSMM_FORCE_AGENT_A_PLAN_JSON"] = json.dumps(forced_plan, ensure_ascii=True, separators=(",", ":"), default=str)
 
     command = [sys.executable, "app.py", "trading-job", "start", "--job-id", peer_job_id]
     if submission_mode:
@@ -778,9 +794,32 @@ def _approval_response_path(output_dir: str, trading_cfg: Dict[str, Any], job_id
 
 
 def _save_state(path: str, payload: Dict[str, Any]) -> None:
+    _write_json_atomic(path, payload)
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    temp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(path),
+            prefix=".state_",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temp_path = f.name
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 def _load_state(path: str) -> Dict[str, Any]:
@@ -790,13 +829,28 @@ def _load_state(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+        except Exception:
+            return {}
+
+        # Reboots can leave null-byte tails in JSON files; recover first valid object.
+        for candidate in (raw, raw.replace("\x00", "")):
+            candidate = str(candidate or "")
+            if not candidate.strip():
+                continue
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(candidate.lstrip("\ufeff \t\r\n"))
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
         return {}
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    _write_json_atomic(path, payload)
 
 
 def _new_job_id(trading_cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -1075,9 +1129,22 @@ def _ensure_assessment_data_fresh(
         return {"ok": False, "error": "missing_master_path"}
 
     token_env = str(dash_cfg.get("tiingo_token_env", "TIINGO_API_TOKEN")).strip() or "TIINGO_API_TOKEN"
+    token_envs_cfg = dash_cfg.get("tiingo_token_envs")
+    token_rotation_state_path = str(dash_cfg.get("tiingo_token_rotation_state_path") or "").strip() or None
     token = os.environ.get(token_env, "")
-    if not token:
-        return {"ok": False, "error": f"missing_token_env:{token_env}"}
+    token_candidates = resolve_tiingo_token_candidates(
+        token_env=token_env,
+        token_envs=token_envs_cfg,
+        token=token,
+    )
+    if not token_candidates:
+        configured_envs = [token_env]
+        if isinstance(token_envs_cfg, str):
+            configured_envs.extend([x.strip() for x in token_envs_cfg.replace(";", ",").split(",") if str(x).strip()])
+        elif isinstance(token_envs_cfg, (list, tuple, set)):
+            configured_envs.extend([str(x).strip() for x in token_envs_cfg if str(x).strip()])
+        configured_envs = list(dict.fromkeys(configured_envs))
+        return {"ok": False, "error": f"missing_token_envs:{','.join(configured_envs)}"}
 
     symbol = str(dash_cfg.get("tiingo_symbol", "xauusd")).strip().lower() or "xauusd"
     rate = str(dash_cfg.get("tiingo_rate", "1min")).strip() or "1min"
@@ -1091,10 +1158,19 @@ def _ensure_assessment_data_fresh(
         token=token,
         max_pulls=max_pulls,
         freshness_lag_minutes=freshness_lag_minutes,
+        token_env=token_env,
+        token_envs=token_envs_cfg,
+        token_rotation_state_path=token_rotation_state_path,
     )
 
     active_sync_result = None
     active_cfg = app_config or {}
+    active_sql_symbol = str(
+        active_cfg.get("sql_symbol")
+        or active_cfg.get("symbol")
+        or dash_cfg.get("sql_symbol")
+        or symbol
+    ).strip()
     active_data_path = str(active_cfg.get("data_path") or "").strip()
     if active_data_path and not active_data_path.lower().endswith((".db", ".sqlite")):
         active_sync_result = sync_dataset_source_from_master(
@@ -1105,6 +1181,7 @@ def _ensure_assessment_data_fresh(
             rolling_windows=list(active_cfg.get("rolling_windows") or [2, 7, 30, 60]),
             n_steps=int(active_cfg.get("n_steps", 1) or 1),
             horizon=int(active_cfg.get("horizon", 1) or 1),
+            symbol=active_sql_symbol,
             logger=logger,
         )
 
@@ -1112,6 +1189,7 @@ def _ensure_assessment_data_fresh(
         "ok": bool(sync_result.get("ok", False)),
         "master_path": master_path,
         "token_env": token_env,
+        "configured_token_envs": [item.get("env") for item in token_candidates],
         "freshness_lag_minutes": freshness_lag_minutes,
         "sync_result": sync_result,
         "active_config_sync_result": active_sync_result,
@@ -1381,10 +1459,13 @@ def kill_trading_job(
 
             kill_res = _kill_process_tree(int(state.get("runner_pid", 0) or 0))
             cancel_res: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "no_pending_order_cancelled"}
+            close_res: Dict[str, Any] = {"ok": False, "skipped": True, "reason": "no_live_position_close_attempted"}
             order = (state.get("order") or {}) if isinstance(state.get("order"), dict) else {}
             position = (state.get("position") or {}) if isinstance(state.get("position"), dict) else {}
             order_ticket = int(order.get("order_ticket", 0) or 0)
             position_ticket = int(position.get("ticket", 0) or 0)
+            if ok_conn and position_ticket > 0:
+                close_res = adapter.close_position_by_ticket(position_ticket)
             if ok_conn and order_ticket > 0 and position_ticket <= 0:
                 cancel_res = adapter.cancel_pending_order(order_ticket)
 
@@ -1395,16 +1476,25 @@ def kill_trading_job(
             state["kill_requested_at"] = timestamp
             state["kill_result"] = kill_res
             state["stop_flag_path"] = stop_path
+            if position_ticket > 0:
+                state["close_result"] = close_res
             if order_ticket > 0 and position_ticket <= 0:
                 state["cancel_result"] = cancel_res
             _save_job_state(output_dir, trading_cfg, state_path, state)
 
+            action_ok = bool(kill_res.get("ok", False))
+            if position_ticket > 0:
+                action_ok = action_ok or bool(close_res.get("ok", False))
+            if order_ticket > 0 and position_ticket <= 0:
+                action_ok = action_ok or bool(cancel_res.get("ok", False))
+
             results.append(
                 {
                     "job_id": target_job_id,
-                    "ok": bool(kill_res.get("ok", False)),
+                    "ok": action_ok,
                     "pid": int((kill_res or {}).get("pid", 0) or 0),
                     "kill_result": kill_res,
+                    "close_result": close_res,
                     "cancel_result": cancel_res,
                 }
             )
@@ -1415,16 +1505,24 @@ def kill_trading_job(
         if ok_conn:
             adapter.shutdown()
 
-    success_job_ids = [str(item.get("job_id") or "").strip() for item in results if str(item.get("job_id") or "").strip()]
+    success_job_ids = [
+        str(item.get("job_id") or "").strip()
+        for item in results
+        if bool(item.get("ok", False)) and str(item.get("job_id") or "").strip()
+    ]
+    attempted_job_ids = [str(item.get("job_id") or "").strip() for item in results if str(item.get("job_id") or "").strip()]
     return {
-        "ok": any(bool(item.get("ok", False)) for item in results) or bool(success_job_ids),
+        "ok": any(bool(item.get("ok", False)) for item in results),
         "job_ids": success_job_ids,
         "results": results,
         "mirror_results": mirror_results,
         "message": (
             f"Trading job kill executed for {len(success_job_ids)} job(s): {', '.join(success_job_ids)}"
             if success_job_ids
-            else "No trading jobs were killed."
+            else (
+                "Trading job kill request completed, but no process or broker exposure was terminated"
+                + (f" for: {', '.join(attempted_job_ids)}" if attempted_job_ids else ".")
+            )
         ),
     }
 
@@ -2300,18 +2398,46 @@ def _finalize_countertrade_parity_reverted_state(
     return state
 
 
+def _retcode_failure_hint(retcode: Any) -> str:
+    code = str(retcode or "").strip()
+    hints = {
+        "10027": "client autotrading disabled; verify MT5 AutoTrading and account permissions",
+        "10018": "market closed",
+        "10016": "invalid stops",
+        "10030": "invalid order filling mode",
+        "10013": "invalid request/filling for broker",
+    }
+    return str(hints.get(code, "") or "").strip()
+
+
+def _append_retcode_hint(message: str, retcode: Any) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return text
+    hint = _retcode_failure_hint(retcode)
+    if not hint:
+        return text
+    if hint.lower() in text.lower():
+        return text
+    return f"{text} ({hint})"
+
+
 def _order_failure_message(order_res: Dict[str, Any]) -> str:
     payload = dict(order_res or {})
     for key in ("message", "error", "reason", "details"):
         value = str(payload.get(key) or "").strip()
         if value:
+            retcode_match = re.search(r"retcode\s*=\s*(\d+)", value, flags=re.IGNORECASE)
+            if retcode_match:
+                return _append_retcode_hint(value, retcode_match.group(1))
             return value
 
     retcode = payload.get("retcode")
     retcode_text = str(retcode).strip() if retcode is not None else ""
     comment = str(payload.get("comment") or payload.get("mt5_comment") or "").strip()
     if retcode_text:
-        return f"retcode={retcode_text} ({comment})" if comment else f"retcode={retcode_text}"
+        base = f"retcode={retcode_text} ({comment})" if comment else f"retcode={retcode_text}"
+        return _append_retcode_hint(base, retcode_text)
 
     return "unknown"
 
@@ -3561,6 +3687,9 @@ def _agent_a_approval_decision(
     active_agent_b_count = _active_agent_b_position_count(output_dir, trading_cfg)
     threshold = int(policy.get("auto_approve_below_agent_b_count", 0) or 0)
 
+    if auto_created and bool(agent_cfg.get("followup_agent_a_requires_approval", False)):
+        return True, "followup_manual_approval_required", active_agent_b_count, threshold
+
     if bool(policy.get("auto_approve_mandatory_session_programmed", True)) and autonomous_trigger == "mandatory_session" and submission_mode == "programmed":
         return False, "mandatory_session_programmed", active_agent_b_count, threshold
     if bool(policy.get("auto_approve_opposing_countertrade", True)) and autonomous_trigger == "opposing_countertrade":
@@ -3800,6 +3929,16 @@ def _notify(
             message=tg_message,
             subscribers_path=_telegram_subscribers_path(output_dir, trading_cfg),
         )
+        if not bool(telegram_out.get("ok", False)):
+            payload_metadata["telegram_delivery_error"] = str(
+                telegram_out.get("error")
+                or telegram_out.get("reason")
+                or "telegram_send_failed"
+            ).strip()
+        payload_metadata["notification_delivery"] = {
+            "email": email_out,
+            "telegram": telegram_out,
+        }
 
     try:
         feedback_state = dict(state_context or {})
@@ -4004,25 +4143,50 @@ def _close_outcome_reason_label(state: Dict[str, Any]) -> str:
     return str(outcome.get("reason_label") or "").strip().lower()
 
 
-def _should_auto_request_followup_agent_a(state: Dict[str, Any]) -> bool:
+def _is_manual_close_outcome(state: Dict[str, Any]) -> bool:
+    outcome = (state.get("close_outcome") or {}) if isinstance(state, dict) else {}
+    if not isinstance(outcome, dict):
+        return False
+
+    reason_label = str(outcome.get("reason_label") or "").strip().lower()
+    if reason_label in {"client", "mobile", "web", "manual"}:
+        return True
+
+    # Some brokers may only include hints in the deal comment for manual closures.
+    comment = str(outcome.get("comment") or "").strip().lower()
+    if "manual" in comment and reason_label not in {"expert", "sl", "tp", "so"}:
+        return True
+    return False
+
+
+def _is_manual_or_external_close(state: Dict[str, Any]) -> bool:
+    closed_reason = str((state or {}).get("closed_reason") or "").strip().lower()
+    if closed_reason in {"manual_stop", "manual_close_via_telegram", "position_not_found_assumed_closed"}:
+        return True
+    if bool((state or {}).get("manual_or_external_close_detected", False)):
+        return True
+    return _is_manual_close_outcome(state)
+
+
+def _should_auto_request_followup_agent_a(state: Dict[str, Any], trading_cfg: Optional[Dict[str, Any]] = None) -> bool:
     closed_reason = str((state or {}).get("closed_reason") or "").strip().lower()
     if not closed_reason:
         return False
-    if closed_reason in {"manual_stop", "manual_close_via_telegram"}:
+    if _is_manual_or_external_close(state):
         return False
     if closed_reason.startswith("mode_b_consensus_close("):
         return True
     if closed_reason in {"hard_deadline_reached", "extension_not_approved_in_window", "extension_rejected_or_timeout"}:
         return True
-    if closed_reason != "position_not_found_assumed_closed":
-        return False
-
-    outcome_reason = _close_outcome_reason_label(state)
-    if outcome_reason in {"client", "mobile", "web"}:
-        return False
-    if outcome_reason in {"sl", "tp", "so", "expert"}:
-        return True
     return False
+
+
+def _followup_agent_a_submission_mode(trading_cfg: Dict[str, Any]) -> str:
+    agent_cfg = (trading_cfg.get("agent") or {}) if isinstance(trading_cfg, dict) else {}
+    mode = str(agent_cfg.get("followup_agent_a_submission_mode") or "programmed").strip().lower()
+    if mode not in {"programmed", "market"}:
+        mode = "programmed"
+    return mode
 
 
 def _launch_followup_agent_a_start(
@@ -4032,10 +4196,12 @@ def _launch_followup_agent_a_start(
     logger,
     completed_state: Dict[str, Any],
 ) -> Dict[str, Any]:
-    if not _should_auto_request_followup_agent_a(completed_state):
-        return {"ok": False, "skipped": True, "reason": "close_reason_not_eligible"}
+    if not _should_auto_request_followup_agent_a(completed_state, trading_cfg):
+        skip_reason = "manual_or_external_close" if _is_manual_or_external_close(completed_state) else "close_reason_not_eligible"
+        return {"ok": False, "skipped": True, "reason": skip_reason}
 
     new_job_id = _new_job_id(trading_cfg)
+    submission_mode = _followup_agent_a_submission_mode(trading_cfg)
     env = os.environ.copy()
     env.setdefault("CONFIG_PATH", "config/config.yaml")
     env["TRADING_CONFIG_PATH"] = _current_trading_config_path()
@@ -4050,7 +4216,16 @@ def _launch_followup_agent_a_start(
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, "app.py", "trading-job", "start", "--job-id", new_job_id],
+            [
+                sys.executable,
+                "app.py",
+                "trading-job",
+                "start",
+                "--job-id",
+                new_job_id,
+                "--submission-mode",
+                submission_mode,
+            ],
             cwd=str(_project_root()),
             env=env,
             creationflags=creationflags,
@@ -4069,7 +4244,8 @@ def _launch_followup_agent_a_start(
             kind="followup_start_requested",
             message=(
                 "Previous trading job finished with an auto-reentry eligible close outcome. "
-                f"Starting a new Agent A entry search now. new_job_id={new_job_id}; pid={int(proc.pid)}"
+                f"Starting a new Agent A entry search now using {submission_mode} order submission mode. "
+                f"new_job_id={new_job_id}; pid={int(proc.pid)}"
             ),
             requires_approval=False,
             emergency=False,
@@ -4077,6 +4253,7 @@ def _launch_followup_agent_a_start(
             metadata={
                 "previous_job_id": completed_state.get("job_id"),
                 "new_job_id": new_job_id,
+                "followup_submission_mode": submission_mode,
                 "trigger_closed_reason": completed_state.get("closed_reason"),
                 "close_outcome": completed_state.get("close_outcome"),
             },
@@ -4247,6 +4424,7 @@ def _run_agent_b_loop(
                     state["close_outcome"] = close_outcome
                 state["status"] = "closed"
                 state["closed_reason"] = "position_not_found_assumed_closed"
+                state["manual_or_external_close_detected"] = True
                 state["ended_at"] = _iso(_now_utc())
                 _append_job_finished_notification(state, output_dir, trading_cfg, "agent_b", job_id)
                 return state
@@ -4617,17 +4795,6 @@ def start_trading_job(
         return {"ok": False, "error": failed_state["closed_reason"], "state": failed_state}
 
     mirror_state = dict(request_ctx.get("mirror") or {}) if isinstance(request_ctx.get("mirror"), dict) else {}
-    mirror_launch = _launch_account_mirror_start(
-        app_config=app_config,
-        trading_cfg=trading_cfg,
-        output_dir=output_dir,
-        logger=logger,
-        selected_model=selected_model,
-        source_job_id=resolved_job_id,
-        request_context=request_ctx,
-    )
-    if not mirror_state and not bool(mirror_launch.get("skipped", False)):
-        mirror_state = dict(mirror_launch)
     if mirror_state:
         request_ctx["mirror"] = mirror_state
 
@@ -4818,8 +4985,10 @@ def start_trading_job(
         sentiment=sentiment,
         memory_context=memory_context,
     )
+
     autonomous_trigger = str((request_ctx or {}).get("autonomous_trigger") or "").strip().lower()
-    if autonomous_trigger == "autonomous_followup":
+    is_mirror_exact_copy = bool(plan.get("forced_plan_override")) and str(plan.get("forced_plan_override_source") or "").strip() == "account_mirror_exact_copy"
+    if autonomous_trigger == "autonomous_followup" and not is_mirror_exact_copy:
         should_trade, autonomous_reason = _autonomous_followup_meets_entry_thresholds(plan, trading_cfg)
         if not should_trade:
             state = {
@@ -4856,6 +5025,24 @@ def start_trading_job(
             except Exception:
                 pass
             return state
+
+    # Launch account mirror only AFTER the autonomous-followup filter has passed,
+    # so FTMO does not receive mirror jobs for trades that Pepperstone filters out.
+    mirror_launch = _launch_account_mirror_start(
+        app_config=app_config,
+        trading_cfg=trading_cfg,
+        output_dir=output_dir,
+        logger=logger,
+        selected_model=selected_model,
+        source_job_id=resolved_job_id,
+        request_context=request_ctx,
+        source_plan=plan,
+    )
+    if not mirror_state and not bool(mirror_launch.get("skipped", False)):
+        mirror_state = dict(mirror_launch)
+    if mirror_state:
+        request_ctx["mirror"] = mirror_state
+
     story = (
         "Agent A completed signal analysis for a single-session operation. "
         f"Decision={plan.get('decision')}, model={plan.get('model')}, confidence={plan.get('confidence')}, "
@@ -5441,7 +5628,18 @@ def resume_trading_job(
     if not state:
         return {"ok": False, "error": "No trading job state found to resume"}
 
-    state["job_id"] = str(state.get("job_id") or resolved_job_id).strip()
+    loaded_job_id = str(state.get("job_id") or "").strip()
+    if requested_job_id and loaded_job_id and loaded_job_id != resolved_job_id:
+        return {
+            "ok": False,
+            "error": (
+                "Job state identity mismatch: "
+                f"requested_job_id={resolved_job_id}; state_job_id={loaded_job_id}; state_path={state_file}"
+            ),
+            "state": state,
+        }
+
+    state["job_id"] = loaded_job_id or resolved_job_id
     state["state_path"] = state_file
     state["runner_pid"] = _runner_pid()
     state["runner_started_at"] = _iso(_now_utc())

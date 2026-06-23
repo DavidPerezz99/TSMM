@@ -141,6 +141,7 @@ def _load_spec_from_config(timeframe: str, config_path: str, fallback: Dict[str,
                 "model": str(spec.get("model") or Path(resolved_config).parents[0].name),
                 "r2": spec.get("r2"),
                 "n_steps": int(cfg.get("n_steps", spec.get("n_steps", 1)) or 1),
+                "m_steps": int(cfg.get("m_steps", spec.get("m_steps", 1)) or 1),
                 "input_features": list(cfg.get("input_features") or spec.get("input_features") or []),
                 "target_features": list(cfg.get("target_features") or spec.get("target_features") or []),
                 "target_col": str(cfg.get("target_col") or spec.get("target_col") or "HIGH"),
@@ -230,12 +231,19 @@ def _confidence_from_rows(rows: List[Dict[str, Any]], pred: float) -> float:
 def _predict_with_loaded(lm: LoadedModel, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     spec = lm.spec
     n_steps = int(spec.get("n_steps", 1) or 1)
+    m_steps = int(spec.get("m_steps", 1) or 1)
     feats = [str(c) for c in (spec.get("input_features") or [])]
-    if len(rows) < n_steps:
-        raise ValueError(f"insufficient_rows: need={n_steps} got={len(rows)}")
+    min_need = n_steps + m_steps
+    if len(rows) < min_need:
+        raise ValueError(f"insufficient_rows: need={min_need} got={len(rows)}")
 
-    tail = rows[-n_steps:]
-    x2 = np.array([[float(r.get(c, 0.0) or 0.0) for c in feats] for r in tail], dtype=np.float32)
+    # Align the input window to match training's sequence construction:
+    # training sequences use X of shape (n_steps, n_feats) whose target y
+    # begins at position i+n_steps.  For inference we offset by -m_steps so
+    # the most-recent-available datum is the *target* of the implicit
+    # training window, not part of the input.
+    tail = rows[-(n_steps + m_steps):-m_steps] if len(rows) >= n_steps + m_steps else rows[-n_steps:]
+    x2 = np.array([[float(r.get(c, 0.0) or 0.0) for c in feats] for r in tail], dtype=np.float64)
 
     model_name = str(spec.get("model") or "").strip().lower()
     if model_name == "nbeats":

@@ -182,6 +182,80 @@ class MT5Adapter:
             "magic": int(getattr(order, "magic", 0) or 0),
         }
 
+    def _round_symbol_price(self, value: float, digits: int) -> float:
+        try:
+            return round(float(value), max(int(digits), 0))
+        except Exception:
+            return float(value)
+
+    def _normalize_market_sltp(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        stop_loss: float,
+        take_profit: float,
+        distance_multiplier: float = 1.0,
+    ) -> Dict[str, Any]:
+        mt5 = self._mt5
+        symbol_info = mt5.symbol_info(symbol) if mt5 is not None else None
+
+        digits = _int_or_default(getattr(symbol_info, "digits", 2), 2)
+        point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+        if point <= 0.0:
+            point = 10 ** (-max(digits, 0))
+
+        stops_level_points = max(float(getattr(symbol_info, "trade_stops_level", 0) or 0.0), 0.0)
+        freeze_level_points = max(float(getattr(symbol_info, "trade_freeze_level", 0) or 0.0), 0.0)
+        min_points = max(stops_level_points, freeze_level_points, 1.0)
+        distance_multiplier = max(float(distance_multiplier or 1.0), 1.0)
+        min_distance = point * min_points * distance_multiplier
+
+        ref_price = float(price or 0.0)
+        sl_raw = float(stop_loss or 0.0)
+        tp_raw = float(take_profit or 0.0)
+        sl = sl_raw
+        tp = tp_raw
+
+        side_token = str(side or "").strip().lower()
+        if side_token == "buy":
+            if sl > 0.0 and sl >= (ref_price - min_distance):
+                sl = ref_price - min_distance
+            if tp > 0.0 and tp <= (ref_price + min_distance):
+                tp = ref_price + min_distance
+        elif side_token == "sell":
+            if sl > 0.0 and sl <= (ref_price + min_distance):
+                sl = ref_price + min_distance
+            if tp > 0.0 and tp >= (ref_price - min_distance):
+                tp = ref_price - min_distance
+
+        sl = self._round_symbol_price(sl, digits) if sl > 0.0 else 0.0
+        tp = self._round_symbol_price(tp, digits) if tp > 0.0 else 0.0
+        ref_price = self._round_symbol_price(ref_price, digits)
+
+        # Guard against rounding drift leaving levels invalid relative to current price.
+        if side_token == "buy":
+            if sl > 0.0 and sl >= ref_price:
+                sl = self._round_symbol_price(ref_price - max(min_distance, point), digits)
+            if tp > 0.0 and tp <= ref_price:
+                tp = self._round_symbol_price(ref_price + max(min_distance, point), digits)
+        elif side_token == "sell":
+            if sl > 0.0 and sl <= ref_price:
+                sl = self._round_symbol_price(ref_price + max(min_distance, point), digits)
+            if tp > 0.0 and tp >= ref_price:
+                tp = self._round_symbol_price(ref_price - max(min_distance, point), digits)
+
+        return {
+            "stop_loss": float(sl),
+            "take_profit": float(tp),
+            "price": float(ref_price),
+            "digits": int(digits),
+            "point": float(point),
+            "stops_level_points": float(stops_level_points),
+            "freeze_level_points": float(freeze_level_points),
+            "min_distance": float(min_distance),
+        }
+
     def list_open_positions(self) -> Dict[str, Any]:
         ok, msg = self._require_mt5()
         if not ok:
@@ -432,14 +506,26 @@ class MT5Adapter:
             price = float(tick.bid)
             position_type = int(getattr(mt5, "POSITION_TYPE_SELL", 1))
 
+        normalized = self._normalize_market_sltp(
+            symbol=symbol,
+            side=side,
+            price=price,
+            stop_loss=float(stop_loss),
+            take_profit=float(take_profit),
+            distance_multiplier=1.0,
+        )
+        effective_stop_loss = float(normalized.get("stop_loss", 0.0) or 0.0)
+        effective_take_profit = float(normalized.get("take_profit", 0.0) or 0.0)
+        effective_price = float(normalized.get("price", price) or price)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
-            "price": price,
-            "sl": float(stop_loss),
-            "tp": float(take_profit),
+            "price": float(effective_price),
+            "sl": float(effective_stop_loss),
+            "tp": float(effective_take_profit),
             "deviation": 20,
             "magic": 7070001,
             "comment": "TSMM market order",
@@ -447,6 +533,43 @@ class MT5Adapter:
         }
 
         send_res = self._send_order_with_filling_fallback(symbol, request)
+        if not send_res.get("ok") and int(send_res.get("retcode", -1) or -1) == 10016:
+            fresh_tick = mt5.symbol_info_tick(symbol)
+            if fresh_tick is not None:
+                retry_price = float(fresh_tick.ask) if side == "buy" else float(fresh_tick.bid)
+                retry_norm = self._normalize_market_sltp(
+                    symbol=symbol,
+                    side=side,
+                    price=retry_price,
+                    stop_loss=float(stop_loss),
+                    take_profit=float(take_profit),
+                    distance_multiplier=2.0,
+                )
+                retry_request = dict(request)
+                retry_request["price"] = float(retry_norm.get("price", retry_price) or retry_price)
+                retry_request["sl"] = float(retry_norm.get("stop_loss", 0.0) or 0.0)
+                retry_request["tp"] = float(retry_norm.get("take_profit", 0.0) or 0.0)
+                send_res = self._send_order_with_filling_fallback(symbol, retry_request)
+                if send_res.get("ok"):
+                    effective_price = float(retry_request["price"])
+                    effective_stop_loss = float(retry_request["sl"])
+                    effective_take_profit = float(retry_request["tp"])
+
+        post_open_risk_update = None
+        if not send_res.get("ok") and int(send_res.get("retcode", -1) or -1) == 10016:
+            # Last-resort fallback for brokers enforcing dynamic stops not exposed
+            # via symbol_info: open at market without SL/TP, then apply risk levels
+            # after fill using a dedicated SLTP modify request.
+            bare_request = dict(request)
+            bare_request["sl"] = 0.0
+            bare_request["tp"] = 0.0
+            bare_send_res = self._send_order_with_filling_fallback(symbol, bare_request)
+            if bare_send_res.get("ok"):
+                send_res = bare_send_res
+                effective_price = float(bare_request.get("price", effective_price) or effective_price)
+            else:
+                send_res = bare_send_res
+
         if not send_res.get("ok"):
             return send_res
         result = send_res.get("result")
@@ -470,12 +593,93 @@ class MT5Adapter:
                     continue
                 if abs(float(getattr(p, "volume", 0.0) or 0.0) - float(volume)) > 1e-9:
                     continue
-                if stop_loss and abs(float(getattr(p, "sl", 0.0) or 0.0) - float(stop_loss)) > 0.05:
+                if effective_stop_loss and abs(float(getattr(p, "sl", 0.0) or 0.0) - float(effective_stop_loss)) > 0.05:
                     continue
-                if take_profit and abs(float(getattr(p, "tp", 0.0) or 0.0) - float(take_profit)) > 0.05:
+                if effective_take_profit and abs(float(getattr(p, "tp", 0.0) or 0.0) - float(effective_take_profit)) > 0.05:
                     continue
                 matched_position = p
                 break
+
+        # Retry position lookup if order succeeded but position isn't visible yet.
+        # Some brokers (e.g. FTMO) have higher latency before the position appears
+        # after a successful order send.
+        if matched_position is None and send_res.get("ok") and int(send_res.get("retcode", -1) or -1) == mt5.TRADE_RETCODE_DONE:
+            for _ in range(5):
+                time.sleep(1.0)
+                if order_ticket > 0:
+                    pos = mt5.positions_get(ticket=order_ticket) or []
+                    if pos:
+                        matched_position = pos[0]
+                        break
+                positions = mt5.positions_get(symbol=symbol) or []
+                for p in positions:
+                    if _int_or_default(getattr(p, "type", None), -1) != position_type:
+                        continue
+                    if int(getattr(p, "magic", 0) or 0) != 7070001:
+                        continue
+                    if str(getattr(p, "comment", "") or "") != "TSMM market order":
+                        continue
+                    if abs(float(getattr(p, "volume", 0.0) or 0.0) - float(volume)) > 1e-9:
+                        continue
+                    matched_position = p
+                    break
+                if matched_position:
+                    break
+
+        if int(send_res.get("retcode", -1) or -1) == mt5.TRADE_RETCODE_DONE and (
+            float(effective_stop_loss or 0.0) > 0.0 or float(effective_take_profit or 0.0) > 0.0
+        ):
+            has_live_sltp = False
+            if matched_position is not None:
+                current_sl = float(getattr(matched_position, "sl", 0.0) or 0.0)
+                current_tp = float(getattr(matched_position, "tp", 0.0) or 0.0)
+                has_live_sltp = current_sl > 0.0 or current_tp > 0.0
+
+            if not has_live_sltp:
+                pos_ticket = int(getattr(matched_position, "ticket", 0) or 0)
+                if pos_ticket <= 0:
+                    pos_ticket = int(order_ticket)
+
+                if pos_ticket > 0:
+                    sltp_tick = mt5.symbol_info_tick(symbol)
+                    sltp_price = float(sltp_tick.ask) if (sltp_tick is not None and side == "buy") else (
+                        float(sltp_tick.bid) if sltp_tick is not None else float(effective_price)
+                    )
+                    post_norm = self._normalize_market_sltp(
+                        symbol=symbol,
+                        side=side,
+                        price=float(sltp_price),
+                        stop_loss=float(stop_loss),
+                        take_profit=float(take_profit),
+                        distance_multiplier=4.0,
+                    )
+                    post_open_risk_update = self.modify_position_risk(
+                        pos_ticket,
+                        stop_loss=float(post_norm.get("stop_loss", 0.0) or 0.0),
+                        take_profit=float(post_norm.get("take_profit", 0.0) or 0.0),
+                    )
+                    if not bool(post_open_risk_update.get("ok", False)) and int(post_open_risk_update.get("retcode", -1) or -1) == 10016:
+                        post_norm_wide = self._normalize_market_sltp(
+                            symbol=symbol,
+                            side=side,
+                            price=float(sltp_price),
+                            stop_loss=float(stop_loss),
+                            take_profit=float(take_profit),
+                            distance_multiplier=8.0,
+                        )
+                        post_open_risk_update = self.modify_position_risk(
+                            pos_ticket,
+                            stop_loss=float(post_norm_wide.get("stop_loss", 0.0) or 0.0),
+                            take_profit=float(post_norm_wide.get("take_profit", 0.0) or 0.0),
+                        )
+
+                    if bool(post_open_risk_update.get("ok", False)) and isinstance(post_open_risk_update.get("position"), dict):
+                        pos_payload = post_open_risk_update.get("position") or {}
+                        effective_stop_loss = float(pos_payload.get("sl", post_open_risk_update.get("stop_loss", effective_stop_loss)) or 0.0)
+                        effective_take_profit = float(pos_payload.get("tp", post_open_risk_update.get("take_profit", effective_take_profit)) or 0.0)
+                    else:
+                        effective_stop_loss = float(post_norm.get("stop_loss", effective_stop_loss) or 0.0)
+                        effective_take_profit = float(post_norm.get("take_profit", effective_take_profit) or 0.0)
 
         return {
             "ok": True,
@@ -483,10 +687,13 @@ class MT5Adapter:
             "deal_ticket": int(getattr(result, "deal", 0) or 0),
             "retcode": retcode,
             "position": self._serialize_position(matched_position) if matched_position is not None else None,
-            "execution_price": price,
+            "execution_price": effective_price,
+            "stop_loss": effective_stop_loss,
+            "take_profit": effective_take_profit,
             "execution_mode": "market",
             "type_filling": send_res.get("type_filling"),
             "attempted_filling_modes": send_res.get("attempted_filling_modes") or [],
+            "post_open_risk_update": post_open_risk_update,
         }
 
     def find_position_by_order(self, order_ticket: int) -> Dict[str, Any]:
@@ -1544,7 +1751,12 @@ def _discover_endpoint_specs(
     return out
 
 
-def _load_endpoint_market_frame(master_path: str, timeframe_label: str, latest_records: int) -> pd.DataFrame:
+def _load_endpoint_market_frame(
+    master_path: str,
+    timeframe_label: str,
+    latest_records: int,
+    symbol: str = "XAUUSD",
+) -> pd.DataFrame:
     p = str(master_path or "").strip()
     if not p:
         return pd.DataFrame()
@@ -1557,6 +1769,7 @@ def _load_endpoint_market_frame(master_path: str, timeframe_label: str, latest_r
             latest_records=max(int(latest_records or 1), 1),
             start_date=None,
             end_date=None,
+            symbol=symbol,
         )
 
     df = pd.read_csv(p)
@@ -1621,6 +1834,12 @@ def _build_endpoint_payloads(
     )
     dashboard_cfg = ((trading_cfg or {}).get("dashboard") or {})
     master_path = str(dashboard_cfg.get("master_table_path") or os.path.join(Path(__file__).resolve().parents[1], "data", "market_data.sqlite"))
+    market_symbol = str(
+        dashboard_cfg.get("sql_symbol")
+        or dashboard_cfg.get("tiingo_symbol")
+        or ((trading_cfg or {}).get("execution") or {}).get("symbol")
+        or "XAUUSD"
+    ).strip()
     if not os.path.isabs(master_path):
         master_path = str((Path(__file__).resolve().parents[1] / master_path).resolve())
 
@@ -1629,7 +1848,12 @@ def _build_endpoint_payloads(
         n_steps = int(spec.get("n_steps", 1) or 1)
         rolling_windows = list(spec.get("rolling_windows") or [2, 7, 30, 60])
         latest_records = max(n_steps + max([int(w) for w in rolling_windows] + [0]) + 5, 200)
-        df = _load_endpoint_market_frame(master_path=master_path, timeframe_label=tf, latest_records=latest_records)
+        df = _load_endpoint_market_frame(
+            master_path=master_path,
+            timeframe_label=tf,
+            latest_records=latest_records,
+            symbol=market_symbol,
+        )
         if df.empty:
             payloads[tf] = {"error": f"No market data available for timeframe {tf}"}
             continue
@@ -1639,13 +1863,15 @@ def _build_endpoint_payloads(
             payloads[tf] = {"error": f"Insufficient enriched rows for timeframe {tf}: need {n_steps}, got {len(enriched)}"}
             continue
 
+        m_steps = int(spec.get("m_steps", 1) or 1)
         needed = list(dict.fromkeys(["DATE"] + [str(c) for c in (spec.get("input_features") or [])]))
         missing = [c for c in needed if c != "DATE" and c not in enriched.columns]
         if missing:
             payloads[tf] = {"error": f"Missing engineered columns for timeframe {tf}: {missing}"}
             continue
 
-        rows_df = enriched[needed].tail(n_steps).copy()
+        payload_rows = n_steps + m_steps
+        rows_df = enriched[needed].tail(payload_rows).copy()
         rows: List[Dict[str, Any]] = []
         for _, row in rows_df.iterrows():
             item: Dict[str, Any] = {"DATE": pd.to_datetime(row["DATE"]).strftime("%Y-%m-%d %H:%M:%S")}

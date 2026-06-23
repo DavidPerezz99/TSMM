@@ -129,13 +129,20 @@ def load_data(data_path, date_col, target_col, config):
             timeframe_minutes = int(config.get('data_timeframe_minutes', 0) or 0)
             if timeframe_minutes <= 0:
                 timeframe_minutes = _infer_timeframe_minutes(data_path_str, fallback=1)
+            sql_symbol = str(
+                config.get('sql_symbol')
+                or config.get('symbol')
+                or config.get('tiingo_symbol')
+                or 'XAUUSD'
+            ).strip()
             latest_records = int(
                 config.get('sql_latest_records', config.get('records', 50000)) or 50000
             )
             logging.info(
-                "Loading data from SQL source. sql_source=%s requested_path=%s timeframe_minutes=%s latest_records=%s start_date=%s end_date=%s",
+                "Loading data from SQL source. sql_source=%s requested_path=%s symbol=%s timeframe_minutes=%s latest_records=%s start_date=%s end_date=%s",
                 sql_source_path,
                 data_path_str,
+                sql_symbol,
                 timeframe_minutes,
                 latest_records,
                 config.get('start_date') or None,
@@ -148,12 +155,14 @@ def load_data(data_path, date_col, target_col, config):
                 latest_records=latest_records,
                 start_date=(config.get('start_date') or None),
                 end_date=(config.get('end_date') or None),
+                symbol=sql_symbol,
             )
             logging.info(
-                "Finished SQL data load. rows=%s elapsed_seconds=%.3f source=%s timeframe_minutes=%s",
+                "Finished SQL data load. rows=%s elapsed_seconds=%.3f source=%s symbol=%s timeframe_minutes=%s",
                 len(df),
                 time.time() - started,
                 sql_source_path,
+                sql_symbol,
                 timeframe_minutes,
             )
             if df.empty:
@@ -181,7 +190,12 @@ def load_data(data_path, date_col, target_col, config):
         df.sort_index(inplace=True)
         
         logging.info("Adding engineered features")
-        df['Price_return'] = df[target_col].diff()
+        # Use CLOSE.diff() for Price_return to match inference pipeline
+        # (inference computes Price_return from CLOSE, not from target_col).
+        if 'CLOSE' in df.columns:
+            df['Price_return'] = df['CLOSE'].diff()
+        else:
+            df['Price_return'] = df[target_col].diff()
         if 'OPEN' in df.columns:
             df['Open_return'] = df['OPEN'].diff()
         if 'HIGH' in df.columns:
