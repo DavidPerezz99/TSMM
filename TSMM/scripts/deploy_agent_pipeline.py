@@ -482,6 +482,7 @@ def _refresh_master_and_views(pipeline_cfg: Dict[str, Any], dry_run: bool = Fals
     refresh_cfg = (pipeline_cfg.get("refresh") or {})
     master_csv = _as_abs(str(refresh_cfg.get("master_csv", "data/xauusd/master_table.csv")))
     db_path = _as_abs(str(refresh_cfg.get("db_path", "data/market_data.sqlite")))
+    symbol = str(refresh_cfg.get("symbol", "XAUUSD") or "XAUUSD").strip()
     chunksize = int(refresh_cfg.get("chunksize", 250000) or 250000)
     views = [int(v) for v in (refresh_cfg.get("views") or [10, 30, 60, 180, 420, 720, 1440, 10080])]
 
@@ -490,22 +491,30 @@ def _refresh_master_and_views(pipeline_cfg: Dict[str, Any], dry_run: bool = Fals
             "dry_run": True,
             "master_csv": str(master_csv),
             "db_path": str(db_path),
+            "symbol": symbol,
             "views": views,
         }
 
-    mig = migrate_master_csv(str(master_csv), str(db_path), chunksize=chunksize)
+    mig = migrate_master_csv(str(master_csv), str(db_path), chunksize=chunksize, symbol=symbol)
     create_cache_tables = bool(refresh_cfg.get("create_cache_tables", False))
-    created = create_timeframe_views(str(db_path), views, include_cache_tables=create_cache_tables)
+    created = create_timeframe_views(
+        str(db_path),
+        views,
+        include_cache_tables=create_cache_tables,
+        symbol=symbol,
+    )
 
     if bool(refresh_cfg.get("update_trading_config", True)):
         trading_cfg_path = ROOT / "config" / "trading_agent.yaml"
         trading = _load_yaml(trading_cfg_path)
         trading.setdefault("dashboard", {})
         trading["dashboard"]["master_table_path"] = str(Path("data") / "market_data.sqlite")
+        trading["dashboard"]["sql_symbol"] = str(symbol).upper()
         _save_yaml(trading_cfg_path, trading)
 
     return {
         "migration": mig,
+        "symbol": str(symbol).upper(),
         "created_views": created,
         "created_cache_tables": bool(create_cache_tables),
     }
@@ -732,6 +741,9 @@ def _run_forecast(
     with run_log_path.open("a", encoding="utf-8") as run_log:
         run_log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START config={cfg_path}\n")
         run_log.flush()
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
         proc = subprocess.Popen(
             [sys.executable, "app.py", "forecast"],
             cwd=str(ROOT),
@@ -739,6 +751,7 @@ def _run_forecast(
             stdout=run_log,
             stderr=subprocess.STDOUT,
             text=True,
+            startupinfo=startupinfo,
         )
 
         started = time.time()
