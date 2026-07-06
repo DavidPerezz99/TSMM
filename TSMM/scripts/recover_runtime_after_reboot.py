@@ -204,6 +204,33 @@ def _parity_enforcer_running() -> bool:
     return False
 
 
+def _endpoint_watchdog_running(trading_cfg_path: Path) -> bool:
+    target_path = str(trading_cfg_path.resolve()).lower()
+    target_name = trading_cfg_path.name.lower()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            raw_cmdline = [str(part or "") for part in (proc.info.get("cmdline") or [])]
+        except Exception:
+            continue
+        cmdline = [part.lower() for part in raw_cmdline]
+        cmdline_text = " ".join(cmdline)
+        if "endpoint_liveness_watchdog.py" not in cmdline_text:
+            continue
+        if "--trading-config" in cmdline:
+            idx = cmdline.index("--trading-config")
+            if idx + 1 < len(raw_cmdline):
+                candidate = _resolve_listener_config_arg(raw_cmdline[idx + 1]).resolve()
+                candidate_text = str(candidate).lower()
+                if candidate_text == target_path or candidate.name.lower() == target_name:
+                    return True
+            continue
+        # If no explicit config argument is present, assume default-profile watchdog.
+        default_target = str((ROOT / "config" / "trading_agent.yaml").resolve()).lower()
+        if target_path == default_target:
+            return True
+    return False
+
+
 def _listener_process_running(trading_cfg_path: Path) -> bool:
     resolved_target = str(trading_cfg_path.resolve()).lower()
     default_target = str((ROOT / "config" / "trading_agent.yaml").resolve()).lower()
@@ -380,6 +407,37 @@ def main() -> int:
                     [sys.executable, str((ROOT / "scripts" / "local_signal_endpoint_service.py").resolve())],
                     env={**_endpoint_env(trading_cfg), **_runtime_env(trading_cfg)},
                     stdout_path=runtime_dir / "endpoint_recovery.log",
+                )
+                action.update(out)
+            payload["actions"].append(action)
+
+    if bool(recovery_cfg.get("restart_endpoint_watchdog", False)):
+        if _endpoint_watchdog_running(TRADING_CFG_PATH):
+            payload["actions"].append({"kind": "endpoint_watchdog", "status": "already_running"})
+        else:
+            action = {"kind": "endpoint_watchdog", "status": "planned" if args.dry_run else "started"}
+            if not args.dry_run:
+                interval_seconds = max(int(recovery_cfg.get("endpoint_watchdog_interval_seconds", 15) or 15), 5)
+                failure_threshold = max(int(recovery_cfg.get("endpoint_watchdog_failure_threshold", 2) or 2), 1)
+                cooldown_seconds = max(int(recovery_cfg.get("endpoint_watchdog_cooldown_seconds", 45) or 45), 10)
+                health_timeout_seconds = max(float(recovery_cfg.get("endpoint_watchdog_health_timeout_seconds", 5.0) or 5.0), 1.0)
+                out = _launch_detached(
+                    [
+                        sys.executable,
+                        str((ROOT / "scripts" / "endpoint_liveness_watchdog.py").resolve()),
+                        "--trading-config",
+                        str(TRADING_CFG_PATH.resolve()),
+                        "--interval-sec",
+                        str(interval_seconds),
+                        "--failure-threshold",
+                        str(failure_threshold),
+                        "--restart-cooldown-sec",
+                        str(cooldown_seconds),
+                        "--health-timeout-sec",
+                        str(health_timeout_seconds),
+                    ],
+                    env={**_runtime_env(trading_cfg), **_endpoint_env(trading_cfg)},
+                    stdout_path=runtime_dir / "endpoint_watchdog.log",
                 )
                 action.update(out)
             payload["actions"].append(action)

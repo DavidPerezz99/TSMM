@@ -124,7 +124,10 @@ model_endpoints:
     url: http://127.0.0.1:8000/predict/7h
     model: ulr
     config_path: config/high7hResults/ulr/top1_07890.yaml
-  12h: http://127.0.0.1:8000/predict/12h
+  12h:
+    url: http://127.0.0.1:8000/predict/12h
+    model: nbeats
+    config_path: config/high12hResults/nbeats/top1_04098.yaml
   24h: http://127.0.0.1:8000/predict/24h
   1w: http://127.0.0.1:8000/predict/1w
 reporting:

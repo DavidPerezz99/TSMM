@@ -4077,6 +4077,11 @@ def _attempt_agent_b_close(
         state.pop("pending_close_status", None)
         state.pop("last_close_failure", None)
         _append_job_finished_notification(state, output_dir, trading_cfg, "agent_b", job_id)
+        try:
+            from utils.trade_memory import TradeMemory as _TMem
+            _TMem().record(_TMem.from_registry_job(state))
+        except Exception:
+            pass
         return True
 
     pos = adapter.get_position_by_ticket(pos_ticket)

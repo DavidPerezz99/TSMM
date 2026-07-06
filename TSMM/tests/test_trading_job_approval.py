@@ -99,6 +99,27 @@ class TradingJobApprovalTests(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertEqual(threshold, 3)
 
+    def test_followup_requires_approval_even_when_below_threshold(self):
+        cfg = {
+            "approval_policy": {"auto_approve_below_agent_b_count": 3},
+            "risk": {"max_open_positions": 3},
+            "agent": {"followup_agent_a_requires_approval": True},
+        }
+
+        with patch("utils.trading_job._active_agent_b_position_count", return_value=0):
+            required, reason, count, threshold = _agent_a_approval_decision(
+                "reports",
+                cfg,
+                auto_created=True,
+                autonomous_trigger="",
+                submission_mode="programmed",
+            )
+
+        self.assertTrue(required)
+        self.assertEqual(reason, "followup_manual_approval_required")
+        self.assertEqual(count, 0)
+        self.assertEqual(threshold, 3)
+
     def test_active_agent_b_position_count_uses_mt5_tsmm_positions(self):
         class Adapter:
             def __init__(self, _cfg):

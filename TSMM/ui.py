@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 import yaml
 
-from utils.live_data import update_fx_master_table_file, update_fx_master_table_db
+from utils.live_data import update_fx_master_table_file, update_fx_master_table_db, resolve_tiingo_token_candidates
 from utils.runtime_scope import resolve_runtime_file
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State", "ctx"])
@@ -60,6 +60,29 @@ def _write_text(path: str, content: str) -> str:
         return f"Saved {path} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     except Exception as e:
         return f"Error writing {path}: {e}"
+
+
+def _parse_token_env_input(token_env: str) -> list[str]:
+    raw = str(token_env or "").strip()
+    if not raw:
+        return ["TIINGO_API_TOKEN"]
+
+    parts = [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+    if not parts:
+        return ["TIINGO_API_TOKEN"]
+    return list(dict.fromkeys(parts))
+
+
+def _token_env_input_value(dash_cfg: dict, refresh_cfg: dict) -> str:
+    envs_cfg = (dash_cfg or {}).get("tiingo_token_envs")
+    envs: list[str]
+    if isinstance(envs_cfg, str):
+        envs = _parse_token_env_input(envs_cfg)
+    elif isinstance(envs_cfg, (list, tuple, set)):
+        envs = [str(x).strip() for x in envs_cfg if str(x).strip()]
+    else:
+        envs = [str((dash_cfg or {}).get("tiingo_token_env", (refresh_cfg or {}).get("token_env", "TIINGO_API_TOKEN"))).strip() or "TIINGO_API_TOKEN"]
+    return ", ".join(list(dict.fromkeys(envs)))
 
 
 app = Dash(__name__)
@@ -189,11 +212,11 @@ app.layout = html.Div(
                                 dcc.Input(id="tiingo-symbol", type="text", value=_data_refresh_cfg.get("symbol", "xauusd"), className="tsmm-input", style={"width": "100%"}),
                                 html.Div([html.Span("Tiingo rate", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
                                 dcc.Input(id="tiingo-rate", type="text", value=_data_refresh_cfg.get("rate", "1min"), className="tsmm-input", style={"width": "100%"}),
-                                html.Div([html.Span("Token env var", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
+                                html.Div([html.Span("Token env var(s)", className="tsmm-label"), html.Span("*", className="tsmm-mark")]),
                                 dcc.Input(
                                     id="token-env",
                                     type="text",
-                                    value=_dash_cfg.get("tiingo_token_env", _data_refresh_cfg.get("token_env", "TIINGO_API_TOKEN")),
+                                    value=_token_env_input_value(_dash_cfg, _data_refresh_cfg),
                                     className="tsmm-input",
                                     style={"width": "100%"},
                                 ),
@@ -282,10 +305,18 @@ def control_mode_b(_, __):
     prevent_initial_call=True,
 )
 def update_master_ui(_, master_path, symbol, rate, token_env):
-    token_key = (token_env or "TIINGO_API_TOKEN").strip()
+    token_envs = _parse_token_env_input(token_env)
+    token_key = token_envs[0]
     token = os.environ.get(token_key, "")
-    if not token:
-        return f"Missing token in env var: {token_key}"
+    token_candidates = resolve_tiingo_token_candidates(
+        token_env=token_key,
+        token_envs=token_envs,
+        token=token,
+    )
+    if not token_candidates:
+        return f"Missing token in configured env vars: {', '.join(token_envs)}"
+
+    rotation_state_path = str((_dash_cfg.get("tiingo_token_rotation_state_path") or "")).strip() or None
 
     p = str(master_path or "").strip()
     if p.lower().endswith(".db") or p.lower().endswith(".sqlite"):
@@ -294,6 +325,9 @@ def update_master_ui(_, master_path, symbol, rate, token_env):
             rate=(rate or "1min").strip(),
             symbol=(symbol or "xauusd").strip().lower(),
             token=token,
+            token_env=token_key,
+            token_envs=token_envs,
+            token_rotation_state_path=rotation_state_path,
         )
     else:
         result = update_fx_master_table_file(
@@ -301,10 +335,18 @@ def update_master_ui(_, master_path, symbol, rate, token_env):
             rate=(rate or "1min").strip(),
             symbol=(symbol or "xauusd").strip().lower(),
             token=token,
+            token_env=token_key,
+            token_envs=token_envs,
+            token_rotation_state_path=rotation_state_path,
         )
     if not bool(result.get("updated", False)):
         return f"Update failed: {result.get('error', 'unknown error')}"
-    return f"Master updated: +{int(result.get('new_rows', 0))} rows | latest={result.get('latest_date', 'N/A')}"
+    used_env = str(result.get("used_token_env") or token_key)
+    rotated = bool(result.get("token_rotated", False))
+    return (
+        f"Master updated: +{int(result.get('new_rows', 0))} rows | "
+        f"latest={result.get('latest_date', 'N/A')} | token_env={used_env} | rotated={'yes' if rotated else 'no'}"
+    )
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ columns: ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'Price_return', 'Open_return',
        'EMA_7', 'Volatility_7', 'SMA_60', 'EMA_60', 'Volatility_60']
 
 data_path: "data/market_data.sqlite"  # SQLite market store or CSV file path
+sql_symbol: "XAUUSD"  # Symbol namespace when data_path points to multi-asset SQLite
 data_timeframe_minutes: 420  # Used only for SQLite sources. 420=7h, 30=30m, 10=10m, 1=1m
 date_col: "DATE"  # Column name for dates
 start_date: ""  # Start date for filtering (empty for all)

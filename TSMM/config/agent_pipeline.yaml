@@ -4,6 +4,7 @@ refresh:
   enabled: true
   master_csv: data/xauusd/master_table.csv
   db_path: data/market_data.sqlite
+  symbol: XAUUSD
   chunksize: 250000
   views: [10, 30, 60, 180, 420, 720, 1440, 10080]
   update_trading_config: true
@@ -52,7 +53,7 @@ trading:
   plan_model: ulr
   execution_config: config/high7hResults/ulr/top1_07890.yaml
   trading_config_path: config/trading_agent.yaml
-  mt5_terminal_path: "C:\\Program Files\\Pepperstone MetaTrader 5\\terminal64.exe"
+  mt5_terminal_path: "C:\\Program Files\\FTMO Global Markets MT5 Terminal\\terminal64.exe"
 
 backtest_policy:
   llm_enabled: false

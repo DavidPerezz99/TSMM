@@ -780,6 +780,154 @@ class AutonomousTradingTests(unittest.TestCase):
         self.assertEqual(((persisted_payload.get("position") or {}).get("ticket")), 101)
         send_mock.assert_called_once()
 
+    @patch("scripts.telegram_command_listener._send_to_chat_ids")
+    @patch("scripts.telegram_command_listener._persist_job_state")
+    @patch("scripts.telegram_command_listener._run_cmd_async")
+    @patch("scripts.telegram_command_listener._stop_job_runner")
+    @patch("scripts.telegram_command_listener._sync_state_runner_pid_from_process")
+    @patch("scripts.telegram_command_listener._job_for_ticket_on_disk")
+    @patch("scripts.telegram_command_listener._subscriber_chat_ids")
+    def test_adopt_untracked_positions_rebinds_existing_non_agent_b_job(
+        self,
+        chat_ids_mock,
+        job_for_ticket_mock,
+        _sync_pid_mock,
+        stop_runner_mock,
+        run_cmd_async_mock,
+        persist_mock,
+        send_mock,
+    ):
+        class Adapter:
+            def list_open_positions(self_inner):
+                return {
+                    "ok": True,
+                    "positions": [
+                        {
+                            "ticket": 202,
+                            "symbol": "XAUUSD",
+                            "volume": 0.01,
+                            "price_open": 4705.0,
+                            "sl": 4667.0,
+                            "tp": 4781.0,
+                            "comment": "",
+                            "magic": 0,
+                            "type": 0,
+                        }
+                    ],
+                }
+
+        chat_ids_mock.return_value = ["123"]
+        existing_state = {
+            "job_id": "job_existing",
+            "status": "agent_a_completed",
+            "stage": "agent_a",
+            "runner_pid": 999,
+            "position": {"ticket": 202, "symbol": "XAUUSD"},
+            "plan": {"decision": "buy"},
+            "state_path": "reports/runtime/trading_jobs/job_existing/trading_job_state.json",
+        }
+        job_for_ticket_mock.return_value = (
+            "job_existing",
+            Path("reports/runtime/trading_jobs/job_existing/trading_job_state.json"),
+            existing_state,
+        )
+        run_cmd_async_mock.return_value = {"ok": True, "pid": 5432}
+
+        events = _adopt_untracked_live_agent_b_positions(
+            trading_cfg={
+                "broker": {"mt5": {}},
+                "execution": {"symbol": "XAUUSD"},
+                "telegram_listener": {
+                    "adopt_any_running_positions": True,
+                    "rebind_existing_non_agent_b": True,
+                    "seed_missing_sltp_on_adopt": False,
+                },
+            },
+            trading_config_path=ROOT / "config" / "trading_agent.yaml",
+            job_cooldowns={},
+            default_chat_id="",
+            last_chat_id="123",
+            adapter=Adapter(),
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["ok"])
+        self.assertEqual(events[0]["action"], "rebind_existing_live_position_to_agent_b")
+        self.assertEqual(events[0]["job_id"], "job_existing")
+        stop_runner_mock.assert_called_once()
+        self.assertGreaterEqual(persist_mock.call_count, 2)
+        pre_rebind_payload = persist_mock.call_args_list[0][0][1]
+        final_payload = persist_mock.call_args_list[-1][0][1]
+        self.assertEqual(pre_rebind_payload.get("status"), "agent_b_running")
+        self.assertEqual(pre_rebind_payload.get("stage"), "agent_b")
+        self.assertEqual(((pre_rebind_payload.get("plan") or {}).get("model")), "manual_entry_auto_adopt")
+        self.assertEqual(final_payload.get("runner_pid"), 5432)
+        send_mock.assert_called_once()
+
+    @patch("scripts.telegram_command_listener._send_to_chat_ids")
+    @patch("scripts.telegram_command_listener._persist_job_state")
+    @patch("scripts.telegram_command_listener._run_cmd_async")
+    @patch("scripts.telegram_command_listener._job_for_ticket_on_disk")
+    @patch("scripts.telegram_command_listener._subscriber_chat_ids")
+    def test_adopt_untracked_positions_can_adopt_external_symbol_when_any_running_enabled(
+        self,
+        chat_ids_mock,
+        job_for_ticket_mock,
+        run_cmd_async_mock,
+        persist_mock,
+        send_mock,
+    ):
+        class Adapter:
+            def list_open_positions(self_inner):
+                return {
+                    "ok": True,
+                    "positions": [
+                        {
+                            "ticket": 303,
+                            "symbol": "EURUSD",
+                            "volume": 0.02,
+                            "price_open": 1.1,
+                            "sl": 1.09,
+                            "tp": 1.12,
+                            "comment": "external trade",
+                            "magic": 555,
+                            "type": 0,
+                        }
+                    ],
+                }
+
+        chat_ids_mock.return_value = ["123"]
+        job_for_ticket_mock.return_value = ("", Path(), {})
+        run_cmd_async_mock.return_value = {"ok": True, "pid": 6543}
+
+        events = _adopt_untracked_live_agent_b_positions(
+            trading_cfg={
+                "broker": {"mt5": {}},
+                "execution": {"symbol": "XAUUSD"},
+                "telegram_listener": {
+                    "adopt_any_running_positions": True,
+                    "seed_missing_sltp_on_adopt": False,
+                },
+            },
+            trading_config_path=ROOT / "config" / "trading_agent.yaml",
+            job_cooldowns={},
+            default_chat_id="",
+            last_chat_id="123",
+            adapter=Adapter(),
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["ok"])
+        self.assertEqual(events[0]["action"], "adopt_orphan_mt5_position")
+        self.assertEqual(events[0]["adoption_kind"], "external")
+        self.assertEqual(events[0]["ticket"], 303)
+        self.assertEqual(persist_mock.call_count, 2)
+        bootstrap_payload = persist_mock.call_args_list[0][0][1]
+        self.assertEqual(bootstrap_payload.get("adoption_kind"), "external")
+        self.assertEqual(((bootstrap_payload.get("plan") or {}).get("model")), "any_live_position_auto_adopt")
+        self.assertEqual(bootstrap_payload.get("recovery_method"), "listener_any_live_mt5_position")
+        send_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

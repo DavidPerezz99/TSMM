@@ -4,7 +4,8 @@ agent:
   default_start_mode_a: true
   confirm_live_execution: true
   signal_interpretation: contrarian
-  followup_agent_a_requires_approval: false
+  followup_agent_a_requires_approval: true
+  followup_agent_a_submission_mode: programmed
   approval_channels:
   - telegram
   timezone: America/Bogota
@@ -62,6 +63,14 @@ mode_b:
       12h: 1
       24h: 1
       1w: 1
+conviction:
+  enabled: true
+  min_conviction_for_no_sl: 0.8
+  min_conviction_for_wide: 0.65
+  min_conviction_for_standard: 0.45
+  min_conviction_for_tight: 0.3
+  historical_weight: 0.25
+  memory_max_trades: 100
 risk:
   risk_per_trade_pct: 0.5
   daily_max_loss_pct: 2.0
@@ -105,10 +114,10 @@ broker:
   active: mt5
   mt5:
     enabled: true
-    login: env:MT5_LOGIN
-    password: env:MT5_PASSWORD
-    server: env:MT5_SERVER
-    path: env:MT5_TERMINAL_PATH
+    login: env:MT5_FTMO_LOGIN
+    password: env:MT5_FTMO_PASSWORD
+    server: FTMO-Server3
+    path: C:\Program Files\FTMO Global Markets MT5 Terminal\terminal64.exe
   iqoption:
     enabled: false
     email: env:IQOPTION_EMAIL
@@ -123,7 +132,10 @@ model_endpoints:
     url: http://127.0.0.1:8000/predict/7h
     model: ulr
     config_path: config/high7hResults/ulr/top1_07890.yaml
-  12h: http://127.0.0.1:8000/predict/12h
+  12h:
+    url: http://127.0.0.1:8000/predict/12h
+    model: nbeats
+    config_path: config/high12hResults/nbeats/top1_04098.yaml
   24h: http://127.0.0.1:8000/predict/24h
   1w: http://127.0.0.1:8000/predict/1w
 reporting:
@@ -139,9 +151,9 @@ trading_job:
   prevent_new_programmed_when_open_position: false
   prevent_new_programmed_when_pending_exists: false
   intentional_same_side_stacking:
-    enabled: true
+    enabled: false
     max_same_side_orders: 3
-    auto_enable_on_high_confidence: true
+    auto_enable_on_high_confidence: false
     auto_stack_confidence_threshold: 0.54
     auto_stack_target_orders: 2
   session_hours: 7
@@ -163,16 +175,9 @@ trading_job:
   state_path: reports/runtime/trading_job_state.json
 runtime:
   root_dir: reports/runtime
-  profile_label: Pepperstone
+  profile_label: FTMO
 account_mirror:
-  enabled: true
-  peer_profile: FTMO
-  peer_trading_config_path: config/trading_agent_ftmo.yaml
-  mirror_job_starts: true
-  mirror_stop_requests: true
-  mirror_kill_requests: true
-  mirror_agent_b_risk_updates: true
-  mirror_agent_b_close_actions: true
+  enabled: false
 opposing_countertrade:
   enabled: true
   allow_source_buy: false
@@ -180,13 +185,11 @@ opposing_countertrade:
   min_source_confidence: 0.54
   target_price_tolerance_abs: 2.0
   stop_distance_multiplier: 1.0
-  enforce_mirror_parity: true
-  mirror_parity_wait_seconds: 45
-  mirror_parity_poll_seconds: 3
 autonomous_trading:
   enabled: true
   timezone: America/Bogota
   scan_interval_seconds: 300
+  block_after_manual_or_external_close: true
   pending_order_maintenance:
     enabled: true
     assessment_timeout_seconds: 3.0
@@ -198,10 +201,10 @@ autonomous_trading:
   followup_cooldown_seconds: 300
   max_followup_launches_per_session: 84
   max_filtered_followups_per_session: 84
-  min_success_probability_for_followup: 0.58
-  min_confidence_for_followup: 0.55
-  min_cm_accuracy_for_followup: 0.52
-  max_input_fooling_risk_for_followup: 0.45
+  min_success_probability_for_followup: 0.4
+  min_confidence_for_followup: 0.48
+  min_cm_accuracy_for_followup: 0.48
+  max_input_fooling_risk_for_followup: 0.55
   require_consensus_alignment_for_followup: true
   session_windows:
   - name: asia_australia
@@ -295,7 +298,11 @@ telegram_listener:
   log_conversations: true
   reply_on_non_command: true
   auto_resume_waiting_jobs_enabled: true
-  auto_resume_waiting_jobs_interval_seconds: 60
+  auto_resume_waiting_jobs_interval_seconds: 15
+  adopt_manual_entries: true
+  adopt_any_running_positions: true
+  rebind_existing_non_agent_b: true
+  seed_missing_sltp_on_adopt: true
   ai_agent:
     enabled: true
     provider: local_ollama
@@ -317,6 +324,7 @@ telegram_listener:
   - ui
   - resource
   poll_seconds: 3
+  trading_start_state_wait_seconds: 3.0
   latest_request_status_interval_seconds: 120
   active_jobs_status_interval_seconds: 300
   command_prefix: /tsmm
@@ -363,6 +371,7 @@ boot_recovery:
 dashboard:
   enabled: true
   master_table_path: data\market_data.sqlite
+  sql_symbol: XAUUSD
   startup_sync_enabled: true
   startup_max_pulls: 2
   startup_freshness_lag_minutes: 20
@@ -373,6 +382,10 @@ dashboard:
   tiingo_symbol: xauusd
   tiingo_rate: 1min
   tiingo_token_env: TIINGO_API_TOKEN
+  tiingo_token_envs:
+  - TIINGO_API_TOKEN
+  - TIINGO_API_TOKEN_ALT
+  tiingo_token_rotation_state_path: reports/runtime/tiingo_token_rotation_state.json
   auto_update_master: true
   auto_update_every_ticks: 1
   live_past_minutes: 1440

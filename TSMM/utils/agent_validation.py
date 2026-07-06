@@ -101,6 +101,7 @@ def _load_master_df(
     n_days: int,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    symbol: str = "XAUUSD",
 ) -> pd.DataFrame:
     """Load master candles from CSV or SQLite for validation/backtesting."""
     p = str(master_table_path or "").strip()
@@ -126,6 +127,7 @@ def _load_master_df(
             latest_records=latest_records,
             start_date=start_date,
             end_date=end_date,
+            symbol=symbol,
         )
 
     df = pd.read_csv(p)
@@ -262,7 +264,13 @@ def run_agent_validation_days(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    df = _load_master_df(master_table_path, n_days)
+    market_symbol = str(
+        ((trading_cfg.get("dashboard") or {}).get("sql_symbol"))
+        or ((trading_cfg.get("execution") or {}).get("symbol"))
+        or "XAUUSD"
+    ).strip()
+
+    df = _load_master_df(master_table_path, n_days, symbol=market_symbol)
     if "DATE" not in df.columns or "CLOSE" not in df.columns:
         return {"ok": False, "error": "Master table must contain DATE and CLOSE columns"}
 
@@ -301,6 +309,7 @@ def run_agent_validation_days(
     summary = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "master_table_path": master_table_path,
+        "symbol": market_symbol,
         "mode": "simple_daily",
         "n_days": int(len(selected_days)),
         "overall": {
@@ -503,7 +512,19 @@ def run_agent_backtest_advanced(
 
     discovered = discover_top_model_configs(config_root=config_root)
 
-    df = _load_master_df(master_table_path, n_days=n_days, start_date=start_date, end_date=end_date)
+    market_symbol = str(
+        ((trading_cfg.get("dashboard") or {}).get("sql_symbol"))
+        or ((trading_cfg.get("execution") or {}).get("symbol"))
+        or "XAUUSD"
+    ).strip()
+
+    df = _load_master_df(
+        master_table_path,
+        n_days=n_days,
+        start_date=start_date,
+        end_date=end_date,
+        symbol=market_symbol,
+    )
     if "DATE" not in df.columns or "CLOSE" not in df.columns:
         return {"ok": False, "error": "Master table must contain DATE and CLOSE columns"}
 

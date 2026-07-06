@@ -4,6 +4,7 @@ refresh:
   enabled: true
   master_csv: data/xauusd/master_table.csv
   db_path: data/market_data.sqlite
+  symbol: XAUUSD
   chunksize: 250000
   views: [10, 30, 60, 180, 420, 720, 1440, 10080]
   update_trading_config: true

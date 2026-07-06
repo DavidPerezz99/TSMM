@@ -9,6 +9,9 @@ from typing import Any, Dict, List
 
 import requests
 
+_telegram_notification_session = requests.Session()
+_telegram_notification_session.headers.update({"Connection": "keep-alive"})
+
 
 def _read_windows_user_env(var_name: str) -> str:
     """Read a user-scoped environment variable directly from Windows registry."""
@@ -81,14 +84,14 @@ def send_telegram_notification(telegram_cfg: Dict[str, Any], message: str) -> Di
         payload["parse_mode"] = parse_mode
 
     try:
-        r = requests.post(url, json=payload, timeout=20)
+        r = _telegram_notification_session.post(url, json=payload, timeout=20)
         data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
         if r.status_code >= 400 or not bool(data.get("ok", False)):
             # Fallback: retry once without parse mode in case formatting is invalid.
             if "parse_mode" in payload:
                 payload_no_parse = dict(payload)
                 payload_no_parse.pop("parse_mode", None)
-                r2 = requests.post(url, json=payload_no_parse, timeout=20)
+                r2 = _telegram_notification_session.post(url, json=payload_no_parse, timeout=20)
                 data2 = r2.json() if r2.headers.get("content-type", "").startswith("application/json") else {"raw": r2.text}
                 if r2.status_code < 400 and bool(data2.get("ok", False)):
                     return {
@@ -133,6 +136,8 @@ def send_telegram_broadcast(
 
     results = []
     ok = False
+    delivered_chat_ids: List[str] = []
+    failed_chat_ids: List[str] = []
     for chat_id in target_chat_ids:
         scoped_cfg = dict(cfg)
         scoped_cfg["chat_id"] = chat_id
@@ -140,10 +145,15 @@ def send_telegram_broadcast(
         results.append(result)
         if bool(result.get("ok", False)):
             ok = True
+            delivered_chat_ids.append(chat_id)
+        else:
+            failed_chat_ids.append(chat_id)
 
     return {
         "ok": ok,
         "chat_ids": target_chat_ids,
+        "delivered_chat_ids": delivered_chat_ids,
+        "failed_chat_ids": failed_chat_ids,
         "results": results,
         "error": None if ok else "telegram_broadcast_failed",
     }

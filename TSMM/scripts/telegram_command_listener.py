@@ -217,10 +217,15 @@ def _telegram_message_with_account(trading_cfg: Dict[str, Any], message: str) ->
     return f"{account_prefix}{raw_message}"
 
 
-def _send_to_chat_ids(trading_cfg: Dict[str, Any], chat_ids: List[str], message: str) -> None:
+def _send_to_chat_ids(
+    trading_cfg: Dict[str, Any],
+    chat_ids: List[str],
+    message: str,
+    allow_agent_mode: bool = False,
+) -> None:
     scoped_message = _telegram_message_with_account(trading_cfg, message)
     for chat_id in [str(c).strip() for c in chat_ids if str(c).strip()]:
-        if _chat_mode(chat_id) == "agent":
+        if (not allow_agent_mode) and _chat_mode(chat_id) == "agent":
             continue
         tcfg = dict(_tg_cfg(trading_cfg))
         tcfg["chat_id"] = chat_id
@@ -279,10 +284,20 @@ def _select_listener_profile(text: str, profiles: List[Dict[str, Any]]) -> Dict[
     return profiles[0] if profiles else {"config_path": ROOT / "config" / "trading_agent.yaml", "trading_cfg": {}, "prefix": "/tsmm"}
 
 
+_telegram_session = requests.Session()
+_telegram_session.headers.update({"Connection": "keep-alive"})
+
 def _api_get(token: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     base = f"https://api.telegram.org/bot{token}/{method}"
-    r = requests.get(base, params=params, timeout=30)
-    return r.json() if r.headers.get("content-type", "").startswith("application/json") else {"ok": False, "raw": r.text}
+    try:
+        r = _telegram_session.get(base, params=params, timeout=30)
+        if r.headers.get("content-type", "").startswith("application/json"):
+            return r.json()
+        return {"ok": False, "raw": r.text[:500]}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": "timeout"}
+    except requests.exceptions.ConnectionError as e:
+        return {"ok": False, "error": f"connection_error:{e}"}
 
 
 def _run_cmd(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
@@ -515,19 +530,34 @@ def _active_job_ids(trading_cfg: Dict[str, Any] | None = None) -> List[str]:
     if resolved_trading_cfg:
         _set_runtime_scope_env(resolved_trading_cfg)
 
+    def _job_id_matches_profile(job_id: str) -> bool:
+        clean_job_id = str(job_id or "").strip()
+        if not clean_job_id:
+            return False
+
+        active_prefix = str(resolve_job_id_prefix(resolved_trading_cfg) or "").strip()
+        if active_prefix:
+            return clean_job_id.startswith(f"job_{active_prefix}_")
+
+        mirror_cfg = dict((resolved_trading_cfg.get("account_mirror") or {})) if isinstance(resolved_trading_cfg, dict) else {}
+        peer_profile = str(mirror_cfg.get("peer_profile") or "").strip()
+        if peer_profile and clean_job_id.startswith(f"job_{peer_profile}_"):
+            return False
+        return True
+
     registry = _registry_payload()
     candidate_ids: List[str] = []
     for raw_id in (registry.get("active_job_ids") or []):
         clean_id = str(raw_id).strip()
-        if clean_id and clean_id not in candidate_ids:
+        if clean_id and _job_id_matches_profile(clean_id) and clean_id not in candidate_ids:
             candidate_ids.append(clean_id)
     for raw_id in (registry.get("jobs") or {}).keys():
         clean_id = str(raw_id).strip()
-        if clean_id and clean_id not in candidate_ids:
+        if clean_id and _job_id_matches_profile(clean_id) and clean_id not in candidate_ids:
             candidate_ids.append(clean_id)
     for raw_id in _all_disk_job_ids():
         clean_id = str(raw_id).strip()
-        if clean_id and clean_id not in candidate_ids:
+        if clean_id and _job_id_matches_profile(clean_id) and clean_id not in candidate_ids:
             candidate_ids.append(clean_id)
 
     mt5_cfg = (((resolved_trading_cfg.get("broker") or {}).get("mt5") or {})) if isinstance(resolved_trading_cfg, dict) else {}
@@ -757,6 +787,48 @@ def _session_autonomous_stats(session_states: List[Dict[str, Any]]) -> Dict[str,
     return stats
 
 
+def _state_has_manual_or_external_close(state: Dict[str, Any]) -> bool:
+    if bool((state or {}).get("manual_or_external_close_detected", False)):
+        return True
+
+    closed_reason = str((state or {}).get("closed_reason") or "").strip().lower()
+    if closed_reason in {"manual_stop", "manual_close_via_telegram", "position_not_found_assumed_closed"}:
+        return True
+
+    close_outcome = dict((state or {}).get("close_outcome") or {})
+    reason_label = str(close_outcome.get("reason_label") or "").strip().lower()
+    if reason_label in {"client", "mobile", "web", "manual"}:
+        return True
+
+    comment = str(close_outcome.get("comment") or "").strip().lower()
+    if "manual" in comment and reason_label not in {"expert", "sl", "tp", "so"}:
+        return True
+    return False
+
+
+def _session_manual_or_external_close_marker(session_states: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest: Dict[str, Any] = {}
+    latest_started: datetime | None = None
+
+    for state in session_states:
+        if not _state_has_manual_or_external_close(state):
+            continue
+        started_at = _parse_state_datetime_utc(state.get("started_at"))
+        if latest_started is None or (started_at is not None and started_at >= latest_started):
+            latest_started = started_at
+            latest = dict(state or {})
+
+    if not latest:
+        return {"blocked": False}
+
+    return {
+        "blocked": True,
+        "job_id": str(latest.get("job_id") or "").strip(),
+        "closed_reason": str(latest.get("closed_reason") or "").strip(),
+        "close_outcome_reason": str((dict(latest.get("close_outcome") or {})).get("reason_label") or "").strip(),
+    }
+
+
 def _seconds_since(moment: datetime | None, now_utc: datetime) -> float:
     if moment is None:
         return float("inf")
@@ -836,6 +908,15 @@ def _refresh_job_state_from_mt5(trading_cfg: Dict[str, Any], state: Dict[str, An
     order = (refreshed.get("order") or {}) if isinstance(refreshed.get("order"), dict) else {}
     stage = str(refreshed.get("stage") or "").strip().lower()
     status = str(refreshed.get("status") or "").strip().lower()
+    ended_at = str(refreshed.get("ended_at") or "").strip()
+    closed_reason = str(refreshed.get("closed_reason") or "").strip().lower()
+
+    # Do not auto-reactivate jobs that were explicitly terminated.
+    if status in {"completed", "closed", "failed", "stopped", "killed"}:
+        return refreshed
+    if ended_at or closed_reason:
+        return refreshed
+
     submission_mode = str(refreshed.get("order_submission_mode") or plan.get("order_submission_mode") or "programmed").strip().lower()
     agent_a_approved = bool(refreshed.get("agent_a_approved"))
 
@@ -1233,10 +1314,12 @@ def _state_broker_key(state: Dict[str, Any]) -> str:
     order = (state.get("order") or {}) if isinstance(state, dict) else {}
     position_ticket = int(position.get("ticket", 0) or 0)
     if position_ticket > 0:
-        return f"position:{position_ticket}"
+        return f"broker_ticket:{position_ticket}"
     order_ticket = int(order.get("order_ticket", 0) or order.get("ticket", 0) or 0)
     if order_ticket > 0:
-        return f"order:{order_ticket}"
+        # Use the same key namespace as positions so a filled order does not
+        # show twice (tracked state + synthetic broker position) in active jobs.
+        return f"broker_ticket:{order_ticket}"
     return f"job:{str((state or {}).get('job_id') or '').strip()}"
 
 
@@ -1550,6 +1633,15 @@ def _infer_position_decision(position: Dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_trade_side_token(raw_side: Any) -> str:
+    token = str(raw_side or "").strip().lower()
+    if token in {"buy", "long", "bull", "bullish"}:
+        return "buy"
+    if token in {"sell", "short", "bear", "bearish"}:
+        return "sell"
+    return ""
+
+
 def _tracked_position_tickets() -> set[int]:
     tickets: set[int] = set()
     for job_id in _all_disk_job_ids():
@@ -1619,6 +1711,89 @@ def _synthetic_orphan_order_job_id(order_ticket: int, trading_cfg: Dict[str, Any
     return f"job_{base}"
 
 
+def _protective_sltp_for_position(
+    trading_cfg: Dict[str, Any],
+    position: Dict[str, Any],
+    decision: str,
+) -> Dict[str, Any]:
+    side = str(decision or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        return {"ok": False, "reason": "unsupported_side"}
+
+    try:
+        entry = float(position.get("price_open", 0.0) or 0.0)
+    except Exception:
+        entry = 0.0
+    if entry <= 0.0:
+        return {"ok": False, "reason": "missing_entry_price"}
+
+    risk_cfg = (trading_cfg.get("risk") or {})
+    sl_pct = max(float(risk_cfg.get("stop_loss_pct", 0.8) or 0.8), 0.01) / 100.0
+    tp_pct = max(float(risk_cfg.get("take_profit_pct", 1.6) or 1.6), 0.01) / 100.0
+
+    if side == "buy":
+        stop_loss = entry * (1.0 - sl_pct)
+        take_profit = entry * (1.0 + tp_pct)
+    else:
+        stop_loss = entry * (1.0 + sl_pct)
+        take_profit = entry * (1.0 - tp_pct)
+
+    return {
+        "ok": True,
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+    }
+
+
+def _agent_b_rebind_payload(
+    state: Dict[str, Any],
+    managed_position: Dict[str, Any],
+    decision: str,
+    adoption_kind: str,
+) -> Dict[str, Any]:
+    payload = dict(state or {})
+    position = dict(managed_position or {})
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    payload["status"] = "agent_b_running"
+    payload["stage"] = "agent_b"
+    payload["mode"] = "mode_b"
+    payload["position"] = position
+    payload["agent_b_started_at"] = now_str
+    payload.setdefault("started_at", now_str)
+
+    plan = (payload.get("plan") or {}) if isinstance(payload.get("plan"), dict) else {}
+    plan["decision"] = str(decision or "").strip().lower()
+    plan["entry"] = position.get("price_open")
+    plan["stop_loss"] = position.get("sl")
+    plan["take_profit"] = position.get("tp")
+    plan["volume"] = position.get("volume")
+    plan["symbol"] = position.get("symbol")
+    if adoption_kind == "manual":
+        plan["model"] = "manual_entry_auto_adopt"
+    elif adoption_kind == "external":
+        plan["model"] = "any_live_position_auto_adopt"
+    else:
+        plan["model"] = "mt5_orphan_recovery"
+    payload["plan"] = plan
+
+    if adoption_kind == "manual":
+        payload["recovery_method"] = "listener_manual_mt5_position"
+    elif adoption_kind == "external":
+        payload["recovery_method"] = "listener_any_live_mt5_position"
+    else:
+        payload["recovery_method"] = "listener_orphan_mt5_position"
+    payload["adoption_kind"] = adoption_kind
+
+    payload.pop("ended_at", None)
+    payload.pop("closed_reason", None)
+    payload.pop("close_outcome", None)
+    payload.pop("pending_close_reason", None)
+    payload.pop("pending_close_status", None)
+    payload.pop("manual_or_external_close_detected", None)
+    return payload
+
+
 def _adopt_untracked_live_agent_b_positions(
     trading_cfg: Dict[str, Any],
     trading_config_path: Path,
@@ -1631,6 +1806,11 @@ def _adopt_untracked_live_agent_b_positions(
     env["TRADING_CONFIG_PATH"] = str(trading_config_path)
     env.setdefault("CONFIG_PATH", "config/config.yaml")
     target_chat_ids = _subscriber_chat_ids(trading_cfg, default_chat_id or last_chat_id)
+    listener_cfg = _listener_cfg(trading_cfg)
+    adopt_manual_entries = bool(listener_cfg.get("adopt_manual_entries", False))
+    adopt_any_running_positions = bool(listener_cfg.get("adopt_any_running_positions", False))
+    rebind_existing_non_agent_b = bool(listener_cfg.get("rebind_existing_non_agent_b", True))
+    seed_missing_sltp_on_adopt = bool(listener_cfg.get("seed_missing_sltp_on_adopt", True))
     now_ts = time.time()
     events: List[Dict[str, Any]] = []
 
@@ -1647,55 +1827,105 @@ def _adopt_untracked_live_agent_b_positions(
         ticket = int(position.get("ticket", 0) or 0)
         if ticket <= 0:
             continue
-        if target_symbol and str(position.get("symbol") or "").strip() != target_symbol:
+        if (not adopt_any_running_positions) and target_symbol and str(position.get("symbol") or "").strip() != target_symbol:
             continue
 
         comment = str(position.get("comment") or "")
         magic = int(position.get("magic", 0) or 0)
-        if "TSMM" not in comment and magic not in {7070001, 7070002}:
-            continue
+        is_tsmm_tagged = "TSMM" in comment or magic in {7070001, 7070002}
+        is_manual_candidate = magic == 0
+        if adopt_any_running_positions:
+            if is_tsmm_tagged:
+                adoption_kind = "tsmm"
+            elif is_manual_candidate:
+                adoption_kind = "manual"
+            else:
+                adoption_kind = "external"
+        else:
+            if not is_tsmm_tagged and not (adopt_manual_entries and is_manual_candidate):
+                continue
+            adoption_kind = "manual" if (not is_tsmm_tagged and is_manual_candidate) else "tsmm"
 
         decision = _infer_position_decision(position)
         if decision not in {"buy", "sell"}:
             events.append({"ok": False, "ticket": ticket, "reason": "unable_to_infer_position_side"})
             continue
 
+        managed_position = dict(position)
+        sl_now = float(managed_position.get("sl", 0.0) or 0.0)
+        tp_now = float(managed_position.get("tp", 0.0) or 0.0)
+        protection_result: Dict[str, Any] | None = None
+        if seed_missing_sltp_on_adopt and (sl_now <= 0.0 or tp_now <= 0.0):
+            desired = _protective_sltp_for_position(trading_cfg, managed_position, decision)
+            if bool(desired.get("ok", False)):
+                protection_result = adapter.modify_position_risk(
+                    ticket,
+                    stop_loss=float(desired.get("stop_loss", 0.0) or 0.0),
+                    take_profit=float(desired.get("take_profit", 0.0) or 0.0),
+                )
+                if bool((protection_result or {}).get("ok", False)) and isinstance((protection_result or {}).get("position"), dict):
+                    managed_position = dict((protection_result or {}).get("position") or managed_position)
+                else:
+                    events.append(
+                        {
+                            "ok": False,
+                            "ticket": ticket,
+                            "reason": "manual_position_protection_update_failed",
+                            "details": protection_result,
+                        }
+                    )
+
         existing_job_id, existing_state_path, existing_state = _job_for_ticket_on_disk(ticket)
         if existing_job_id:
             tracked_tickets.add(ticket)
             if not existing_state:
-                continue
-            state_path = existing_state_path or _job_state_path(existing_job_id)
-            _sync_state_runner_pid_from_process(existing_job_id, existing_state, state_path)
-            if not _should_auto_reconcile_agent_b_job(trading_cfg, existing_state):
-                continue
+                if not adopt_any_running_positions:
+                    continue
+            else:
+                state_path = existing_state_path or _job_state_path(existing_job_id)
+                _sync_state_runner_pid_from_process(existing_job_id, existing_state, state_path)
+                should_reconcile = _should_auto_reconcile_agent_b_job(trading_cfg, existing_state)
+                should_rebind = bool(rebind_existing_non_agent_b) and not should_reconcile
+                if not should_reconcile and not should_rebind:
+                    continue
 
-            if float(job_cooldowns.get(existing_job_id) or 0.0) > now_ts:
-                continue
+                if float(job_cooldowns.get(existing_job_id) or 0.0) > now_ts:
+                    continue
 
-            _stop_job_runner(existing_state)
-            out = _run_cmd_async([sys.executable, "app.py", "trading-job", "resume", "--job-id", existing_job_id], env)
-            if not bool(out.get("ok", False)):
+                _stop_job_runner(existing_state)
+                if should_rebind:
+                    existing_state = _agent_b_rebind_payload(existing_state, managed_position, decision, adoption_kind)
+                    _persist_job_state(state_path, existing_state)
+
+                out = _run_cmd_async([sys.executable, "app.py", "trading-job", "resume", "--job-id", existing_job_id], env)
+                if not bool(out.get("ok", False)):
+                    job_cooldowns[existing_job_id] = now_ts + 60.0
+                    events.append({"ok": False, "job_id": existing_job_id, "ticket": ticket, "reason": out.get("error", "resume_launch_failed")})
+                    continue
+
+                pid = int(out.get("pid") or 0)
+                existing_state["runner_pid"] = pid
+                existing_state["runner_started_at"] = _runner_started_at_value()
+                existing_state["position"] = managed_position
+                if should_rebind:
+                    existing_state["status"] = "agent_b_running"
+                    existing_state["stage"] = "agent_b"
+                    existing_state["mode"] = "mode_b"
+                _persist_job_state(state_path, existing_state)
                 job_cooldowns[existing_job_id] = now_ts + 60.0
-                events.append({"ok": False, "job_id": existing_job_id, "ticket": ticket, "reason": out.get("error", "resume_launch_failed")})
+                action = "rebind_existing_live_position_to_agent_b" if should_rebind else "resume_tracked_mt5_position"
+                events.append({"ok": True, "job_id": existing_job_id, "action": action, "pid": pid, "ticket": ticket, "adoption_kind": adoption_kind, "protection_result": protection_result})
+                if target_chat_ids:
+                    descriptor = "manual" if adoption_kind == "manual" else ("external" if adoption_kind == "external" else "TSMM")
+                    _send_to_chat_ids(
+                        trading_cfg,
+                        target_chat_ids,
+                        f"Resumed Agent B supervision for an existing {descriptor} MT5 live position: job_id={existing_job_id}; pid={pid}; mt5_ticket={ticket}",
+                        allow_agent_mode=True,
+                    )
                 continue
 
-            pid = int(out.get("pid") or 0)
-            existing_state["runner_pid"] = pid
-            existing_state["runner_started_at"] = _runner_started_at_value()
-            existing_state["position"] = position
-            _persist_job_state(state_path, existing_state)
-            job_cooldowns[existing_job_id] = now_ts + 60.0
-            events.append({"ok": True, "job_id": existing_job_id, "action": "resume_tracked_mt5_position", "pid": pid, "ticket": ticket})
-            if target_chat_ids:
-                _send_to_chat_ids(
-                    trading_cfg,
-                    target_chat_ids,
-                    f"Resumed Agent B supervision for an existing TSMM MT5 live position: job_id={existing_job_id}; pid={pid}; mt5_ticket={ticket}",
-                )
-            continue
-
-        if ticket in tracked_tickets:
+        if ticket in tracked_tickets and not adopt_any_running_positions:
             continue
 
         synthetic_job_id = _synthetic_orphan_job_id(ticket, trading_cfg)
@@ -1714,20 +1944,21 @@ def _adopt_untracked_live_agent_b_positions(
             "mode": "mode_b",
             "started_at": started_at,
             "agent_b_started_at": started_at,
-            "position": position,
+            "position": managed_position,
             "plan": {
                 "decision": decision,
-                "model": "mt5_orphan_recovery",
-                "entry": position.get("price_open"),
-                "stop_loss": position.get("sl"),
-                "take_profit": position.get("tp"),
-                "volume": position.get("volume"),
-                "symbol": position.get("symbol"),
+                "model": "manual_entry_auto_adopt" if adoption_kind == "manual" else ("any_live_position_auto_adopt" if adoption_kind == "external" else "mt5_orphan_recovery"),
+                "entry": managed_position.get("price_open"),
+                "stop_loss": managed_position.get("sl"),
+                "take_profit": managed_position.get("tp"),
+                "volume": managed_position.get("volume"),
+                "symbol": managed_position.get("symbol"),
             },
             "order_submission_mode": "market",
             "runner_pid": 0,
             "runner_started_at": "",
-            "recovery_method": "listener_orphan_mt5_position",
+            "recovery_method": "listener_manual_mt5_position" if adoption_kind == "manual" else ("listener_any_live_mt5_position" if adoption_kind == "external" else "listener_orphan_mt5_position"),
+            "adoption_kind": adoption_kind,
         }
         _persist_job_state(state_path, synthetic_state)
 
@@ -1743,25 +1974,83 @@ def _adopt_untracked_live_agent_b_positions(
         _persist_job_state(state_path, synthetic_state)
         tracked_tickets.add(ticket)
         job_cooldowns[synthetic_job_id] = now_ts + 60.0
-        event = {"ok": True, "job_id": synthetic_job_id, "action": "adopt_orphan_mt5_position", "pid": pid, "ticket": ticket}
+        event = {
+            "ok": True,
+            "job_id": synthetic_job_id,
+            "action": "adopt_orphan_mt5_position",
+            "pid": pid,
+            "ticket": ticket,
+            "adoption_kind": adoption_kind,
+            "protection_result": protection_result,
+        }
         events.append(event)
         if target_chat_ids:
+            descriptor = "manual" if adoption_kind == "manual" else ("external" if adoption_kind == "external" else "TSMM")
             _send_to_chat_ids(
                 trading_cfg,
                 target_chat_ids,
-                f"Recovered an orphan TSMM MT5 live position into Agent B supervision: job_id={synthetic_job_id}; pid={pid}; mt5_ticket={ticket}",
+                f"Recovered an orphan {descriptor} MT5 live position into Agent B supervision: job_id={synthetic_job_id}; pid={pid}; mt5_ticket={ticket}",
+                allow_agent_mode=True,
             )
 
     return events
 
 
 def _read_trading_state(job_id: str = "") -> Dict[str, Any]:
-    desired_job_id = str(job_id or "").strip() or _latest_job_id()
-    if desired_job_id:
-        payload = _read_json(_job_state_path(desired_job_id))
+    requested_job_id = str(job_id or "").strip()
+    if requested_job_id:
+        # When a specific job id is requested, never fall back to another job state.
+        return _read_json(_job_state_path(requested_job_id))
+
+    latest_job_id = _latest_job_id()
+    if latest_job_id:
+        payload = _read_json(_job_state_path(latest_job_id))
         if payload:
             return payload
     return _read_json(_trading_state_path())
+
+
+def _await_job_state(job_id: str, timeout_seconds: float, poll_seconds: float = 0.25) -> Dict[str, Any]:
+    target_job_id = str(job_id or "").strip()
+    if not target_job_id:
+        return {}
+
+    timeout_seconds = max(float(timeout_seconds or 0.0), 0.0)
+    if timeout_seconds <= 0.0:
+        return _read_json(_job_state_path(target_job_id))
+
+    deadline = time.time() + timeout_seconds
+    while True:
+        payload = _read_json(_job_state_path(target_job_id))
+        if payload and str(payload.get("job_id") or "").strip() == target_job_id:
+            return payload
+        if time.time() >= deadline:
+            return {}
+        time.sleep(max(float(poll_seconds or 0.25), 0.05))
+
+
+def _format_trading_launch_message(
+    action: str,
+    pid: Any,
+    job_id: str,
+    startup_state: Dict[str, Any],
+) -> str:
+    resolved_action = str(action or "start").strip().lower() or "start"
+    resolved_job_id = str(job_id or "latest").strip() or "latest"
+    pid_text = str(pid if pid is not None else "n/a")
+
+    if startup_state:
+        status = _job_display_status(startup_state)
+        stage = str(startup_state.get("stage") or "n/a")
+        return (
+            f"trading {resolved_action} started pid={pid_text}; job_id={resolved_job_id}; "
+            f"status={status}; stage={stage}"
+        )
+
+    return (
+        f"trading {resolved_action} spawned pid={pid_text}; job_id={resolved_job_id}; "
+        "state=pending_initialization (startup sync and model analysis can take a few minutes before runtime state appears)"
+    )
 
 
 def _approval_request_is_live(req: Dict[str, Any], job_id: str = "") -> bool:
@@ -1921,7 +2210,7 @@ def _console_trace(message: str) -> None:
 
 def _allowed_roots(trading_cfg: Dict[str, Any]) -> set[str]:
     lcfg = _listener_cfg(trading_cfg)
-    roots = [str(x).strip().lower() for x in (lcfg.get("allowed_commands") or ["status", "deploy", "trading", "endpoint", "ui", "resource"]) if str(x).strip()]
+    roots = [str(x).strip().lower() for x in (lcfg.get("allowed_commands") or ["status", "deploy", "trading", "endpoint", "ui", "resource", "history", "analysis"]) if str(x).strip()]
     return set(roots)
 
 
@@ -1936,7 +2225,7 @@ def _help_message(prefix: str) -> str:
         f"- {p} trading start [--plan-model MODEL] [--submission-mode programmed|market] [--job-id JOB]: Start trading job. Defaults to programmed for the mandatory session order.\n"
         f"- {p} trading resume [--job-id JOB]: Resume Agent B trading loop.\n"
         f"- {p} trading jobs: Show all active TSMM trading jobs in a readable list.\n"
-        f"- {p} trading close [--job-id JOB|--ticket TICKET]: Close a specific live MT5 position and end its TSMM job.\n"
+        f"- {p} trading close [--job-id JOB|--ticket TICKET|--side buy|sell]: Close a specific live MT5 position and end its TSMM job.\n"
         f"- {p} trading close-restart: Close the current live MT5 position, then launch a new trading job.\n"
         f"- {p} trading status [--job-id JOB]: Show trading job status and decision.\n"
         f"- {p} trading stop [--job-id JOB]: Stop all trading jobs, or only the specified job when --job-id is provided.\n"
@@ -2107,10 +2396,17 @@ def _infer_natural_language_tail(text: str) -> Tuple[str | None, str | None]:
     if not job_id_match:
         job_id_match = re.search(r"\b(job_[a-z0-9_\-]+)\b", t)
     close_target_tail = ""
+    close_side = ""
+    if _contains_any(t, ["buying job", "buy job", "buy position", "buy trade", "long job", "long position", "long trade"]):
+        close_side = "buy"
+    elif _contains_any(t, ["selling job", "sell job", "sell position", "sell trade", "short job", "short position", "short trade"]):
+        close_side = "sell"
     if ticket_match:
         close_target_tail = f" --ticket {ticket_match.group(1)}"
     elif job_id_match:
         close_target_tail = f" --job-id {job_id_match.group(1)}"
+    elif close_side:
+        close_target_tail = f" --side {close_side}"
 
     if _contains_any(t, ["deploy stop", "deployment stop", "stop deploy", "stop deployment", "cancel deploy", "cancel deployment", "abort deploy", "abort deployment", "halt deploy", "halt deployment"]):
         return "deploy stop", None
@@ -2135,6 +2431,29 @@ def _infer_natural_language_tail(text: str) -> Tuple[str | None, str | None]:
 
     if _contains_any(t, ["active jobs", "trading jobs", "managed jobs", "running jobs", "list jobs"]):
         return "trading jobs", None
+
+    if _contains_any(t, [
+        "finish buying job",
+        "finish buy job",
+        "finish buying trade",
+        "finish buy trade",
+        "finish long job",
+        "finish long trade",
+    ]):
+        return "trading close --side buy", None
+
+    if _contains_any(t, [
+        "finish selling job",
+        "finish sell job",
+        "finish selling trade",
+        "finish sell trade",
+        "finish short job",
+        "finish short trade",
+    ]):
+        return "trading close --side sell", None
+
+    if _contains_any(t, ["finish current job", "finish this job", "finish current trade", "finish this trade"]):
+        return f"trading close{close_target_tail}", None
 
     if _contains_any(t, ["close current position and restart trading", "close current positions and restart trading", "close current position and re start trading", "close current positions and re start trading", "close position and restart trading", "close positions and restart trading", "close position and re start trading", "close positions and re start trading", "close that position and restart trading", "close that position and re start trading", "close current position and start trading", "close current positions and start trading", "close that position and start trading", "close trade and restart trading", "close trade and re start trading"]):
         return "trading close-restart", None
@@ -2634,6 +2953,7 @@ def _reconcile_orphaned_agent_b_jobs(
                         trading_cfg,
                         target_chat_ids,
                         f"trading auto-resume started: job_id={job_id}; pid={pid}; stage=agent_b; mt5_ticket={ticket}",
+                        allow_agent_mode=True,
                     )
                 continue
 
@@ -2642,9 +2962,10 @@ def _reconcile_orphaned_agent_b_jobs(
                 state["close_outcome"] = close_outcome
             state["status"] = "closed"
             state["closed_reason"] = "position_not_found_assumed_closed"
+            state["manual_or_external_close_detected"] = True
             state["ended_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-            if _should_auto_request_followup_agent_a(state):
+            if _should_auto_request_followup_agent_a(state, trading_cfg):
                 new_job_id = _new_job_id(trading_cfg)
                 env["TSMM_AGENT_A_AUTO_CREATED"] = "1"
                 followup = _run_cmd_async([sys.executable, "app.py", "trading-job", "start", "--job-id", new_job_id], env)
@@ -2668,7 +2989,7 @@ def _reconcile_orphaned_agent_b_jobs(
             events.append(event)
             if target_chat_ids:
                 message = f"job_id: {job_id}\n\n{_job_finished_message(state, state.get('close_result') or {}, state.get('position') or {})}"[:3500]
-                _send_to_chat_ids(trading_cfg, target_chat_ids, message)
+                _send_to_chat_ids(trading_cfg, target_chat_ids, message, allow_agent_mode=True)
                 followup = state.get("followup_agent_a") if isinstance(state.get("followup_agent_a"), dict) else {}
                 if followup.get("ok"):
                     _send_to_chat_ids(
@@ -2678,6 +2999,7 @@ def _reconcile_orphaned_agent_b_jobs(
                             "Previous trading job finished with an auto-reentry eligible close outcome. "
                             f"Starting a new Agent A entry search now. new_job_id={followup.get('job_id')}; pid={followup.get('pid')}"
                         )[:3500],
+                        allow_agent_mode=True,
                     )
 
         events.extend(
@@ -2818,12 +3140,13 @@ def _load_app_cfg() -> Dict[str, Any]:
 
 def _summarize_market_snapshot(app_cfg: Dict[str, Any]) -> Dict[str, Any]:
     db_path = ROOT / str(app_cfg.get("data_path") or "data/market_data.sqlite")
+    data_symbol = str(app_cfg.get("data_symbol") or app_cfg.get("sql_symbol") or "XAUUSD").strip()
     if not db_path.exists():
         return {"ok": False, "reason": f"db_missing:{db_path}"}
 
     out: Dict[str, Any] = {"ok": True}
     try:
-        df_1h = query_ohlc(str(db_path), timeframe_minutes=60, latest_records=3)
+        df_1h = query_ohlc(str(db_path), timeframe_minutes=60, latest_records=3, symbol=data_symbol)
         if not df_1h.empty and len(df_1h) >= 1:
             last = df_1h.iloc[-1]
             prev = df_1h.iloc[-2] if len(df_1h) >= 2 else None
@@ -2835,7 +3158,7 @@ def _summarize_market_snapshot(app_cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "close": float(last.get("CLOSE", 0.0) or 0.0),
                 "delta_close": None if prev is None else float(last.get("CLOSE", 0.0) or 0.0) - float(prev.get("CLOSE", 0.0) or 0.0),
             }
-        df_7h = query_ohlc(str(db_path), timeframe_minutes=420, latest_records=2)
+        df_7h = query_ohlc(str(db_path), timeframe_minutes=420, latest_records=2, symbol=data_symbol)
         if not df_7h.empty and len(df_7h) >= 1:
             last = df_7h.iloc[-1]
             prev = df_7h.iloc[-2] if len(df_7h) >= 2 else None
@@ -2989,7 +3312,8 @@ def _compact_ops_context(context: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _resolve_live_position_for_close(trading_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_live_position_for_close(trading_cfg: Dict[str, Any], side: str = "") -> Dict[str, Any]:
+    requested_side = _normalize_trade_side_token(side)
     state = _read_trading_state()
     desired_ticket = int(
         (((state.get("position") or {}).get("ticket") or 0))
@@ -3012,35 +3336,54 @@ def _resolve_live_position_for_close(trading_cfg: Dict[str, Any]) -> Dict[str, A
         if desired_ticket:
             pos = adapter.get_position_by_ticket(desired_ticket)
             if pos.get("ok") and pos.get("position"):
-                return {"ok": True, "ticket": int(desired_ticket), "position": pos.get("position")}
+                resolved_position = dict(pos.get("position") or {})
+                if requested_side:
+                    resolved_side = _normalize_trade_side_token(resolved_position.get("side"))
+                    if resolved_side and resolved_side != requested_side:
+                        resolved_position = {}
+                if resolved_position:
+                    return {"ok": True, "ticket": int(desired_ticket), "position": resolved_position}
 
         positions = mt5.positions_get() or []
+        serialized_positions = [
+            {
+                "ticket": int(getattr(p, "ticket", 0) or 0),
+                "symbol": str(getattr(p, "symbol", "") or ""),
+                "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
+                "side": _normalize_trade_side_token(adapter._position_side_from_type(getattr(p, "type", -1))),
+            }
+            for p in positions
+        ]
+
+        candidate_positions = list(serialized_positions)
         if symbol_hint:
-            symbol_positions = [p for p in positions if str(getattr(p, "symbol", "") or "") == symbol_hint]
-            if len(symbol_positions) == 1:
-                p = symbol_positions[0]
+            symbol_filtered = [p for p in candidate_positions if str(p.get("symbol") or "") == symbol_hint]
+            if symbol_filtered:
+                candidate_positions = symbol_filtered
+
+        if requested_side:
+            side_filtered = [p for p in candidate_positions if str(p.get("side") or "") == requested_side]
+            if len(side_filtered) == 1:
+                pos = side_filtered[0]
                 return {
                     "ok": True,
-                    "ticket": int(getattr(p, "ticket", 0) or 0),
-                    "position": {
-                        "ticket": int(getattr(p, "ticket", 0) or 0),
-                        "symbol": str(getattr(p, "symbol", "") or ""),
-                        "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                        "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                    },
+                    "ticket": int(pos.get("ticket", 0) or 0),
+                    "position": pos,
+                }
+            if len(side_filtered) > 1:
+                return {
+                    "ok": False,
+                    "message": f"multiple_live_positions_for_side:{requested_side}",
+                    "open_positions": side_filtered[:5],
                 }
 
-        if len(positions) == 1:
-            p = positions[0]
+        if len(candidate_positions) == 1:
+            p = candidate_positions[0]
             return {
                 "ok": True,
-                "ticket": int(getattr(p, "ticket", 0) or 0),
-                "position": {
-                    "ticket": int(getattr(p, "ticket", 0) or 0),
-                    "symbol": str(getattr(p, "symbol", "") or ""),
-                    "volume": float(getattr(p, "volume", 0.0) or 0.0),
-                    "price_open": float(getattr(p, "price_open", 0.0) or 0.0),
-                },
+                "ticket": int(p.get("ticket", 0) or 0),
+                "position": p,
             }
 
         return {
@@ -3048,20 +3391,22 @@ def _resolve_live_position_for_close(trading_cfg: Dict[str, Any]) -> Dict[str, A
             "message": "could_not_resolve_single_live_position",
             "open_positions": [
                 {
-                    "ticket": int(getattr(p, "ticket", 0) or 0),
-                    "symbol": str(getattr(p, "symbol", "") or ""),
-                    "volume": float(getattr(p, "volume", 0.0) or 0.0),
+                    "ticket": int((p or {}).get("ticket", 0) or 0),
+                    "symbol": str((p or {}).get("symbol", "") or ""),
+                    "volume": float((p or {}).get("volume", 0.0) or 0.0),
+                    "side": str((p or {}).get("side", "") or ""),
                 }
-                for p in positions[:5]
+                for p in serialized_positions[:5]
             ],
         }
     finally:
         adapter.shutdown()
 
 
-def _resolve_close_target(trading_cfg: Dict[str, Any], job_id: str = "", ticket: int = 0) -> Dict[str, Any]:
+def _resolve_close_target(trading_cfg: Dict[str, Any], job_id: str = "", ticket: int = 0, side: str = "") -> Dict[str, Any]:
     desired_job_id = str(job_id or "").strip()
     desired_ticket = int(ticket or 0)
+    desired_side = _normalize_trade_side_token(side)
 
     if desired_ticket > 0:
         matched_job_id, state_path, state = _find_job_for_ticket(desired_ticket)
@@ -3079,9 +3424,15 @@ def _resolve_close_target(trading_cfg: Dict[str, Any], job_id: str = "", ticket:
         if not state:
             return {"ok": False, "message": f"job_not_found:{desired_job_id}"}
         position = (state.get("position") or {}) if isinstance(state, dict) else {}
-        resolved_ticket = int(position.get("ticket") or 0)
+        agent_b_plan = (state.get("agent_b_plan") or {}) if isinstance(state, dict) else {}
+        resolved_ticket = int(position.get("ticket") or agent_b_plan.get("position_ticket") or 0)
         if resolved_ticket <= 0:
             return {"ok": False, "message": f"job_has_no_live_position_ticket:{desired_job_id}"}
+        if desired_side:
+            plan = (state.get("plan") or {}) if isinstance(state, dict) else {}
+            resolved_side = _normalize_trade_side_token(position.get("side") or plan.get("decision"))
+            if resolved_side and resolved_side != desired_side:
+                return {"ok": False, "message": f"job_position_side_mismatch:{desired_job_id}:{resolved_side}"}
         return {
             "ok": True,
             "ticket": resolved_ticket,
@@ -3091,11 +3442,11 @@ def _resolve_close_target(trading_cfg: Dict[str, Any], job_id: str = "", ticket:
             "position": position,
         }
 
-    return _resolve_live_position_for_close(trading_cfg)
+    return _resolve_live_position_for_close(trading_cfg, side=desired_side)
 
 
-def _close_live_position(trading_cfg: Dict[str, Any], job_id: str = "", ticket: int = 0) -> Dict[str, Any]:
-    resolved = _resolve_close_target(trading_cfg, job_id=job_id, ticket=ticket)
+def _close_live_position(trading_cfg: Dict[str, Any], job_id: str = "", ticket: int = 0, side: str = "") -> Dict[str, Any]:
+    resolved = _resolve_close_target(trading_cfg, job_id=job_id, ticket=ticket, side=side)
     if not bool(resolved.get("ok", False)):
         return resolved
 
@@ -4150,6 +4501,7 @@ def _handle_command(
         action = rest[0].lower() if rest else ""
         requested_job_id = ""
         requested_ticket = 0
+        requested_side = ""
         requested_plan_model = ""
         requested_submission_mode = ""
         idx = 1
@@ -4172,6 +4524,10 @@ def _handle_command(
                     requested_ticket = int(rest[idx + 1])
                 except Exception:
                     requested_ticket = 0
+                idx += 2
+                continue
+            if token == "--side" and idx + 1 < len(rest):
+                requested_side = _normalize_trade_side_token(rest[idx + 1])
                 idx += 2
                 continue
             idx += 1
@@ -4219,7 +4575,7 @@ def _handle_command(
             }
 
         if action == "close":
-            close_res = _close_live_position(trading_cfg, job_id=requested_job_id, ticket=requested_ticket)
+            close_res = _close_live_position(trading_cfg, job_id=requested_job_id, ticket=requested_ticket, side=requested_side)
             if not bool(close_res.get("ok", False)):
                 return {
                     "handled": True,
@@ -4263,7 +4619,7 @@ def _handle_command(
             }
 
         if action not in {"start", "resume", "stop", "kill"}:
-            return {"handled": True, "ok": False, "message": "usage: trading start|resume|stop|kill|jobs|close|close-restart|status|approve|reject [--submission-mode programmed|market] [--job-id JOB] [--ticket TICKET]"}
+            return {"handled": True, "ok": False, "message": "usage: trading start|resume|stop|kill|jobs|close|close-restart|status|approve|reject [--submission-mode programmed|market] [--job-id JOB] [--ticket TICKET] [--side buy|sell]"}
 
         args = [sys.executable, "app.py", "trading-job", action]
         if action == "start" and requested_plan_model:
@@ -4280,14 +4636,23 @@ def _handle_command(
         # trading start/resume can block; launch detached so listener keeps polling.
         if action in {"start", "resume"}:
             out = _run_cmd_async(args, env)
+            startup_wait_seconds = max(float(lcfg.get("trading_start_state_wait_seconds", 2.0) or 2.0), 0.0)
+            startup_wait_seconds = min(startup_wait_seconds, 10.0)
+            startup_state = _await_job_state(requested_job_id, timeout_seconds=startup_wait_seconds) if requested_job_id else {}
             return {
                 "handled": True,
                 "ok": out.get("ok", False),
-                "message": f"trading {action} started pid={out.get('pid')}; job_id={requested_job_id or 'latest'}",
+                "message": _format_trading_launch_message(
+                    action=action,
+                    pid=out.get("pid"),
+                    job_id=requested_job_id or "latest",
+                    startup_state=startup_state,
+                ),
                 "track_request": {
                     "type": f"trading {action}",
                     "pid": out.get("pid"),
                     "job_id": requested_job_id or "",
+                    "startup_state_detected": bool(startup_state),
                 },
                 "exec_args": out.get("args"),
                 "stdout": out.get("stdout", ""),
@@ -4365,6 +4730,54 @@ def _handle_command(
             }
         return {"handled": True, "ok": False, "message": "usage: resource status|relieve"}
 
+    if cmd == "history":
+        try:
+            from utils.trade_memory import recent_analysis as _recent
+            _r = _recent(15)
+            if _r.get("n_trades", 0) == 0:
+                return {"handled": True, "ok": True, "message": "No trade history yet."}
+            _lines = [
+                f"Summary (last {_r['n_trades']} trades):",
+                f"Win/Loss: {_r['wins']}W / {_r['losses']}L",
+                f"Win rate: {_r['win_rate']*100:.1f}%",
+                f"Total P&L: ${_r['total_pnl']:.2f}",
+                f"Avg/trade: ${_r['avg_pnl_per_trade']:.2f}",
+                f"Avg confidence: {_r['avg_confidence']:.3f}",
+                f"Best trade: ${_r['best_trade'] or 0:.2f}",
+                f"Worst trade: ${_r['worst_trade'] or 0:.2f}",
+            ]
+            return {"handled": True, "ok": True, "message": chr(10).join(_lines)}
+        except Exception as e:
+            return {"handled": True, "ok": False, "message": f"history unavailable: {e}"}
+
+    if cmd == "analysis":
+        sub = rest[0].lower() if rest else "week"
+        try:
+            from utils.trade_memory import weekly_analysis as _weekly
+            _a = _weekly()
+            if _a.get("total", 0) == 0:
+                return {"handled": True, "ok": True, "message": "Not enough data for weekly analysis yet."}
+            _lines = [
+                f"Weekly Analysis ({_a['period']}):",
+                f"Total: {_a['total']} trades ({_a['wins']}W / {_a['losses']}L)",
+                f"Win rate: {_a['win_rate']*100:.1f}%",
+                f"Total P&L: ${_a['total_pnl']:.2f}",
+                f"Avg hold: {_a['avg_hold_hours']:.1f}h",
+            ]
+            if _a.get('best_setups'):
+                _lines.append("")
+                _lines.append("Best trades:")
+                for _s in _a['best_setups']:
+                    _lines.append(f"  {_s['decision']} +${_s['pnl']:.2f} (conf={_s['confidence']:.3f}, {_s['reason']})")
+            if _a.get('worst_setups'):
+                _lines.append("")
+                _lines.append("Worst trades:")
+                for _s in _a['worst_setups']:
+                    _lines.append(f"  {_s['decision']} ${_s['pnl']:.2f} (conf={_s['confidence']:.3f}, {_s['reason']})")
+            return {"handled": True, "ok": True, "message": chr(10).join(_lines)}
+        except Exception as e:
+            return {"handled": True, "ok": False, "message": f"analysis unavailable: {e}"}
+
     return {"handled": True, "ok": False, "message": "unknown command"}
 
 
@@ -4394,12 +4807,13 @@ def run_listener(trading_config_path: Path) -> int:
     offset = 0
     latest_request: Dict[str, Any] = {}
     last_chat_id = default_chat_id
-    auto_resume_cooldowns: Dict[str, float] = {}
-    agent_b_reconcile_cooldowns: Dict[str, float] = {}
+    auto_resume_cooldowns_by_profile: Dict[str, Dict[str, float]] = {}
+    agent_b_reconcile_cooldowns_by_profile: Dict[str, Dict[str, float]] = {}
     next_active_jobs_at = time.time() + float(active_jobs_interval_sec)
     next_auto_resume_at = time.time()
     next_autonomy_at = time.time()
     next_scheduled_refresh_at = time.time()
+    next_inference_at = time.time()
     previous_weekend_quiet_mode = _weekend_utc_quiet_mode_active(trading_cfg, now_utc=datetime.utcnow().replace(tzinfo=timezone.utc))
 
     print(f"telegram listener started: cfg={trading_config_path} prefix={lcfg.get('command_prefix', '/tsmm')} runtime={runtime_root}")
@@ -4491,34 +4905,48 @@ def run_listener(trading_config_path: Path) -> int:
                     _console_trace(f"weekend quiet mode enforced: {quiet_out}")
 
             if (not weekend_quiet_mode) and auto_resume_enabled and time.time() >= next_auto_resume_at:
-                launched = _auto_resume_waiting_jobs(
-                    trading_cfg=trading_cfg,
-                    trading_config_path=trading_config_path,
-                    job_cooldowns=auto_resume_cooldowns,
-                    default_chat_id=default_chat_id,
-                    last_chat_id=last_chat_id,
-                )
-                if launched:
-                    last_launch = launched[-1]
-                    latest_request = {
-                        "chat_id": default_chat_id or last_chat_id,
-                        "subscriber_chat_ids": _subscriber_chat_ids(trading_cfg, default_chat_id),
-                        "type": "trading resume",
-                        "pid": int(last_launch.get("pid") or 0),
-                        "job_id": str(last_launch.get("job_id") or ""),
-                        "next_status_at": time.time() + float(progress_interval_sec),
-                        "done_notified": False,
-                    }
+                for profile in profile_entries:
+                    profile_cfg = dict(profile.get("trading_cfg") or {})
+                    profile_path = _resolve_trading_config_path(profile.get("config_path") or trading_config_path)
+                    profile_key = str(profile_path.resolve()).lower()
+                    profile_label = str((profile_cfg.get("runtime") or {}).get("profile_label") or profile_path.stem)
 
-                reconciled = _reconcile_orphaned_agent_b_jobs(
-                    trading_cfg=trading_cfg,
-                    trading_config_path=trading_config_path,
-                    job_cooldowns=agent_b_reconcile_cooldowns,
-                    default_chat_id=default_chat_id,
-                    last_chat_id=last_chat_id,
-                )
-                if reconciled:
-                    _console_trace(f"agent_b reconciliation events={reconciled}")
+                    _set_runtime_scope_env(profile_cfg)
+                    os.environ["TRADING_CONFIG_PATH"] = str(profile_path)
+
+                    profile_auto_resume_cooldowns = auto_resume_cooldowns_by_profile.setdefault(profile_key, {})
+                    launched = _auto_resume_waiting_jobs(
+                        trading_cfg=profile_cfg,
+                        trading_config_path=profile_path,
+                        job_cooldowns=profile_auto_resume_cooldowns,
+                        default_chat_id=default_chat_id,
+                        last_chat_id=last_chat_id,
+                    )
+                    if launched:
+                        last_launch = launched[-1]
+                        latest_request = {
+                            "chat_id": default_chat_id or last_chat_id,
+                            "subscriber_chat_ids": _subscriber_chat_ids(profile_cfg, default_chat_id),
+                            "type": f"trading resume ({profile_label})",
+                            "pid": int(last_launch.get("pid") or 0),
+                            "job_id": str(last_launch.get("job_id") or ""),
+                            "next_status_at": time.time() + float(progress_interval_sec),
+                            "done_notified": False,
+                        }
+
+                    profile_reconcile_cooldowns = agent_b_reconcile_cooldowns_by_profile.setdefault(profile_key, {})
+                    reconciled = _reconcile_orphaned_agent_b_jobs(
+                        trading_cfg=profile_cfg,
+                        trading_config_path=profile_path,
+                        job_cooldowns=profile_reconcile_cooldowns,
+                        default_chat_id=default_chat_id,
+                        last_chat_id=last_chat_id,
+                    )
+                    if reconciled:
+                        _console_trace(f"agent_b reconciliation events ({profile_label})={reconciled}")
+
+                runtime_root = _set_runtime_scope_env(trading_cfg)
+                os.environ["TRADING_CONFIG_PATH"] = str(trading_config_path)
                 next_auto_resume_at = time.time() + float(auto_resume_interval_sec)
 
             if (not weekend_quiet_mode) and autonomy_enabled and time.time() >= next_autonomy_at:
@@ -4559,9 +4987,20 @@ def run_listener(trading_config_path: Path) -> int:
                     followup_ready = _seconds_since(session_stats.get("last_followup_started_at"), current_utc) >= float(followup_cooldown_seconds)
                     target_chat_ids = _subscriber_chat_ids(trading_cfg, default_chat_id or last_chat_id)
                     launch_out: Dict[str, Any] = {}
+                    manual_close_block = _session_manual_or_external_close_marker(session_states)
+                    autonomy_blocked_by_manual_close = bool(autonomy_cfg.get("block_after_manual_or_external_close", True)) and bool(manual_close_block.get("blocked", False))
+
+                    if autonomy_blocked_by_manual_close:
+                        _console_trace(
+                            "autonomous launch blocked after manual/external close: "
+                            f"job_id={manual_close_block.get('job_id')}; "
+                            f"closed_reason={manual_close_block.get('closed_reason')}; "
+                            f"close_outcome_reason={manual_close_block.get('close_outcome_reason')}"
+                        )
 
                     if (
-                        not pending_approval
+                        not autonomy_blocked_by_manual_close
+                        and not pending_approval
                         and not _session_has_mandatory_coverage(session_states)
                         and mandatory_ready
                     ):
@@ -4581,7 +5020,8 @@ def run_listener(trading_config_path: Path) -> int:
                                 _send_to_chat_ids(trading_cfg, target_chat_ids, msg)
                             _console_trace(msg)
                     elif (
-                        bool(autonomy_cfg.get("followup_enabled", True))
+                        not autonomy_blocked_by_manual_close
+                        and bool(autonomy_cfg.get("followup_enabled", True))
                         and not pending_approval
                         and session_active_jobs < session_capacity
                         and _mode_b_supervision_active(trading_cfg)
@@ -4797,16 +5237,40 @@ def run_listener(trading_config_path: Path) -> int:
                 target_chat_ids = _subscriber_chat_ids(trading_cfg, default_chat_id or last_chat_id)
                 if target_chat_ids:
                     digest_msg = _format_active_jobs_digest(trading_cfg)
-                    _send_to_chat_ids(trading_cfg, target_chat_ids, digest_msg)
+                    _send_to_chat_ids(trading_cfg, target_chat_ids, digest_msg, allow_agent_mode=True)
                 next_active_jobs_at = time.time() + float(active_jobs_interval_sec)
 
+            # Periodic inference refresh (~5 min) when no active position
+            if time.time() >= next_inference_at and not weekend_quiet_mode:
+                next_inference_at = time.time() + 300
+                try:
+                    _run_cmd_async(
+                        [sys.executable or 'python', 'scripts/full_horizon_report.py'],
+                        env=dict(os.environ),
+                    )
+                    _console_trace("periodic inference refresh launched")
+                except Exception:
+                    pass
+
             previous_weekend_quiet_mode = weekend_quiet_mode
-            time.sleep(poll_seconds)
+            # Robust sleep - ensures minimum wait time even if interrupted
+            _sleep_deadline = time.time() + poll_seconds
+            while time.time() < _sleep_deadline:
+                _remaining = _sleep_deadline - time.time()
+                if _remaining <= 0:
+                    break
+                time.sleep(min(_remaining, 0.5))
         except KeyboardInterrupt:
             print("telegram listener interrupted")
             return 0
         except Exception:
-            time.sleep(poll_seconds)
+            _console_trace(f"listener loop error: sleeping {poll_seconds}s before retry")
+            _sleep_deadline = time.time() + poll_seconds
+            while time.time() < _sleep_deadline:
+                _remaining = _sleep_deadline - time.time()
+                if _remaining <= 0:
+                    break
+                time.sleep(min(_remaining, 0.5))
 
 
 def main() -> int:

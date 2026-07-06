@@ -1505,6 +1505,144 @@ def _apply_agent_a_enrichment_to_plan(
     return out
 
 
+def _apply_conviction_to_plan(
+    plan: Dict[str, Any],
+    enrichment: Dict[str, Any],
+    trading_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Assess conviction from enrichment signals and plan quality, then adjust SL/TP/sizing."""
+    out = dict(plan or {})
+    conviction_cfg = dict(trading_cfg.get("conviction", {}) or {})
+    if not bool(conviction_cfg.get("enabled", True)):
+        out["conviction"] = {"enabled": False}
+        return out
+
+    risk_cfg = dict(trading_cfg.get("risk", {}) or {})
+    base_sl_pct = float(risk_cfg.get("stop_loss_pct", 0.8) or 0.8) / 100.0
+    base_tp_pct = float(risk_cfg.get("take_profit_pct", 1.6) or 1.6) / 100.0
+    base_volume = float((trading_cfg.get("execution", {}) or {}).get("default_volume", 0.01) or 0.01)
+
+    min_no_sl = float(conviction_cfg.get("min_conviction_for_no_sl", 0.80) or 0.80)
+    min_wide = float(conviction_cfg.get("min_conviction_for_wide", 0.65) or 0.65)
+    min_standard = float(conviction_cfg.get("min_conviction_for_standard", 0.45) or 0.45)
+    min_tight = float(conviction_cfg.get("min_conviction_for_tight", 0.30) or 0.30)
+    hist_weight = float(conviction_cfg.get("historical_weight", 0.25) or 0.25)
+
+    # ── factors ──
+    confidence = float(out.get("confidence", 0.5) or 0.5)
+    cm_acc = float(out.get("cm_accuracy", 0.5) or 0.5)
+    success_prob = float(out.get("success_probability", 0.5) or 0.5)
+    fooling = float(out.get("input_fooling_risk", 0.5) or 0.5)
+
+    enr = out.get("enrichment", {}) or {}
+    consensus_score = abs(float(enr.get("consensus_score", 0.0) or 0.0))
+    avg_model_conf = float(enr.get("avg_confidence", 0.5) or 0.5)
+    alignment = str(enr.get("alignment") or "neutral").lower()
+    n_signals = int(enr.get("n_signals", 0) or 0)
+
+    # 1. Signal quality (0-0.45)
+    signal_factor = 0.0
+    signal_factor += 0.15 * max(0, min(1, (confidence - 0.40) / 0.30))
+    signal_factor += 0.10 * max(0, min(1, (cm_acc - 0.40) / 0.30))
+    signal_factor += 0.10 * max(0, min(1, (success_prob - 0.35) / 0.30))
+    signal_factor += 0.10 * max(0, min(1, (1.0 - fooling) / 0.30))
+
+    # 2. Enrichment alignment (0-0.30)
+    enrich_factor = 0.0
+    enrich_factor += 0.12 * consensus_score
+    enrich_factor += 0.10 * max(0, min(1, (avg_model_conf - 0.45) / 0.25))
+    if alignment == "aligned":
+        enrich_factor += 0.08
+    elif alignment == "opposed":
+        enrich_factor -= 0.05
+    enrich_factor = max(0, min(0.30, enrich_factor))
+
+    # 3. Breadth bonus (0-0.10)
+    breadth = max(0, min(0.10, n_signals / 240.0))  # 24 signals → 0.10
+
+    # 4. Historical memory (0-0.15)
+    hist_factor = 0.0
+    try:
+        from utils.trade_memory import get_memory
+        mem = get_memory()
+        hist_result, n_similar = mem.win_rate_for_similar(out, min_samples=2)
+        if hist_result is not None:
+            hist_factor = hist_weight * hist_result
+    except Exception:
+        pass
+
+    raw_conviction = min(1.0, signal_factor + enrich_factor + breadth + hist_factor)
+
+    # ── risk mode ──
+    if raw_conviction >= min_no_sl:
+        risk_mode = "no_sl"
+        sl_mult = 5.0
+        tp_mult = 3.0
+        vol_mult = 1.5
+    elif raw_conviction >= min_wide:
+        risk_mode = "wide"
+        sl_mult = 1.5
+        tp_mult = 2.0
+        vol_mult = 1.0
+    elif raw_conviction >= min_standard:
+        risk_mode = "standard"
+        sl_mult = 1.0
+        tp_mult = 1.0
+        vol_mult = 0.75
+    elif raw_conviction >= min_tight:
+        risk_mode = "tight"
+        sl_mult = 0.5
+        tp_mult = 0.6
+        vol_mult = 0.5
+    else:
+        risk_mode = "skip"
+        sl_mult = 0.0
+        tp_mult = 0.0
+        vol_mult = 0.0
+
+    # ── apply ──
+    decision = str(out.get("decision") or "hold").lower()
+    if decision in {"buy", "sell"} and risk_mode != "skip":
+        entry = float(out.get("entry") or 0.0)
+        sl_pct = base_sl_pct * sl_mult
+        tp_pct = base_tp_pct * tp_mult
+        if risk_mode == "no_sl":
+            out["stop_loss"] = None
+            out["take_profit"] = round(entry * (1 + tp_mult * base_tp_pct if decision == "buy" else 1 - tp_mult * base_tp_pct), 6)
+            out["risk_notes"].append(f"Conviction={raw_conviction:.3f}: NO STOP LOSS mode (wide SL={sl_pct*100:.1f}%).")
+        elif decision == "buy":
+            out["stop_loss"] = round(entry * (1 - sl_pct), 6)
+            out["take_profit"] = round(entry * (1 + tp_pct), 6)
+        else:
+            out["stop_loss"] = round(entry * (1 + sl_pct), 6)
+            out["take_profit"] = round(entry * (1 - tp_pct), 6)
+
+        if vol_mult != 1.0:
+            volume = round(base_volume * vol_mult, 4)
+            out["volume"] = max(volume, 0.01)
+            out["risk_notes"].append(f"Volume adjusted by conviction ({vol_mult}x) to {out.get('volume')}.")
+
+        out["conviction"] = {
+            "conviction": round(raw_conviction, 4),
+            "risk_mode": risk_mode,
+            "factors": {
+                "signal_quality": round(signal_factor, 3),
+                "enrichment": round(enrich_factor, 3),
+                "breadth": round(breadth, 3),
+                "historical": round(hist_factor, 3),
+            },
+            "position_multiplier": vol_mult,
+        }
+    elif risk_mode == "skip":
+        out["decision"] = "hold"
+        out["conviction"] = {"conviction": round(raw_conviction, 4), "risk_mode": "skip", "reasoning": "conviction below tight threshold"}
+        out["risk_notes"].append(f"Trade blocked by low conviction ({raw_conviction:.3f} < {min_tight:.2f}).")
+    else:
+        out["conviction"] = {"conviction": round(raw_conviction, 4), "risk_mode": risk_mode}
+
+    return out
+
+
 def _estimate_signal_success_probability(plan: Dict[str, Any], backtest: Dict[str, Any]) -> float:
     """Estimate signal success probability using confidence + CM quality + backtest prior."""
     conf = float(plan.get("confidence", 0.5) or 0.5)
@@ -2145,6 +2283,9 @@ def run_investing_agent(
         plan = _apply_agent_a_enrichment_to_plan(plan, enrichment)
     else:
         enrichment = {"enabled": False, "reason": "Disabled in mode_a config"}
+
+    # Conviction assessment — modulates SL/TP/sizing based on signal strength
+    plan = _apply_conviction_to_plan(plan, enrichment, trading_cfg)
 
     backtest = run_backtest_from_validation(
         results.get("df"),

@@ -13,7 +13,12 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from utils.live_data import read_csv_tail, update_fx_master_table_file, update_fx_master_table_db
+from utils.live_data import (
+    read_csv_tail,
+    update_fx_master_table_file,
+    update_fx_master_table_db,
+    resolve_tiingo_token_candidates,
+)
 from utils.market_db import query_ohlc
 from utils.agent_channel import read_channel_messages, set_channel_enabled, is_channel_enabled
 from utils.runtime_scope import resolve_runtime_dir, resolve_runtime_file
@@ -80,13 +85,18 @@ def _load_startup_sync_status(path: str) -> dict:
         return {}
 
 
-def _load_data(path: str, latest_records: int = 50000) -> pd.DataFrame:
+def _load_data(path: str, latest_records: int = 50000, symbol: str = "XAUUSD") -> pd.DataFrame:
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["DATE", "OPEN", "HIGH", "LOW", "CLOSE"])
 
     # SQL-first option: if a SQLite DB path is provided, read from table queries.
     if str(path).lower().endswith(".db") or str(path).lower().endswith(".sqlite"):
-        return query_ohlc(path, timeframe_minutes=1, latest_records=max(int(latest_records or 1), 1))
+        return query_ohlc(
+            path,
+            timeframe_minutes=1,
+            latest_records=max(int(latest_records or 1), 1),
+            symbol=symbol,
+        )
 
     df = read_csv_tail(path, max(int(latest_records or 1), 1))
     if "DATE" not in df.columns:
@@ -215,14 +225,45 @@ def _pdf_fig(series: np.ndarray, title: str, x_title: str, template: str = "plot
     return fig
 
 
+def _parse_token_env_input(token_env: str) -> list[str]:
+    raw = str(token_env or "").strip()
+    if not raw:
+        return ["TIINGO_API_TOKEN"]
+
+    parts = [item.strip() for item in raw.replace(";", ",").split(",") if item.strip()]
+    if not parts:
+        return ["TIINGO_API_TOKEN"]
+    return list(dict.fromkeys(parts))
+
+
+def _token_env_input_value(cfg: dict) -> str:
+    envs_cfg = (cfg or {}).get("tiingo_token_envs")
+    envs: list[str]
+    if isinstance(envs_cfg, str):
+        envs = _parse_token_env_input(envs_cfg)
+    elif isinstance(envs_cfg, (list, tuple, set)):
+        envs = [str(x).strip() for x in envs_cfg if str(x).strip()]
+    else:
+        envs = [str((cfg or {}).get("tiingo_token_env", "TIINGO_API_TOKEN")).strip() or "TIINGO_API_TOKEN"]
+    return ", ".join(list(dict.fromkeys(envs)))
+
+
 def _update_master_from_tiingo(master_table_path: str, symbol: str, rate: str, token_env: str) -> str:
     if not master_table_path:
         return "Missing Master table CSV path."
 
-    token_key = (token_env or "TIINGO_API_TOKEN").strip()
+    token_envs = _parse_token_env_input(token_env)
+    token_key = token_envs[0]
     token = os.environ.get(token_key, "")
-    if not token:
-        return f"Missing Tiingo token in env var: {token_key}"
+    token_candidates = resolve_tiingo_token_candidates(
+        token_env=token_key,
+        token_envs=token_envs,
+        token=token,
+    )
+    if not token_candidates:
+        return f"Missing Tiingo token in configured env vars: {', '.join(token_envs)}"
+
+    rotation_state_path = str(dashboard_cfg.get("tiingo_token_rotation_state_path") or "").strip() or None
 
     try:
         if str(master_table_path).lower().endswith(".db") or str(master_table_path).lower().endswith(".sqlite"):
@@ -231,6 +272,9 @@ def _update_master_from_tiingo(master_table_path: str, symbol: str, rate: str, t
                 rate=(rate or "1min").strip(),
                 symbol=(symbol or "xauusd").strip().lower(),
                 token=token,
+                token_env=token_key,
+                token_envs=token_envs,
+                token_rotation_state_path=rotation_state_path,
             )
         else:
             result = update_fx_master_table_file(
@@ -238,12 +282,18 @@ def _update_master_from_tiingo(master_table_path: str, symbol: str, rate: str, t
                 rate=(rate or "1min").strip(),
                 symbol=(symbol or "xauusd").strip().lower(),
                 token=token,
+                token_env=token_key,
+                token_envs=token_envs,
+                token_rotation_state_path=rotation_state_path,
             )
         if not bool(result.get("updated", False)):
             return f"Update failed: {result.get('error', 'unknown error')}"
+        used_env = str(result.get("used_token_env") or token_key)
+        rotated = bool(result.get("token_rotated", False))
         return (
             f"Master updated: +{int(result.get('new_rows', 0))} rows, "
-            f"latest={result.get('latest_date', 'N/A')}"
+            f"latest={result.get('latest_date', 'N/A')}; "
+            f"token_env={used_env}; rotated={'yes' if rotated else 'no'}"
         )
     except Exception as e:
         return f"Update failed: {e}"
@@ -421,8 +471,8 @@ app.layout = html.Div(
                             dcc.Input(id="tiingo-rate", type="text", value=dashboard_cfg.get("tiingo_rate", "1min"), style={"width": "100%"}),
                         ),
                         _control_cell(
-                            "Token env var",
-                            dcc.Input(id="tiingo-token-env", type="text", value=dashboard_cfg.get("tiingo_token_env", "TIINGO_API_TOKEN"), style={"width": "100%"}),
+                            "Token env var(s)",
+                            dcc.Input(id="tiingo-token-env", type="text", value=_token_env_input_value(dashboard_cfg), style={"width": "100%"}),
                         ),
                         _control_cell(
                             "Auto update master",
@@ -649,7 +699,11 @@ def refresh(n_intervals, _manual_refresh_clicks, master_table_path, latest_recor
     else:
         auto_status = "Auto update disabled."
 
-    df = _load_data(master_table_path, latest_records=max(int(latest_records or 50000), 500))
+    df = _load_data(
+        master_table_path,
+        latest_records=max(int(latest_records or 50000), 500),
+        symbol=str(symbol or dashboard_cfg.get("sql_symbol") or "XAUUSD"),
+    )
     state = _load_state(state_path)
     tj_state = _load_state(trading_job_state_path or _default_trading_job_state_path())
 

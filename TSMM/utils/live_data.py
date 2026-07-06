@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import logging
+import json
 import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, Optional
@@ -13,6 +14,253 @@ from typing import Dict, Any, Tuple, Optional
 import pandas as pd
 import requests
 from utils.market_db import init_market_db, upsert_ohlc_1m, get_latest_date
+
+
+def _normalize_tiingo_token_envs(
+    token_env: str = "TIINGO_API_TOKEN",
+    token_envs: Any = None,
+) -> list[str]:
+    env_names: list[str] = []
+
+    def _add(raw_value: Any) -> None:
+        value = str(raw_value or "").strip()
+        if not value:
+            return
+        if value not in env_names:
+            env_names.append(value)
+
+    primary = str(token_env or "TIINGO_API_TOKEN").strip() or "TIINGO_API_TOKEN"
+    _add(primary)
+
+    if isinstance(token_envs, str):
+        for item in re.split(r"[,;\n]+", token_envs):
+            _add(item)
+    elif isinstance(token_envs, (list, tuple, set)):
+        for item in token_envs:
+            _add(item)
+
+    return env_names
+
+
+def resolve_tiingo_token_candidates(
+    token_env: str = "TIINGO_API_TOKEN",
+    token_envs: Any = None,
+    token: str = "",
+) -> list[Dict[str, str]]:
+    primary = str(token_env or "TIINGO_API_TOKEN").strip() or "TIINGO_API_TOKEN"
+    candidates: list[Dict[str, str]] = []
+
+    for env_name in _normalize_tiingo_token_envs(primary, token_envs):
+        token_value = str(os.environ.get(env_name, "") or "").strip()
+        if not token_value and env_name == primary:
+            token_value = str(token or "").strip()
+        if token_value:
+            candidates.append({"env": env_name, "token": token_value})
+
+    if not candidates:
+        fallback = str(token or "").strip()
+        if fallback:
+            candidates.append({"env": primary, "token": fallback})
+
+    return candidates
+
+
+def _resolve_tiingo_rotation_state_path(token_rotation_state_path: Optional[str]) -> str:
+    explicit = str(token_rotation_state_path or "").strip()
+    if explicit:
+        return explicit
+
+    runtime_dir = str(os.environ.get("TSMM_RUNTIME_DIR", "") or "").strip()
+    if runtime_dir:
+        return os.path.join(runtime_dir, "tiingo_token_rotation_state.json")
+    return os.path.join("reports", "runtime", "tiingo_token_rotation_state.json")
+
+
+def _load_tiingo_rotation_state(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        return dict(payload) if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_tiingo_rotation_state(path: str, payload: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload or {}, f, indent=2)
+    except Exception:
+        pass
+
+
+def _is_tiingo_quota_error(status_code: int, response_text: str) -> bool:
+    if int(status_code or 0) == 429:
+        return True
+    text = str(response_text or "").strip().lower()
+    hints = (
+        "quota",
+        "rate limit",
+        "request limit",
+        "too many requests",
+        "limit reached",
+        "exceeded",
+    )
+    return any(h in text for h in hints)
+
+
+def _ordered_tiingo_candidates(
+    candidates: list[Dict[str, str]],
+    token_rotation_state_path: Optional[str],
+) -> Tuple[list[Dict[str, str]], str]:
+    if not candidates:
+        return [], ""
+
+    state_path = _resolve_tiingo_rotation_state_path(token_rotation_state_path)
+    state = _load_tiingo_rotation_state(state_path)
+    current_env = str(state.get("current_env") or "").strip()
+    if not current_env:
+        return list(candidates), ""
+
+    for idx, item in enumerate(candidates):
+        if str(item.get("env") or "").strip() == current_env:
+            return candidates[idx:] + candidates[:idx], current_env
+
+    return list(candidates), current_env
+
+
+def _persist_active_tiingo_env(
+    token_rotation_state_path: Optional[str],
+    used_env: str,
+    previous_env: str,
+    rotation_reason: str,
+) -> None:
+    if not used_env:
+        return
+
+    state_path = _resolve_tiingo_rotation_state_path(token_rotation_state_path)
+    state = _load_tiingo_rotation_state(state_path)
+    state["current_env"] = used_env
+    state["previous_env"] = previous_env or state.get("previous_env")
+    state["last_rotation_reason"] = rotation_reason
+    state["last_rotated_at_utc"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    _save_tiingo_rotation_state(state_path, state)
+
+
+def _fetch_tiingo_prices_with_failover(
+    symbol: str,
+    rate: str,
+    start_date: str,
+    token: str,
+    token_env: str,
+    token_envs: Any,
+    token_rotation_state_path: Optional[str],
+    timeout_seconds: int = 30,
+) -> Dict[str, Any]:
+    primary_env = str(token_env or "TIINGO_API_TOKEN").strip() or "TIINGO_API_TOKEN"
+    configured_envs = _normalize_tiingo_token_envs(primary_env, token_envs)
+    candidates = resolve_tiingo_token_candidates(primary_env, configured_envs, token=token)
+    if not candidates:
+        return {
+            "ok": False,
+            "error": f"Missing Tiingo token in configured env vars: {', '.join(configured_envs)}",
+            "attempts": [],
+            "configured_token_envs": configured_envs,
+        }
+
+    ordered_candidates, previous_env = _ordered_tiingo_candidates(candidates, token_rotation_state_path)
+    attempts: list[Dict[str, Any]] = []
+
+    headers = {"Content-Type": "application/json"}
+    for idx, item in enumerate(ordered_candidates):
+        used_env = str(item.get("env") or "").strip()
+        used_token = str(item.get("token") or "").strip()
+        url = (
+            f"https://api.tiingo.com/tiingo/fx/{symbol}/prices"
+            f"?startDate={start_date}&resampleFreq={rate}&token={used_token}"
+        )
+
+        try:
+            response = requests.get(url, headers=headers, timeout=max(int(timeout_seconds or 30), 5))
+        except Exception as exc:
+            attempts.append({"env": used_env, "ok": False, "error": str(exc), "quota_error": False})
+            return {
+                "ok": False,
+                "error": f"Error fetching data: {exc}",
+                "used_token_env": used_env,
+                "attempts": attempts,
+                "configured_token_envs": configured_envs,
+            }
+
+        response_text = str(response.text or "")
+        if int(response.status_code) == 200:
+            try:
+                payload = response.json()
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "env": used_env,
+                        "ok": False,
+                        "status_code": 200,
+                        "error": f"Invalid Tiingo JSON payload: {exc}",
+                        "quota_error": False,
+                    }
+                )
+                return {
+                    "ok": False,
+                    "error": f"Error fetching data: Invalid Tiingo JSON payload: {exc}",
+                    "used_token_env": used_env,
+                    "attempts": attempts,
+                    "configured_token_envs": configured_envs,
+                }
+
+            attempts.append({"env": used_env, "ok": True, "status_code": 200, "quota_error": False})
+            rotation_reason = "steady_state"
+            if idx > 0:
+                rotation_reason = "quota_failover"
+            _persist_active_tiingo_env(
+                token_rotation_state_path=token_rotation_state_path,
+                used_env=used_env,
+                previous_env=previous_env,
+                rotation_reason=rotation_reason,
+            )
+            return {
+                "ok": True,
+                "payload": payload,
+                "used_token_env": used_env,
+                "rotated": bool(idx > 0),
+                "attempts": attempts,
+                "configured_token_envs": configured_envs,
+            }
+
+        quota_error = _is_tiingo_quota_error(response.status_code, response_text)
+        attempts.append(
+            {
+                "env": used_env,
+                "ok": False,
+                "status_code": int(response.status_code),
+                "quota_error": bool(quota_error),
+                "error": response_text[:600],
+            }
+        )
+        if quota_error and idx + 1 < len(ordered_candidates):
+            continue
+
+        return {
+            "ok": False,
+            "error": f"Error fetching data: {response_text}",
+            "used_token_env": used_env,
+            "attempts": attempts,
+            "configured_token_envs": configured_envs,
+            "quota_error": bool(quota_error),
+        }
+
+    return {
+        "ok": False,
+        "error": "Error fetching data: exhausted Tiingo token candidates",
+        "attempts": attempts,
+        "configured_token_envs": configured_envs,
+    }
 
 
 def read_csv_tail(path: str, n_rows: int, usecols=None) -> pd.DataFrame:
@@ -267,7 +515,11 @@ def _infer_timeframe_minutes(target_path: str, explicit_minutes: Optional[int] =
     return value
 
 
-def _load_master_minute_frame(master_table_path: str, latest_records: int) -> pd.DataFrame:
+def _load_master_minute_frame(
+    master_table_path: str,
+    latest_records: int,
+    symbol: str = "XAUUSD",
+) -> pd.DataFrame:
     latest_records = max(int(latest_records or 1), 1)
     if str(master_table_path).lower().endswith(".db") or str(master_table_path).lower().endswith(".sqlite"):
         from utils.market_db import query_ohlc
@@ -278,6 +530,7 @@ def _load_master_minute_frame(master_table_path: str, latest_records: int) -> pd
             latest_records=latest_records,
             start_date=None,
             end_date=None,
+            symbol=symbol,
         )
 
     df = read_csv_tail(master_table_path, latest_records)
@@ -297,6 +550,7 @@ def sync_dataset_source_from_master(
     rolling_windows: list[int] | None = None,
     n_steps: int = 1,
     horizon: int = 1,
+    symbol: str = "XAUUSD",
     logger=None,
 ) -> Dict[str, Any]:
     """Regenerate the active model source file from the refreshed master source."""
@@ -310,7 +564,11 @@ def sync_dataset_source_from_master(
     else:
         required_master_rows = (required_target_rows * tf_minutes) + 200
 
-    master_df = _load_master_minute_frame(master_table_path, latest_records=required_master_rows)
+    master_df = _load_master_minute_frame(
+        master_table_path,
+        latest_records=required_master_rows,
+        symbol=symbol,
+    )
     if master_df.empty:
         return {
             "updated": False,
@@ -346,6 +604,7 @@ def sync_dataset_source_from_master(
     return {
         "updated": True,
         "master_table_path": master_table_path,
+        "symbol": str(symbol or "XAUUSD").upper(),
         "output_path": output_path,
         "timeframe_minutes": tf_minutes,
         "rows": int(len(enriched)),
@@ -357,9 +616,12 @@ def update_fx_master_table_file(
     master_table_path: str,
     rate: str,
     symbol: str,
-    token: str,
+    token: str = "",
     date_col: str = "DATE",
     tail_probe_rows: int = 2000,
+    token_env: str = "TIINGO_API_TOKEN",
+    token_envs: Any = None,
+    token_rotation_state_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Update a master minute CSV in-place by appending only new Tiingo rows.
 
@@ -369,8 +631,13 @@ def update_fx_master_table_file(
         return {"updated": False, "error": "Missing master_table_path"}
     if not os.path.exists(master_table_path):
         return {"updated": False, "error": f"Master table file not found: {master_table_path}"}
-    if not token:
-        return {"updated": False, "error": "Missing Tiingo token"}
+    if not resolve_tiingo_token_candidates(token_env=token_env, token_envs=token_envs, token=token):
+        env_names = _normalize_tiingo_token_envs(token_env=token_env, token_envs=token_envs)
+        return {
+            "updated": False,
+            "error": f"Missing Tiingo token in configured env vars: {', '.join(env_names)}",
+            "configured_token_envs": env_names,
+        }
 
     # Read tail rows with all columns and auto-detect which column currently holds datetime values.
     probe = read_csv_tail(master_table_path, max(int(tail_probe_rows), 10), usecols=None)
@@ -425,23 +692,36 @@ def update_fx_master_table_file(
 
     new_date = f"{date.strftime('%Y-%m-%d')} {last_hour:02}:{last_minute:02}:00"
 
-    headers = {"Content-Type": "application/json"}
-    url = (
-        f"https://api.tiingo.com/tiingo/fx/{symbol}/prices"
-        f"?startDate={new_date}&resampleFreq={rate}&token={token}"
+    fetch_res = _fetch_tiingo_prices_with_failover(
+        symbol=symbol,
+        rate=rate,
+        start_date=new_date,
+        token=token,
+        token_env=token_env,
+        token_envs=token_envs,
+        token_rotation_state_path=token_rotation_state_path,
+        timeout_seconds=30,
     )
+    if not bool(fetch_res.get("ok", False)):
+        return {
+            "updated": False,
+            "error": str(fetch_res.get("error") or "Error fetching Tiingo data"),
+            "used_token_env": fetch_res.get("used_token_env"),
+            "token_rotated": bool(fetch_res.get("rotated", False)),
+            "token_attempts": fetch_res.get("attempts"),
+            "configured_token_envs": fetch_res.get("configured_token_envs"),
+        }
 
-    response = requests.get(url, headers=headers, timeout=30)
-    if response.status_code != 200:
-        return {"updated": False, "error": f"Error fetching data: {response.text}"}
-
-    ds = pd.DataFrame(response.json())
+    ds = pd.DataFrame(fetch_res.get("payload") or [])
     if ds.empty:
         return {
             "updated": True,
             "new_rows": 0,
             "master_table_path": master_table_path,
             "latest_date": reference_date_str,
+            "used_token_env": fetch_res.get("used_token_env"),
+            "token_rotated": bool(fetch_res.get("rotated", False)),
+            "token_attempts": fetch_res.get("attempts"),
         }
 
     ds.drop(columns=[c for c in ["ticker"] if c in ds.columns], inplace=True)
@@ -488,6 +768,9 @@ def update_fx_master_table_file(
         "new_rows": int(len(write_df)),
         "master_table_path": master_table_path,
         "latest_date": str(ds["DATE"].iloc[-1]),
+        "used_token_env": fetch_res.get("used_token_env"),
+        "token_rotated": bool(fetch_res.get("rotated", False)),
+        "token_attempts": fetch_res.get("attempts"),
     }
 
 
@@ -495,16 +778,24 @@ def update_fx_master_table_db(
     db_path: str,
     rate: str,
     symbol: str,
-    token: str,
+    token: str = "",
+    token_env: str = "TIINGO_API_TOKEN",
+    token_envs: Any = None,
+    token_rotation_state_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Update SQLite ohlc_1m table by appending only new Tiingo rows."""
     if not db_path:
         return {"updated": False, "error": "Missing db_path"}
-    if not token:
-        return {"updated": False, "error": "Missing Tiingo token"}
+    if not resolve_tiingo_token_candidates(token_env=token_env, token_envs=token_envs, token=token):
+        env_names = _normalize_tiingo_token_envs(token_env=token_env, token_envs=token_envs)
+        return {
+            "updated": False,
+            "error": f"Missing Tiingo token in configured env vars: {', '.join(env_names)}",
+            "configured_token_envs": env_names,
+        }
 
-    init_market_db(db_path)
-    latest = get_latest_date(db_path)
+    init_market_db(db_path, symbol=symbol)
+    latest = get_latest_date(db_path, symbol=symbol)
     if latest:
         reference_date = pd.to_datetime(latest, errors="coerce")
     else:
@@ -526,23 +817,36 @@ def update_fx_master_table_db(
 
     new_date = f"{date.strftime('%Y-%m-%d')} {last_hour:02}:{last_minute:02}:00"
 
-    headers = {"Content-Type": "application/json"}
-    url = (
-        f"https://api.tiingo.com/tiingo/fx/{symbol}/prices"
-        f"?startDate={new_date}&resampleFreq={rate}&token={token}"
+    fetch_res = _fetch_tiingo_prices_with_failover(
+        symbol=symbol,
+        rate=rate,
+        start_date=new_date,
+        token=token,
+        token_env=token_env,
+        token_envs=token_envs,
+        token_rotation_state_path=token_rotation_state_path,
+        timeout_seconds=30,
     )
+    if not bool(fetch_res.get("ok", False)):
+        return {
+            "updated": False,
+            "error": str(fetch_res.get("error") or "Error fetching Tiingo data"),
+            "used_token_env": fetch_res.get("used_token_env"),
+            "token_rotated": bool(fetch_res.get("rotated", False)),
+            "token_attempts": fetch_res.get("attempts"),
+            "configured_token_envs": fetch_res.get("configured_token_envs"),
+        }
 
-    response = requests.get(url, headers=headers, timeout=30)
-    if response.status_code != 200:
-        return {"updated": False, "error": f"Error fetching data: {response.text}"}
-
-    ds = pd.DataFrame(response.json())
+    ds = pd.DataFrame(fetch_res.get("payload") or [])
     if ds.empty:
         return {
             "updated": True,
             "new_rows": 0,
             "db_path": db_path,
             "latest_date": reference_date_str,
+            "used_token_env": fetch_res.get("used_token_env"),
+            "token_rotated": bool(fetch_res.get("rotated", False)),
+            "token_attempts": fetch_res.get("attempts"),
         }
 
     ds.drop(columns=[c for c in ["ticker"] if c in ds.columns], inplace=True)
@@ -570,12 +874,16 @@ def update_fx_master_table_db(
             "latest_date": reference_date_str,
         }
 
-    n = upsert_ohlc_1m(db_path, ds)
+    n = upsert_ohlc_1m(db_path, ds, symbol=symbol)
     return {
         "updated": True,
         "new_rows": int(n),
         "db_path": db_path,
+        "symbol": str(symbol or "XAUUSD").upper(),
         "latest_date": str(ds["DATE"].iloc[-1]),
+        "used_token_env": fetch_res.get("used_token_env"),
+        "token_rotated": bool(fetch_res.get("rotated", False)),
+        "token_attempts": fetch_res.get("attempts"),
     }
 
 
@@ -602,11 +910,11 @@ def _latest_ts_from_csv(master_table_path: str, tail_probe_rows: int = 5000) -> 
     return pd.to_datetime(best_series.dropna()).max()
 
 
-def get_master_latest_timestamp(master_table_path: str) -> Optional[pd.Timestamp]:
+def get_master_latest_timestamp(master_table_path: str, symbol: str = "XAUUSD") -> Optional[pd.Timestamp]:
     if not master_table_path:
         return None
     if str(master_table_path).lower().endswith(".db") or str(master_table_path).lower().endswith(".sqlite"):
-        latest = get_latest_date(master_table_path)
+        latest = get_latest_date(master_table_path, symbol=symbol)
         if not latest:
             return None
         return pd.to_datetime(latest, errors="coerce")
@@ -619,11 +927,12 @@ def is_master_aligned(
     master_table_path: str,
     freshness_lag_minutes: int = 20,
     now_ts: Optional[datetime] = None,
+    symbol: str = "XAUUSD",
 ) -> Dict[str, Any]:
     now_utc = now_ts or datetime.utcnow()
     is_weekend = now_utc.weekday() >= 5
 
-    latest = get_master_latest_timestamp(master_table_path)
+    latest = get_master_latest_timestamp(master_table_path, symbol=symbol)
     if latest is None or pd.isna(latest):
         return {
             "is_aligned": False,
@@ -668,15 +977,23 @@ def bootstrap_master_on_backend_start(
     master_table_path: str,
     rate: str,
     symbol: str,
-    token: str,
+    token: str = "",
     max_pulls: int = 2,
     freshness_lag_minutes: int = 20,
+    token_env: str = "TIINGO_API_TOKEN",
+    token_envs: Any = None,
+    token_rotation_state_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Attempt to sync master source on backend startup, up to max_pulls attempts."""
     if not master_table_path:
         return {"ok": False, "error": "Missing master table path"}
-    if not token:
-        return {"ok": False, "error": "Missing Tiingo token"}
+    if not resolve_tiingo_token_candidates(token_env=token_env, token_envs=token_envs, token=token):
+        env_names = _normalize_tiingo_token_envs(token_env=token_env, token_envs=token_envs)
+        return {
+            "ok": False,
+            "error": f"Missing Tiingo token in configured env vars: {', '.join(env_names)}",
+            "configured_token_envs": env_names,
+        }
 
     attempts = []
     pull_count = max(int(max_pulls), 1)
@@ -688,6 +1005,9 @@ def bootstrap_master_on_backend_start(
                 rate=rate,
                 symbol=symbol,
                 token=token,
+                token_env=token_env,
+                token_envs=token_envs,
+                token_rotation_state_path=token_rotation_state_path,
             )
         else:
             pull_res = update_fx_master_table_file(
@@ -695,11 +1015,15 @@ def bootstrap_master_on_backend_start(
                 rate=rate,
                 symbol=symbol,
                 token=token,
+                token_env=token_env,
+                token_envs=token_envs,
+                token_rotation_state_path=token_rotation_state_path,
             )
 
         align = is_master_aligned(
             master_table_path=master_table_path,
             freshness_lag_minutes=freshness_lag_minutes,
+            symbol=symbol,
         )
         attempts.append({"attempt": i, "pull": pull_res, "alignment": align})
 

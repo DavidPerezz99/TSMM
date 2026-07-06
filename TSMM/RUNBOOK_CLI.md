@@ -293,3 +293,30 @@ Default summary outputs:
 
 - `reports/runtime[/ftmo]/operation_feedback/weekly/operation_feedback_weekly_YYYYMMDD.json`
 - `reports/runtime[/ftmo]/operation_feedback/weekly/operation_feedback_weekly_YYYYMMDD.md`
+
+## 10) Multi-asset master tables (US500 integration)
+
+The SQLite market layer now supports symbol-scoped master tables and views in one DB family.
+
+Naming convention:
+
+- XAUUSD (backward compatible): `ohlc_1m`, `ohlc_10m`, `ohlc_30m`, ...
+- Other assets: `ohlc_1m_<symbol_lower>`, `ohlc_10m_<symbol_lower>`, `ohlc_30m_<symbol_lower>`, ...
+
+Import US500 HISTDATA folder tree (recursive):
+
+```powershell
+python scripts/migrate_market_data_to_sqlite.py --master-dir "C:/Users/USUARIO/Documents/DataBuild" --master-glob "**/*.csv" --db-path data/market_data_us500.sqlite --symbol US500 --views 10,30,60,180,420,720,1440,10080
+```
+
+Optional trading config update during import:
+
+```powershell
+python scripts/migrate_market_data_to_sqlite.py --master-dir "C:/Users/USUARIO/Documents/DataBuild" --db-path data/market_data_us500.sqlite --symbol US500 --views 10,30,60,180,420,720,1440,10080 --update-trading-config --trading-config config/trading_agent.yaml
+```
+
+Config keys for symbol selection:
+
+- `dashboard.master_table_path`: SQLite DB path for the runtime/profile.
+- `dashboard.sql_symbol`: symbol namespace used when reading from SQLite.
+- `config/config.yaml -> sql_symbol`: app-level symbol for status/snapshot queries.

@@ -40,7 +40,7 @@ from utils.metrics_saver import save_all_models_metrics, save_forecast_to_file
 from utils.interpretability import add_interpretability
 from utils.investing_agent import load_trading_config
 from utils.trading_job import start_trading_job, resume_trading_job, stop_trading_job, kill_trading_job, resolve_trading_start_request
-from utils.live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master
+from utils.live_data import bootstrap_master_on_backend_start, sync_dataset_source_from_master, resolve_tiingo_token_candidates
 
 
 def _resolve_app_path(path_value: str) -> str:
@@ -102,6 +102,67 @@ def create_output_directory(config: dict) -> str:
     output_dir = _resolve_app_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
+
+
+def _extract_trading_job_state(job_result: dict) -> dict:
+    if not isinstance(job_result, dict):
+        return {}
+    state = job_result.get("state")
+    if isinstance(state, dict):
+        return state
+    if isinstance(job_result.get("job_id"), str) or "status" in job_result or "stage" in job_result:
+        return job_result
+    return {}
+
+
+def _summarize_trading_job_result(job_result: dict) -> dict:
+    state = _extract_trading_job_state(job_result)
+    status = str(state.get("status") or "").strip().lower() if isinstance(state, dict) else ""
+
+    if isinstance(job_result, dict) and "ok" in job_result:
+        ok_value = bool(job_result.get("ok"))
+    elif status:
+        ok_value = status not in {"failed", "killed", "stopped"}
+    else:
+        ok_value = False
+
+    summary = {
+        "ok": ok_value,
+    }
+
+    if isinstance(job_result, dict):
+        message = str(job_result.get("message") or "").strip()
+        if message:
+            summary["message"] = message
+        error = str(job_result.get("error") or "").strip()
+        if error:
+            summary["error"] = error
+
+    if not isinstance(state, dict) or not state:
+        return summary
+
+    summary.update(
+        {
+            "job_id": str(state.get("job_id") or ""),
+            "status": str(state.get("status") or ""),
+            "stage": str(state.get("stage") or ""),
+            "mode": str(state.get("mode") or ""),
+            "order_submission_mode": str(state.get("order_submission_mode") or ""),
+            "runner_pid": int(state.get("runner_pid") or 0),
+            "closed_reason": str(state.get("closed_reason") or ""),
+            "state_path": str(state.get("state_path") or ""),
+        }
+    )
+
+    position = state.get("position") if isinstance(state.get("position"), dict) else {}
+    order = state.get("order") if isinstance(state.get("order"), dict) else {}
+    position_ticket = int(position.get("ticket") or 0)
+    order_ticket = int(order.get("order_ticket") or 0)
+    if position_ticket > 0:
+        summary["position_ticket"] = position_ticket
+    if order_ticket > 0:
+        summary["order_ticket"] = order_ticket
+    return summary
 
 
 def generate_output_filename(config: dict, output_format: str) -> str:
@@ -381,15 +442,28 @@ def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logg
         })
         return
 
-    token_env = str(dash_cfg.get('tiingo_token_env', 'TIINGO_API_TOKEN')).strip()
+    token_env = str(dash_cfg.get('tiingo_token_env', 'TIINGO_API_TOKEN')).strip() or 'TIINGO_API_TOKEN'
+    token_envs_cfg = dash_cfg.get('tiingo_token_envs')
+    token_rotation_state_path = str(dash_cfg.get('tiingo_token_rotation_state_path') or '').strip() or None
     token = os.environ.get(token_env, '')
-    if not token:
-        logger.warning("Startup master sync skipped: missing Tiingo token in env var %s", token_env)
+    token_candidates = resolve_tiingo_token_candidates(
+        token_env=token_env,
+        token_envs=token_envs_cfg,
+        token=token,
+    )
+    if not token_candidates:
+        configured_envs = [token_env]
+        if isinstance(token_envs_cfg, str):
+            configured_envs.extend([x.strip() for x in token_envs_cfg.replace(';', ',').split(',') if str(x).strip()])
+        elif isinstance(token_envs_cfg, (list, tuple, set)):
+            configured_envs.extend([str(x).strip() for x in token_envs_cfg if str(x).strip()])
+        configured_envs = list(dict.fromkeys(configured_envs))
+        logger.warning("Startup master sync skipped: missing Tiingo token in configured env vars %s", configured_envs)
         _save_startup_status({
             'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
             'enabled': True,
             'ok': False,
-            'reason': f'missing_token_env:{token_env}',
+            'reason': f"missing_token_envs:{','.join(configured_envs)}",
             'status_path': status_path,
         })
         return
@@ -415,10 +489,20 @@ def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logg
         token=token,
         max_pulls=max_pulls,
         freshness_lag_minutes=freshness_lag_minutes,
+        token_env=token_env,
+        token_envs=token_envs_cfg,
+        token_rotation_state_path=token_rotation_state_path,
     )
 
     active_sync_result = None
     active_data_path = str((active_config or {}).get('data_path') or '').strip()
+    active_sql_symbol = str(
+        (active_config or {}).get('sql_symbol')
+        or (active_config or {}).get('symbol')
+        or dash_cfg.get('sql_symbol')
+        or dash_cfg.get('tiingo_symbol')
+        or 'xauusd'
+    ).strip()
     active_records = int((active_config or {}).get('records', 5000) or 5000)
     active_rolling_windows = list((active_config or {}).get('rolling_windows') or [2, 7, 30, 60])
     active_n_steps = int((active_config or {}).get('n_steps', 1) or 1)
@@ -435,6 +519,7 @@ def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logg
             rolling_windows=active_rolling_windows,
             n_steps=active_n_steps,
             horizon=active_horizon,
+            symbol=active_sql_symbol,
             logger=logger,
         )
     elif active_data_path:
@@ -464,6 +549,8 @@ def maybe_sync_master_on_backend_start(active_config: dict, logger: logging.Logg
         'max_pulls': max_pulls,
         'freshness_lag_minutes': freshness_lag_minutes,
         'result': result,
+        'token_env': token_env,
+        'configured_token_envs': [item.get('env') for item in token_candidates],
         'active_config_data_path': active_data_path,
         'active_config_sync_result': active_sync_result,
         'status_path': status_path,
@@ -558,9 +645,11 @@ def main():
             print("\n" + "=" * 60)
             print("TRADING JOB RESULT")
             print("=" * 60)
-            print(job_result)
+            summary = _summarize_trading_job_result(job_result)
+            print(json.dumps(summary, indent=2, ensure_ascii=True))
             print("=" * 60)
-            logger.info("Trading job completed with result: %s", job_result)
+            logger.info("Trading job completed with result summary: %s", summary)
+            logger.debug("Trading job completed with full result: %s", job_result)
             return
 
         # Standard forecast/report mode.
