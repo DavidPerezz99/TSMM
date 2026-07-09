@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from utils.runtime_scope import resolve_runtime_dir
 
 from utils.notification_telegram import send_telegram_broadcast
+_PYW = str(Path(sys.executable).with_name("pythonw.exe")) if os.name == "nt" and Path(sys.executable).with_name("pythonw.exe").exists() else sys.executable
 
 TRADING_CFG_PATH = Path(os.environ.get("TRADING_CONFIG_PATH", str(ROOT / "config" / "trading_agent.yaml")))
 
@@ -282,7 +283,7 @@ def _listener_covers_target(running_cfg_path: Path, target_cfg_path: Path) -> bo
 def _launch_detached(args: List[str], *, env: Dict[str, str] | None = None, stdout_path: Path | None = None) -> Dict[str, Any]:
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     stdout_handle = subprocess.DEVNULL
     stderr_handle = subprocess.DEVNULL
@@ -404,7 +405,7 @@ def main() -> int:
             action = {"kind": "endpoint", "status": "planned" if args.dry_run else "started"}
             if not args.dry_run:
                 out = _launch_detached(
-                    [sys.executable, str((ROOT / "scripts" / "local_signal_endpoint_service.py").resolve())],
+                    [_PYW, str((ROOT / "scripts" / "local_signal_endpoint_service.py").resolve())],
                     env={**_endpoint_env(trading_cfg), **_runtime_env(trading_cfg)},
                     stdout_path=runtime_dir / "endpoint_recovery.log",
                 )
@@ -423,7 +424,7 @@ def main() -> int:
                 health_timeout_seconds = max(float(recovery_cfg.get("endpoint_watchdog_health_timeout_seconds", 5.0) or 5.0), 1.0)
                 out = _launch_detached(
                     [
-                        sys.executable,
+                        _PYW,
                         str((ROOT / "scripts" / "endpoint_liveness_watchdog.py").resolve()),
                         "--trading-config",
                         str(TRADING_CFG_PATH.resolve()),

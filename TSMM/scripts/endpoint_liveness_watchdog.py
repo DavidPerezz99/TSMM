@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Tuple
 import psutil
 import requests
 import yaml
+_PYW = str(Path(sys.executable).with_name("pythonw.exe")) if os.name == "nt" and Path(sys.executable).with_name("pythonw.exe").exists() else sys.executable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -166,14 +167,14 @@ def _launch_endpoint(
 ) -> int:
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     env = {**_runtime_env(trading_cfg_path, trading_cfg), **_endpoint_env(trading_cfg)}
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     file_handle = open(stdout_log, "a", encoding="utf-8")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(service_script.resolve())],
+            [_PYW, str(service_script.resolve())],
             cwd=str(ROOT),
             env=env,
             stdout=file_handle,

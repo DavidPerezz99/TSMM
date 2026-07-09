@@ -75,7 +75,7 @@ def _start_ollama_server(provider_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
         subprocess.Popen(

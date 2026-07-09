@@ -174,13 +174,16 @@ def _launch_account_mirror_start(
     if autonomous_trigger:
         command.extend(["--autonomous-trigger", autonomous_trigger])
 
+    cmds = list(command)
+    if os.name == "nt" and len(cmds) > 0 and "python" in str(cmds[0]).lower():
+        cmds[0] = str(Path(sys.executable).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
         proc = subprocess.Popen(
-            command,
+            cmds,
             cwd=str(_project_root()),
             env=env,
             creationflags=creationflags,
@@ -1896,13 +1899,16 @@ def _launch_opposing_countertrade_start(
         "opposing_countertrade",
     ]
 
+    cmds = list(command)
+    if os.name == "nt" and len(cmds) > 0 and "python" in str(cmds[0]).lower():
+        cmds[0] = str(Path(sys.executable).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
         proc = subprocess.Popen(
-            command,
+            cmds,
             cwd=str(_project_root()),
             env=env,
             creationflags=creationflags,
@@ -4215,9 +4221,13 @@ def _launch_followup_agent_a_start(
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_JOB_ID", None)
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_CONFIG_PATH", None)
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_PROFILE", None)
+    if os.name == "nt" and len(sys.executable) > 0:
+        _pyw = str(Path(sys.executable).with_name("pythonw.exe"))
+        if os.path.exists(_pyw):
+            sys.executable = _pyw  # type: ignore[assignment]
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     try:
         proc = subprocess.Popen(

@@ -64,10 +64,10 @@ def _start_ui(script_name: str) -> int:
     script_path = ROOT / script_name
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     p = subprocess.Popen(
-        [sys.executable, str(script_path)],
+        [_PYW, str(script_path)],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
