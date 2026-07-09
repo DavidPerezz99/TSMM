@@ -2070,7 +2070,7 @@ def _ensure_local_endpoint_on_demand(trading_cfg: Optional[Dict[str, Any]]) -> D
 
     exe = sys.executable
     if os.name == "nt":
-        exe = str(Path(sys.executable).with_name("pythonw.exe"))
+        exe = sys.executable
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

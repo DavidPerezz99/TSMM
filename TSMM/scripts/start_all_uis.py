@@ -67,7 +67,7 @@ def _start_ui(script_name: str) -> int:
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     p = subprocess.Popen(
-        [_PYW, str(script_path)],
+        [sys.executable, str(script_path)],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

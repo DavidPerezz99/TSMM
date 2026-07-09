@@ -743,7 +743,7 @@ def _run_forecast(
         run_log.flush()
         exe = sys.executable
         if os.name == "nt":
-            exe = str(Path(sys.executable).with_name("pythonw.exe"))
+            exe = sys.executable
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -812,7 +812,7 @@ def _ensure_endpoint_service(script_rel: str, host: str, port: int, dry_run: boo
     script_abs = _as_abs(script_rel)
     exe = sys.executable
     if os.name == "nt":
-        exe = str(Path(exe).with_name("pythonw.exe"))
+        exe = sys.executable
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -905,10 +905,7 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
     if mt5_terminal_path:
         env["MT5_TERMINAL_PATH"] = mt5_terminal_path
 
-    # Swap python.exe → pythonw.exe on Windows to prevent console popups
     cmd2 = list(cmd)
-    if os.name == "nt" and cmd2 and sys.executable in cmd2[0]:
-        cmd2[0] = str(Path(cmd2[0]).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

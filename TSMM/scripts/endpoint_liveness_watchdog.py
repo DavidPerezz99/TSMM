@@ -22,8 +22,6 @@ from typing import Any, Dict, List, Tuple
 import psutil
 import requests
 import yaml
-_PYW = str(Path(sys.executable).with_name("pythonw.exe")) if os.name == "nt" and Path(sys.executable).with_name("pythonw.exe").exists() else sys.executable
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -174,7 +172,7 @@ def _launch_endpoint(
     file_handle = open(stdout_log, "a", encoding="utf-8")
     try:
         proc = subprocess.Popen(
-            [_PYW, str(service_script.resolve())],
+            [sys.executable, str(service_script.resolve())],
             cwd=str(ROOT),
             env=env,
             stdout=file_handle,

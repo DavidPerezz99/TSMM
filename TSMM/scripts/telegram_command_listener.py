@@ -301,10 +301,6 @@ def _api_get(token: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_cmd(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
-    # Use pythonw.exe on Windows to prevent console popups for background processes
-    if os.name == "nt" and args and sys.executable in args[0]:
-        args = list(args)
-        args[0] = str(Path(sys.executable).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -327,12 +323,6 @@ def _run_cmd(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
 
 
 def _run_cmd_async(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
-    # Use pythonw.exe on Windows to prevent console popups for background processes
-    if os.name == "nt" and args and len(args) > 0 and ("python" in str(args[0]).lower()):
-        args = list(args)
-        _pyw_path = str(Path(sys.executable).with_name("pythonw.exe"))
-        if os.path.exists(_pyw_path):
-            args[0] = _pyw_path
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

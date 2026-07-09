@@ -176,7 +176,7 @@ def _launch_account_mirror_start(
 
     cmds = list(command)
     if os.name == "nt" and len(cmds) > 0 and "python" in str(cmds[0]).lower():
-        cmds[0] = str(Path(sys.executable).with_name("pythonw.exe"))
+        pass  # CREATE_NO_WINDOW handled by sitecustomize
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -1901,7 +1901,7 @@ def _launch_opposing_countertrade_start(
 
     cmds = list(command)
     if os.name == "nt" and len(cmds) > 0 and "python" in str(cmds[0]).lower():
-        cmds[0] = str(Path(sys.executable).with_name("pythonw.exe"))
+        pass  # CREATE_NO_WINDOW handled by sitecustomize
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -4222,9 +4222,6 @@ def _launch_followup_agent_a_start(
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_CONFIG_PATH", None)
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_PROFILE", None)
     if os.name == "nt" and len(sys.executable) > 0:
-        _pyw = str(Path(sys.executable).with_name("pythonw.exe"))
-        if os.path.exists(_pyw):
-            sys.executable = _pyw  # type: ignore[assignment]
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
