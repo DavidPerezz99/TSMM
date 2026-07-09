@@ -188,23 +188,23 @@ opposing_countertrade:
 autonomous_trading:
   enabled: true
   timezone: America/Bogota
-  scan_interval_seconds: 300
+  scan_interval_seconds: 600
   block_after_manual_or_external_close: true
   pending_order_maintenance:
     enabled: true
     assessment_timeout_seconds: 3.0
     cancel_opposed_consensus_threshold: 0.25
     entry_cross_tolerance_abs: 0.05
-  followup_enabled: true
+  followup_enabled: false
   followup_submission_mode: market
   mandatory_session_cooldown_seconds: 600
-  followup_cooldown_seconds: 300
-  max_followup_launches_per_session: 84
-  max_filtered_followups_per_session: 84
-  min_success_probability_for_followup: 0.4
-  min_confidence_for_followup: 0.48
-  min_cm_accuracy_for_followup: 0.48
-  max_input_fooling_risk_for_followup: 0.55
+  followup_cooldown_seconds: 600
+  max_followup_launches_per_session: 6
+  max_filtered_followups_per_session: 6
+  min_success_probability_for_followup: 0.45
+  min_confidence_for_followup: 0.5
+  min_cm_accuracy_for_followup: 0.5
+  max_input_fooling_risk_for_followup: 0.5
   require_consensus_alignment_for_followup: true
   session_windows:
   - name: asia_australia
@@ -353,11 +353,11 @@ endpoint_lifecycle:
   startup_wait_seconds: 20
 resource_guard:
   enabled: true
-  cpu_threshold_pct: 95
-  ram_threshold_pct: 95
-  sustained_seconds: 240
-  cooldown_seconds: 600
-  disable_endpoint_on_relief: true
+  cpu_threshold_pct: 98
+  ram_threshold_pct: 98
+  sustained_seconds: 300
+  cooldown_seconds: 900
+  disable_endpoint_on_relief: false
   disable_uis_on_relief: true
 boot_recovery:
   enabled: true

@@ -2068,13 +2068,16 @@ def _ensure_local_endpoint_on_demand(trading_cfg: Optional[Dict[str, Any]]) -> D
     env["TSMM_SIGNAL_HOST"] = host
     env["TSMM_SIGNAL_PORT"] = str(port)
 
+    exe = sys.executable
+    if os.name == "nt":
+        exe = str(Path(sys.executable).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     subprocess.Popen(
         [
-            sys.executable,
+            exe,
             str((root / service_script).resolve()),
         ],
         cwd=str(root),

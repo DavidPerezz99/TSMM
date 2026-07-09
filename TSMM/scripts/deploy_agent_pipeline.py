@@ -741,17 +741,20 @@ def _run_forecast(
     with run_log_path.open("a", encoding="utf-8") as run_log:
         run_log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START config={cfg_path}\n")
         run_log.flush()
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
+        exe = sys.executable
+        if os.name == "nt":
+            exe = str(Path(sys.executable).with_name("pythonw.exe"))
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
         proc = subprocess.Popen(
-            [sys.executable, "app.py", "forecast"],
+            [exe, "app.py", "forecast"],
             cwd=str(ROOT),
             env=env,
             stdout=run_log,
             stderr=subprocess.STDOUT,
             text=True,
-            startupinfo=startupinfo,
+            creationflags=creationflags,
         )
 
         started = time.time()
@@ -807,12 +810,15 @@ def _ensure_endpoint_service(script_rel: str, host: str, port: int, dry_run: boo
     env["TSMM_SIGNAL_PORT"] = str(port)
 
     script_abs = _as_abs(script_rel)
+    exe = sys.executable
+    if os.name == "nt":
+        exe = str(Path(exe).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     p = subprocess.Popen(
-        [sys.executable, str(script_abs)],
+        [exe, str(script_abs)],
         cwd=str(ROOT),
         env=env,
         creationflags=creationflags,
@@ -899,12 +905,16 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
     if mt5_terminal_path:
         env["MT5_TERMINAL_PATH"] = mt5_terminal_path
 
+    # Swap python.exe → pythonw.exe on Windows to prevent console popups
+    cmd2 = list(cmd)
+    if os.name == "nt" and cmd2 and sys.executable in cmd2[0]:
+        cmd2[0] = str(Path(cmd2[0]).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     p = subprocess.Popen(
-        cmd,
+        cmd2,
         cwd=str(ROOT),
         env=env,
         creationflags=creationflags,

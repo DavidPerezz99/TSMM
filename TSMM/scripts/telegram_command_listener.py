@@ -301,12 +301,21 @@ def _api_get(token: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_cmd(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
+    # Use pythonw.exe on Windows to prevent console popups for background processes
+    if os.name == "nt" and args and sys.executable in args[0]:
+        args = list(args)
+        args[0] = str(Path(sys.executable).with_name("pythonw.exe"))
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
     proc = subprocess.run(
         args,
         cwd=str(ROOT),
         env=env,
         capture_output=True,
         text=True,
+        creationflags=creationflags,
     )
     return {
         "ok": proc.returncode == 0,
@@ -318,9 +327,13 @@ def _run_cmd(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
 
 
 def _run_cmd_async(args: List[str], env: Dict[str, str]) -> Dict[str, Any]:
+    # Use pythonw.exe on Windows to prevent console popups for background processes
+    if os.name == "nt" and args and sys.executable in args[0]:
+        args = list(args)
+        args[0] = str(Path(sys.executable).with_name("pythonw.exe"))
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
     p = subprocess.Popen(
         args,

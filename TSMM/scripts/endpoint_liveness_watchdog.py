@@ -114,7 +114,7 @@ def _cmdline_parts(proc: psutil.Process) -> List[str]:
         return []
 
 
-def _endpoint_processes(service_script: Path) -> List[Tuple[int, float]]:
+def _endpoint_processes(service_script: Path, port: int = 8000) -> List[Tuple[int, float]]:
     target_full = str(service_script.resolve()).lower()
     target_name = service_script.name.lower()
     matched: List[Tuple[int, float]] = []
@@ -134,6 +134,17 @@ def _endpoint_processes(service_script: Path) -> List[Tuple[int, float]]:
             continue
 
     matched = [(pid, created) for pid, created in matched if pid > 0]
+
+    # Fallback: if psutil returned nothing, check which PID owns the listening port
+    # (handles "Not Responding" processes that psutil can't read)
+    if not matched:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.status == "LISTEN" and conn.laddr.port == port and conn.pid:
+                    matched.append((int(conn.pid), 0.0))
+        except Exception:
+            pass
+
     matched.sort(key=lambda item: item[1])
     return matched
 
@@ -224,7 +235,7 @@ def main() -> int:
 
     while True:
         healthy = _health_ok(host=host, port=port, timeout_seconds=health_timeout_sec)
-        endpoint_pids = _endpoint_processes(service_script)
+        endpoint_pids = _endpoint_processes(service_script, port=port)
 
         # Keep a single endpoint worker to avoid port contention after repeated recoveries.
         if len(endpoint_pids) > 1:
