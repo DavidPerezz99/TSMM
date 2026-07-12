@@ -127,7 +127,7 @@ Controlled by `plot_data_export` in `config/config.yaml`.
 ## 7) Run search mode for one generated config
 
 ```powershell
-python search_mode.py --config config/config.yaml
+python tools/search_mode.py --config config/config.yaml
 ```
 
 This writes experiment summary JSON including governance metrics under `_governance`.
@@ -136,13 +136,13 @@ This writes experiment summary JSON including governance metrics under `_governa
 Use the config path under `config/` (important).
 
 ```powershell
-python hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 2
+python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 2
 ```
 
 If memory is tight, reduce parallel workers:
 
 ```powershell
-python hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 1
+python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 1
 ```
 
 ## 9) Suggested pass/fail checks before live/paper mode
@@ -175,7 +175,7 @@ python scripts/live_data_loop.py --config config/config.yaml --every-seconds 60
 ## 12) Run live dashboard
 
 ```powershell
-python dashboard.py
+python apps/dashboard.py
 ```
 
 Open browser at `http://127.0.0.1:8050`.

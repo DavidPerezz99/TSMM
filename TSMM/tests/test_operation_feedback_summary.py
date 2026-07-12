@@ -6,10 +6,33 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.operation_feedback_weekly_summary import _drift_summary, _patterns_summary
+from scripts.operation_feedback_weekly_summary import _drift_summary, _patterns_summary, _terminal_operation_events
+from scripts.analyze_operation_feedback import build_job_rows, summarize_events
 
 
 class OperationFeedbackSummaryTests(unittest.TestCase):
+    def test_terminal_events_keep_latest_terminal_snapshot_when_later_event_is_running(self):
+        events = [
+            {"job_id": "job_1", "timestamp_utc": "2026-05-22 00:00:00", "status": "closed", "outcome_label": "good"},
+            {"job_id": "job_1", "timestamp_utc": "2026-05-22 00:01:00", "status": "agent_b_running", "outcome_label": "pending"},
+        ]
+
+        terminal = _terminal_operation_events(events)
+
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["status"], "closed")
+
+    def test_full_history_summary_counts_terminal_outcome_independently_of_latest_state(self):
+        events = [
+            {"job_id": "job_1", "timestamp_utc": "2026-05-22 00:00:00", "status": "closed", "outcome_label": "good"},
+            {"job_id": "job_1", "timestamp_utc": "2026-05-22 00:01:00", "status": "agent_b_running", "outcome_label": "pending"},
+        ]
+
+        summary = summarize_events(events, build_job_rows(events))
+
+        self.assertEqual(summary["terminal_operation_count"], 1)
+        self.assertEqual(summary["terminal_outcome_counts"], [("good", 1)])
+
     def test_patterns_summary_returns_good_and_bad_rankings(self):
         events = [
             {

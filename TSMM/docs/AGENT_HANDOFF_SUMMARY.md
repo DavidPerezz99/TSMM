@@ -9,9 +9,9 @@
 
 Primary files:
 - scripts/telegram_command_listener.py
-- channel_listener_commands.txt
-- RUNBOOK_CLI.md
-- AGENT_STEWARD_INSTRUCTIONS.md
+- docs/channel_listener_commands.txt
+- docs/RUNBOOK_CLI.md
+- docs/AGENT_STEWARD_INSTRUCTIONS.md
 
 ### Deployment pipeline and model coverage
 - Added deployment pipeline orchestration script with stage logging and stop-flag support.
@@ -118,7 +118,7 @@ A careful commit curation is still required to match portability requirements (e
 - utils/investing_agent.py
 - config/agent_pipeline.yaml
 - config/trading_agent.yaml
-- AGENT_STEWARD_INSTRUCTIONS.md
-- RUNBOOK_CLI.md
+- docs/AGENT_STEWARD_INSTRUCTIONS.md
+- docs/RUNBOOK_CLI.md
 - reports/runtime/deployment_pipeline_last.json
 - reports/runtime/deployment_pipeline_stage_log.jsonl

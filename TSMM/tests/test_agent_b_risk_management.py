@@ -7,7 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.trading_job import _agent_b_risk_adjustment, _attempt_agent_b_close, _mirror_agent_b_position_action
+from utils.trading_job import (
+    _agent_b_risk_adjustment,
+    _apply_agent_b_risk_adjustment,
+    _attempt_agent_b_close,
+    _mirror_agent_b_position_action,
+)
 
 
 class _StubAdapter:
@@ -20,6 +25,9 @@ class _StubAdapter:
 
     def get_position_by_ticket(self, ticket):
         return dict(self._position_result)
+
+    def get_position_close_outcome(self, ticket):
+        return {"ok": True, "found": False, "ticket": int(ticket)}
 
 
 class _StubMirrorAdapter:
@@ -41,6 +49,29 @@ class _StubMirrorAdapter:
 
 
 class AgentBRiskManagementTests(unittest.TestCase):
+    def test_failed_risk_adjustment_is_retried_but_successful_one_is_deduplicated(self):
+        class _RiskAdapter:
+            def __init__(self):
+                self.results = [{"ok": False}, {"ok": True}]
+                self.calls = 0
+
+            def modify_position_risk(self, ticket, stop_loss=None, take_profit=None):
+                self.calls += 1
+                return self.results.pop(0)
+
+        adapter = _RiskAdapter()
+        state = {}
+        adjustment = {"action": "attach_delayed_stop_loss", "stop_loss": 99.0, "take_profit": 103.0}
+
+        first = _apply_agent_b_risk_adjustment(adapter, state, 123, adjustment)
+        second = _apply_agent_b_risk_adjustment(adapter, state, 123, adjustment)
+        third = _apply_agent_b_risk_adjustment(adapter, state, 123, adjustment)
+
+        self.assertTrue(first["attempted"])
+        self.assertTrue(second["attempted"])
+        self.assertFalse(third["attempted"])
+        self.assertEqual(adapter.calls, 2)
+
     @patch("utils.trading_job._notify", return_value={"channel": {"kind": "risk_update"}})
     @patch("utils.trading_job._save_job_state")
     @patch("utils.trading_job._load_state")

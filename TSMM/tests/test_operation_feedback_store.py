@@ -101,6 +101,12 @@ class OperationFeedbackStoreTests(unittest.TestCase):
                 "plan": {"model": "ulr", "decision": "buy", "confidence": 0.62},
                 "order_submission_mode": "market",
                 "started_at": "2026-05-29 00:00:00",
+                "last_risk_adjustment": {
+                    "action": "tighten_stop_loss",
+                    "previous_stop_loss": 98.5,
+                    "stop_loss": 99.5,
+                    "result": {"ok": True},
+                },
             }
             signal = {
                 "consensus": "buy",
@@ -109,7 +115,16 @@ class OperationFeedbackStoreTests(unittest.TestCase):
                     "10m": {"signal": 1, "confidence": 0.61, "model": "nbeats"},
                 },
             }
-            current_plan = {"recommendation": "hold", "should_close": False}
+            current_plan = {
+                "recommendation": "close_position",
+                "risk_adjustment": {
+                    "action": "trail_stop_loss",
+                    "previous_stop_loss": 99.0,
+                    "stop_loss": 100.5,
+                    "previous_take_profit": 102.0,
+                    "take_profit": 103.0,
+                },
+            }
 
             notify_out = log_notification_feedback(
                 output_dir=output_dir,
@@ -141,6 +156,15 @@ class OperationFeedbackStoreTests(unittest.TestCase):
             event_kinds = {str(e.get("event_kind") or "") for e in events}
             self.assertIn("notify_agent_a_order_failed", event_kinds)
             self.assertIn("mode_b_assessment_sample", event_kinds)
+            agent_b_events = [e for e in events if e.get("event_kind") == "mode_b_assessment_sample"]
+            self.assertTrue(agent_b_events)
+            snapshot = agent_b_events[-1]["mode_b_snapshot"]
+            self.assertTrue(snapshot["should_close"])
+            self.assertEqual(snapshot["risk_action"], "tighten_stop_loss")
+            self.assertEqual(snapshot["risk_action_proposed"], "trail_stop_loss")
+            self.assertEqual(snapshot["risk_previous_stop_loss"], 98.5)
+            self.assertEqual(snapshot["risk_stop_loss"], 99.5)
+            self.assertEqual(snapshot["risk_stop_loss_proposed"], 100.5)
 
 
 if __name__ == "__main__":

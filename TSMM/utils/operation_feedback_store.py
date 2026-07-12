@@ -205,15 +205,33 @@ def _extract_mode_b_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     mode_b = (state.get("mode_b") or {}) if isinstance(state, dict) else {}
     plan = (state.get("agent_b_plan") or {}) if isinstance(state, dict) else {}
     risk = (state.get("last_risk_adjustment") or {}) if isinstance(state, dict) else {}
+    risk_adjustment = (plan.get("risk_adjustment") or {}) if isinstance(plan, dict) else {}
+    risk_result = (risk.get("result") or {}) if isinstance(risk, dict) else {}
+    if not isinstance(risk_result, dict):
+        risk_result = {}
+
+    recommendation = str(plan.get("recommendation") or "").strip().lower()
+    should_close = bool(plan.get("should_close", False)) or recommendation == "close_position"
+    proposed_risk_action = str(risk_adjustment.get("action") or "").strip().lower()
+    risk_action = ""
+    if bool(risk_result.get("ok", False)):
+        risk_action = str(risk.get("action") or risk_result.get("action") or "").strip().lower()
 
     return {
         "sample_tick_utc": str(state.get("last_mode_b_tick") or "").strip(),
         "consensus": str(mode_b.get("consensus") or plan.get("consensus") or "").strip().lower(),
         "consensus_score": _safe_float(mode_b.get("consensus_score") if isinstance(mode_b, dict) else None),
-        "recommendation": str(plan.get("recommendation") or "").strip().lower(),
-        "should_close": bool(plan.get("should_close", False)),
+        "recommendation": recommendation,
+        "should_close": should_close,
         "close_reason": str(plan.get("close_reason") or "").strip(),
-        "risk_action": str(((risk.get("result") or {}).get("action") if isinstance(risk, dict) and isinstance(risk.get("result"), dict) else "") or "").strip().lower(),
+        "risk_action": risk_action,
+        "risk_action_proposed": proposed_risk_action,
+        "risk_stop_loss": _safe_float(risk.get("stop_loss")) if risk_action else None,
+        "risk_take_profit": _safe_float(risk.get("take_profit")) if risk_action else None,
+        "risk_previous_stop_loss": _safe_float(risk.get("previous_stop_loss")) if risk_action else None,
+        "risk_previous_take_profit": _safe_float(risk.get("previous_take_profit")) if risk_action else None,
+        "risk_stop_loss_proposed": _safe_float(risk_adjustment.get("stop_loss")),
+        "risk_take_profit_proposed": _safe_float(risk_adjustment.get("take_profit")),
         "timeframe_signals": _extract_mode_b_timeframes(mode_b),
     }
 

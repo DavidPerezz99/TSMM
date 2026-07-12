@@ -2,17 +2,23 @@
 Agent Validation Dashboard
 
 Run:
-    py -3.11 validation_dashboard.py
+    py -3.11 apps/validation_dashboard.py
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import sys
 import threading
 from datetime import datetime, timedelta
 
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 dash_mod = __import__("dash", fromlist=["Dash", "dcc", "html", "Input", "Output", "State"])
 Dash = dash_mod.Dash
@@ -24,7 +30,7 @@ State = dash_mod.State
 
 from utils.agent_validation import run_agent_validation_days, run_agent_backtest_advanced
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(PROJECT_ROOT)
 TRADING_CFG_PATH = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 MAIN_CFG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
 VALIDATION_ROOT = os.path.join(BASE_DIR, "reports", "agent_validation")
@@ -219,7 +225,7 @@ cfg_trading = _load_yaml(TRADING_CFG_PATH)
 dashboard_cfg = (cfg_trading.get("dashboard") or {})
 refresh_cfg = (cfg_main.get("data_refresh") or {})
 
-app = Dash(__name__)
+app = Dash(__name__, assets_folder=str(PROJECT_ROOT / "assets"))
 app.title = "TSMM Agent Validation"
 
 app.layout = html.Div(

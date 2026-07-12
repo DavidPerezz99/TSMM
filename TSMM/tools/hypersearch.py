@@ -28,6 +28,11 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Iterator
 import yaml
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from utils.cache_management import clear_cache
 
 
@@ -609,7 +614,7 @@ class BulkSearchEngine:
         
         cmd = [
             sys.executable,
-            "search_mode.py",
+            str(ROOT / "tools" / "search_mode.py"),
             "--config",
             str(cfg_path),
             "--summary-dir",
@@ -769,7 +774,7 @@ class SmartSearchEngine:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "-1"
         
-        cmd = [sys.executable, "search_mode.py", "--config", str(cfg_path)]
+        cmd = [sys.executable, str(ROOT / "tools" / "search_mode.py"), "--config", str(cfg_path)]
         async with self.sem:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, 
@@ -802,16 +807,16 @@ def main_cli():
         epilog="""
 Examples:
     # Run bulk search with smart experiment generation (creates isolated execution folder)
-    python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
+    python tools/hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
 
     # Resume the latest bulk execution folder
-    python hypersearch.py resume_bulk --configs-root experiments --max-parallel 4
+    python tools/hypersearch.py resume_bulk --configs-root experiments --max-parallel 4
   
   # Run bulk search with legacy factorial approach (NOT recommended - may create thousands of experiments)
-  python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --legacy
+  python tools/hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --legacy
   
   # Rerun top configurations
-  python hypersearch.py smart_search --from-experiments experiments --top-n 50 --max-parallel 2
+  python tools/hypersearch.py smart_search --from-experiments experiments --top-n 50 --max-parallel 2
         """
     )
     sub = p.add_subparsers(dest="mode", required=True)

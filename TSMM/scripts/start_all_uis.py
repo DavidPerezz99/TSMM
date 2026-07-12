@@ -1,9 +1,9 @@
 """Start all TSMM UI apps in one command.
 
 Starts:
-- dashboard.py (8050)
-- ui.py (8051)
-- validation_dashboard.py (8052)
+- apps/dashboard.py (8050)
+- apps/ui.py (8051)
+- apps/validation_dashboard.py (8052)
 
 Usage:
   python scripts/start_all_uis.py
@@ -28,9 +28,9 @@ RUNTIME_DIR = ROOT / "reports" / "runtime"
 PID_FILE = RUNTIME_DIR / "ui_processes.json"
 
 UI_SPECS = [
-    {"name": "dashboard", "script": "dashboard.py", "port": 8050, "url": "http://127.0.0.1:8050"},
-    {"name": "config_ui", "script": "ui.py", "port": 8051, "url": "http://127.0.0.1:8051"},
-    {"name": "validation_dashboard", "script": "validation_dashboard.py", "port": 8052, "url": "http://127.0.0.1:8052"},
+    {"name": "dashboard", "script": "apps/dashboard.py", "port": 8050, "url": "http://127.0.0.1:8050"},
+    {"name": "config_ui", "script": "apps/ui.py", "port": 8051, "url": "http://127.0.0.1:8051"},
+    {"name": "validation_dashboard", "script": "apps/validation_dashboard.py", "port": 8052, "url": "http://127.0.0.1:8052"},
 ]
 
 

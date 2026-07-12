@@ -8,14 +8,20 @@ Provides editors for:
 And Mode B interrupt/resume controls.
 
 Run:
-    py -3.11 ui.py
+    py -3.11 apps/ui.py
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import sys
 from datetime import datetime
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.live_data import update_fx_master_table_file, update_fx_master_table_db, resolve_tiingo_token_candidates
 from utils.runtime_scope import resolve_runtime_file
@@ -29,7 +35,7 @@ Output = dash_mod.Output
 State = dash_mod.State
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(PROJECT_ROOT)
 CFG_MAIN = os.path.join(BASE_DIR, "config", "config.yaml")
 CFG_TRADING = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 CFG_SWEEP = os.path.join(BASE_DIR, "config", "sweep_definition.yaml")
@@ -85,7 +91,7 @@ def _token_env_input_value(dash_cfg: dict, refresh_cfg: dict) -> str:
     return ", ".join(list(dict.fromkeys(envs)))
 
 
-app = Dash(__name__)
+app = Dash(__name__, assets_folder=str(PROJECT_ROOT / "assets"))
 app.title = "TSMM UI"
 
 _cfg_main = _load_yaml(CFG_MAIN)
@@ -247,7 +253,7 @@ app.layout = html.Div(
                                     className="tsmm-toolbar",
                                 ),
                                 html.Div(id="mode-b-status", className="tsmm-status-info", style={"marginTop": "10px"}),
-                                html.P("Open dashboard separately with: py -3.11 dashboard.py"),
+                                html.P("Open dashboard separately with: py -3.11 apps/dashboard.py"),
                             ],
                             className="tsmm-card",
                             style={"padding": "12px"},

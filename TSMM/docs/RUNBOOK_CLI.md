@@ -183,7 +183,7 @@ Audit file for all handled chat commands:
 
 Steward governance instructions:
 
-- AGENT_STEWARD_INSTRUCTIONS.md
+- docs/AGENT_STEWARD_INSTRUCTIONS.md
 
 ## 5) UI lifecycle (minimal-by-default)
 

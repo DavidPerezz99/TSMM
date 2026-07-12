@@ -1,9 +1,9 @@
 """Stop all TSMM UI apps in one command.
 
 Stops:
-- dashboard.py
-- ui.py
-- validation_dashboard.py
+- apps/dashboard.py
+- apps/ui.py
+- apps/validation_dashboard.py
 """
 
 from __future__ import annotations

@@ -192,6 +192,24 @@ class _FakeMT5MarketStopsFallback:
 
 
 class MT5AdapterTests(unittest.TestCase):
+    def test_modify_position_risk_normalizes_crossed_stop_against_live_price(self):
+        adapter = MT5Adapter({})
+        fake_mt5 = _FakeMT5MarketStopsFallback()
+        fake_mt5._positions[9101] = {
+            "ticket": 9101,
+            "sl": 0.0,
+            "tp": 4460.0,
+            "price": 4400.0,
+            "volume": 0.01,
+        }
+        adapter._mt5 = fake_mt5
+
+        out = adapter.modify_position_risk(ticket=9101, stop_loss=4401.0)
+
+        self.assertTrue(out["ok"])
+        self.assertLess(out["stop_loss"], 4399.8)
+        self.assertEqual(out["normalization"]["price"], 4399.8)
+
     def test_cancel_pending_order_uses_minimal_remove_request(self):
         adapter = MT5Adapter({})
         adapter._mt5 = _FakeMT5()

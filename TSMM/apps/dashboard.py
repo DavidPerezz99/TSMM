@@ -2,14 +2,20 @@
 TSMM Live Dashboard
 
 Run:
-    py -3.11 dashboard.py
+    py -3.11 apps/dashboard.py
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import sys
 from datetime import datetime, timedelta
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import pandas as pd
@@ -35,7 +41,7 @@ State = dash_mod.State
 go = plotly_go
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(PROJECT_ROOT)
 TRADING_CFG_PATH = os.environ.get("TRADING_CONFIG_PATH", os.path.join(BASE_DIR, "config", "trading_agent.yaml"))
 
 
@@ -302,7 +308,7 @@ def _update_master_from_tiingo(master_table_path: str, symbol: str, rate: str, t
 cfg = _load_trading_cfg()
 dashboard_cfg = (cfg.get("dashboard") or {})
 
-app = Dash(__name__)
+app = Dash(__name__, assets_folder=str(PROJECT_ROOT / "assets"))
 app.title = "TSMM Live Dashboard"
 
 _controls_grid_style = {

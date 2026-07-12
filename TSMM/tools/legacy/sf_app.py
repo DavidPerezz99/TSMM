@@ -1,6 +1,13 @@
 import os
+from pathlib import Path
+import sys
 import yaml
 from datetime import datetime
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from utils.logger import setup_logger
 from utils.data_loader import load_data
 from models.univariate_models import train_univariate_models
@@ -12,7 +19,7 @@ relative_path = 'config/snowflake_credentials.yaml'
 data_output_path = 'data/output'
 def main():
  
-    with open("config.yaml") as f:
+    with (ROOT / "config" / "config.yaml").open(encoding="utf-8") as f:
         config = yaml.safe_load(f)
     
 

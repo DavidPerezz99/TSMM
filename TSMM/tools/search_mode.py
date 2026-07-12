@@ -14,8 +14,10 @@ from pathlib import Path
 import numpy as np
 import argparse
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add project root to path when launched as tools/search_mode.py.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from utils.logger import setup_logger
 from utils.data_loader import load_data_cached

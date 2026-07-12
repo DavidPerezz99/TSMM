@@ -133,16 +133,17 @@ def _close_reason_family(event: Dict[str, Any]) -> str:
 
 def _terminal_operation_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by_job: Dict[str, Dict[str, Any]] = {}
+    terminal_statuses = {"closed", "completed", "failed", "stopped"}
     for event in events:
         job_id = str(event.get("job_id") or "").strip()
-        if not job_id:
+        status = str(event.get("status") or "").strip().lower()
+        if not job_id or status not in terminal_statuses:
             continue
         current = by_job.get(job_id)
         if current is None or str(event.get("timestamp_utc") or "") > str(current.get("timestamp_utc") or ""):
             by_job[job_id] = event
 
-    terminal_statuses = {"closed", "completed", "failed", "stopped"}
-    return [event for event in by_job.values() if str(event.get("status") or "").strip().lower() in terminal_statuses]
+    return list(by_job.values())
 
 
 def _pattern_key(event: Dict[str, Any]) -> Tuple[str, str, str, bool, str]:

@@ -3,7 +3,13 @@
 
 import sys
 import yaml
-from hypersearch import generate_smart_experiments
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.hypersearch import generate_smart_experiments
 
 try:
     # Load configs

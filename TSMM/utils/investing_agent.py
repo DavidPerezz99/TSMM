@@ -410,8 +410,8 @@ class MT5Adapter:
         side: str,
         volume: float,
         entry: float,
-        stop_loss: float,
-        take_profit: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
         expiration_utc: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         ok, msg = self._require_mt5()
@@ -441,8 +441,8 @@ class MT5Adapter:
             "volume": float(volume),
             "type": order_type,
             "price": float(entry),
-            "sl": float(stop_loss),
-            "tp": float(take_profit),
+            "sl": float(stop_loss or 0.0),
+            "tp": float(take_profit or 0.0),
             "deviation": 20,
             "magic": 7070001,
             "comment": "TSMM programmed order",
@@ -478,8 +478,8 @@ class MT5Adapter:
         symbol: str,
         side: str,
         volume: float,
-        stop_loss: float,
-        take_profit: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
     ) -> Dict[str, Any]:
         ok, msg = self._require_mt5()
         if not ok:
@@ -510,8 +510,8 @@ class MT5Adapter:
             symbol=symbol,
             side=side,
             price=price,
-            stop_loss=float(stop_loss),
-            take_profit=float(take_profit),
+            stop_loss=float(stop_loss or 0.0),
+            take_profit=float(take_profit or 0.0),
             distance_multiplier=1.0,
         )
         effective_stop_loss = float(normalized.get("stop_loss", 0.0) or 0.0)
@@ -541,8 +541,8 @@ class MT5Adapter:
                     symbol=symbol,
                     side=side,
                     price=retry_price,
-                    stop_loss=float(stop_loss),
-                    take_profit=float(take_profit),
+                    stop_loss=float(stop_loss or 0.0),
+                    take_profit=float(take_profit or 0.0),
                     distance_multiplier=2.0,
                 )
                 retry_request = dict(request)
@@ -649,8 +649,8 @@ class MT5Adapter:
                         symbol=symbol,
                         side=side,
                         price=float(sltp_price),
-                        stop_loss=float(stop_loss),
-                        take_profit=float(take_profit),
+                        stop_loss=float(stop_loss or 0.0),
+                        take_profit=float(take_profit or 0.0),
                         distance_multiplier=4.0,
                     )
                     post_open_risk_update = self.modify_position_risk(
@@ -663,8 +663,8 @@ class MT5Adapter:
                             symbol=symbol,
                             side=side,
                             price=float(sltp_price),
-                            stop_loss=float(stop_loss),
-                            take_profit=float(take_profit),
+                            stop_loss=float(stop_loss or 0.0),
+                            take_profit=float(take_profit or 0.0),
                             distance_multiplier=8.0,
                         )
                         post_open_risk_update = self.modify_position_risk(
@@ -929,6 +929,27 @@ class MT5Adapter:
         desired_sl = float(stop_loss) if stop_loss is not None else current_sl
         desired_tp = float(take_profit) if take_profit is not None else current_tp
 
+        symbol = str(getattr(p, "symbol", "") or "")
+        position_type = int(getattr(p, "type", getattr(mt5, "POSITION_TYPE_BUY", 0)) or 0)
+        side = "buy" if position_type == int(getattr(mt5, "POSITION_TYPE_BUY", 0)) else "sell"
+        current_price = float(getattr(p, "price_current", 0.0) or 0.0)
+        tick = mt5.symbol_info_tick(symbol) if symbol else None
+        if side == "buy":
+            current_price = float(getattr(tick, "bid", 0.0) or current_price)
+        else:
+            current_price = float(getattr(tick, "ask", 0.0) or current_price)
+        normalized: Dict[str, Any] = {"skipped": True, "reason": "live_price_unavailable", "price": current_price}
+        if current_price > 0.0:
+            normalized = self._normalize_market_sltp(
+                symbol=symbol,
+                side=side,
+                price=current_price,
+                stop_loss=desired_sl,
+                take_profit=desired_tp,
+            )
+            desired_sl = float(normalized.get("stop_loss", desired_sl) or 0.0)
+            desired_tp = float(normalized.get("take_profit", desired_tp) or 0.0)
+
         if abs(desired_sl - current_sl) < 1e-9 and abs(desired_tp - current_tp) < 1e-9:
             return {
                 "ok": True,
@@ -940,7 +961,7 @@ class MT5Adapter:
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": str(getattr(p, "symbol", "") or ""),
+            "symbol": symbol,
             "position": int(ticket),
             "sl": float(desired_sl),
             "tp": float(desired_tp),
@@ -959,6 +980,7 @@ class MT5Adapter:
                 "message": f"modify risk failed retcode={retcode}",
                 "retcode": retcode,
                 "ticket": int(ticket),
+                "normalization": normalized,
             }
 
         refreshed = mt5.positions_get(ticket=int(ticket)) or []
@@ -968,6 +990,7 @@ class MT5Adapter:
             "retcode": retcode,
             "stop_loss": float(desired_sl),
             "take_profit": float(desired_tp),
+            "normalization": normalized,
             "position": self._serialize_position(refreshed[0]) if refreshed else None,
         }
 

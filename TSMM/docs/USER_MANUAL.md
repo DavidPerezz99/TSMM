@@ -12,10 +12,10 @@ TSMM trains time-series forecasting models from YAML config and produces:
 
 Main runtime entry points:
 - `app.py`: single forecasting run
-- `search_mode.py`: one experiment run (often called by hypersearch)
-- `hypersearch.py`: bulk sweep execution
-- `ui.py`: config editor UI (Dash)
-- `dashboard.py`: live dashboard (Dash)
+- `tools/search_mode.py`: one experiment run (often called by hypersearch)
+- `tools/hypersearch.py`: bulk sweep execution
+- `apps/ui.py`: config editor UI (Dash)
+- `apps/dashboard.py`: live dashboard (Dash)
 
 ## 2) Requirements
 
@@ -146,7 +146,7 @@ Runtime state files are configured in `config/trading_agent.yaml` under `trading
 Start UI:
 
 ```powershell
-python ui.py
+python apps/ui.py
 ```
 
 Open in browser:
@@ -176,7 +176,7 @@ Notes:
 Start dashboard:
 
 ```powershell
-python dashboard.py
+python apps/dashboard.py
 ```
 
 Open in browser:
@@ -219,7 +219,7 @@ python -m unittest discover -s tests -v
 ## 9) Run one search experiment
 
 ```powershell
-python search_mode.py --config config/config.yaml
+python tools/search_mode.py --config config/config.yaml
 ```
 
 This writes experiment summaries under `experiments/`.
@@ -227,8 +227,8 @@ This writes experiment summaries under `experiments/`.
 Useful flags:
 
 ```powershell
-python search_mode.py --config config/config.yaml --summary-dir experiments
-python search_mode.py --config config/config.yaml --bulk-search
+python tools/search_mode.py --config config/config.yaml --summary-dir experiments
+python tools/search_mode.py --config config/config.yaml --bulk-search
 ```
 
 ## 10) Run bulk hyperparameter search
@@ -236,13 +236,13 @@ python search_mode.py --config config/config.yaml --bulk-search
 Example:
 
 ```powershell
-python hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 2
+python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 2
 ```
 
 If memory is limited:
 
 ```powershell
-python hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 1
+python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 1
 ```
 
 ## 11) Live data loop
@@ -266,7 +266,7 @@ python scripts/live_data_loop.py --config config/config.yaml --every-seconds 60
 3. Run `python app.py`.
 4. Check generated files in `reports/`.
 5. Run validator/tests before any serious experiment or deployment.
-6. Use `search_mode.py` and `hypersearch.py` when tuning parameters.
+6. Use `tools/search_mode.py` and `tools/hypersearch.py` when tuning parameters.
 
 ## 13) Troubleshooting
 
@@ -299,10 +299,11 @@ pip install -r requirements.txt
 ## 14) File map (quick reference)
 
 - `app.py`: main forecasting pipeline
-- `ui.py`: config editor UI
-- `dashboard.py`: live dashboard
-- `search_mode.py`: single experiment run
-- `hypersearch.py`: bulk sweep engine
+- `apps/ui.py`: config editor UI
+- `apps/dashboard.py`: live dashboard
+- `apps/validation_dashboard.py`: agent validation dashboard
+- `tools/search_mode.py`: single experiment run
+- `tools/hypersearch.py`: bulk sweep engine
 - `scripts/validate_source_dataset.py`: disruption validation from source data
 - `scripts/run_validation_suite.py`: unit tests + source validation
 - `config/config.yaml`: main forecasting config

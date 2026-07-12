@@ -91,6 +91,14 @@ risk:
 execution:
   symbol: XAUUSD
   default_volume: 0.01
+  delayed_stop_loss:
+    enabled: false
+    allowed_conviction_modes:
+    - no_sl
+    min_conviction: 0.8
+    max_volume_multiplier: 1.0
+    max_unprotected_seconds: 900
+    max_unprotected_adverse_pct: 0.25
   market_schedule:
     timezone: America/Bogota
     max_wait_seconds: 7200

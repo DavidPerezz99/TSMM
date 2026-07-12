@@ -1540,6 +1540,98 @@ def _should_stop(output_dir: str, trading_cfg: Dict[str, Any], job_id: Optional[
     return os.path.exists(_stop_flag_path(output_dir, trading_cfg, job_id))
 
 
+def _delayed_stop_loss_cfg(trading_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    exec_cfg = (trading_cfg.get("execution") or {}) if isinstance(trading_cfg, dict) else {}
+    cfg = dict(exec_cfg.get("delayed_stop_loss") or {})
+    risk_cfg = (trading_cfg.get("risk") or {}) if isinstance(trading_cfg, dict) else {}
+    legacy_cfg = risk_cfg.get("delayed_stop_loss")
+    if isinstance(legacy_cfg, dict):
+        merged = dict(legacy_cfg)
+        merged.update(cfg)
+        cfg = merged
+    return cfg
+
+
+def _fallback_stop_loss_for_plan(plan: Dict[str, Any], trading_cfg: Dict[str, Any]) -> float:
+    decision = str((plan or {}).get("decision") or "").strip().lower()
+    entry = _safe_float((plan or {}).get("entry"), 0.0)
+    risk_cfg = (trading_cfg.get("risk") or {}) if isinstance(trading_cfg, dict) else {}
+    sl_pct = max(_safe_float(risk_cfg.get("stop_loss_pct", 0.8), 0.8), 0.01) / 100.0
+    if decision == "buy" and entry > 0.0:
+        return round(entry * (1.0 - sl_pct), 6)
+    if decision == "sell" and entry > 0.0:
+        return round(entry * (1.0 + sl_pct), 6)
+    return 0.0
+
+
+def _plan_requests_delayed_stop_loss(plan: Dict[str, Any], trading_cfg: Dict[str, Any]) -> bool:
+    cfg = _delayed_stop_loss_cfg(trading_cfg)
+    if not bool(cfg.get("enabled", False)):
+        return False
+
+    decision = str((plan or {}).get("decision") or "").strip().lower()
+    if decision not in {"buy", "sell"}:
+        return False
+
+    conviction = (plan.get("conviction") or {}) if isinstance(plan, dict) else {}
+    risk_mode = str(conviction.get("risk_mode") or "").strip().lower()
+    allowed_modes = cfg.get("allowed_conviction_modes") or ["no_sl"]
+    allowed = {str(item).strip().lower() for item in allowed_modes if str(item).strip()}
+    conviction_score = _safe_float(conviction.get("conviction"), 0.0)
+    min_conviction = min(max(_safe_float(cfg.get("min_conviction", 0.8), 0.8), 0.0), 1.0)
+    plan_sl = (plan or {}).get("stop_loss")
+    return (
+        risk_mode in allowed
+        and conviction_score >= min_conviction
+        and (plan_sl is None or _safe_float(plan_sl, 0.0) <= 0.0)
+    )
+
+
+def _order_volume_for_plan(plan: Dict[str, Any], trading_cfg: Dict[str, Any]) -> float:
+    exec_cfg = (trading_cfg.get("execution") or {}) if isinstance(trading_cfg, dict) else {}
+    default_volume = max(_safe_float(exec_cfg.get("default_volume", 0.01), 0.01), 0.0)
+    requested_volume = max(_safe_float((plan or {}).get("volume", default_volume), default_volume), 0.0)
+    if not _plan_requests_delayed_stop_loss(plan, trading_cfg):
+        return requested_volume
+
+    cfg = _delayed_stop_loss_cfg(trading_cfg)
+    max_multiplier = max(_safe_float(cfg.get("max_volume_multiplier", 1.0), 1.0), 0.0)
+    return min(requested_volume, default_volume * max_multiplier)
+
+
+def _order_risk_levels_for_plan(plan: Dict[str, Any], trading_cfg: Dict[str, Any]) -> Tuple[float, float, Dict[str, Any]]:
+    delayed = _plan_requests_delayed_stop_loss(plan, trading_cfg)
+    stop_loss = _safe_float((plan or {}).get("stop_loss"), 0.0)
+    take_profit = _safe_float((plan or {}).get("take_profit"), 0.0)
+    fallback_stop = _fallback_stop_loss_for_plan(plan, trading_cfg)
+
+    if delayed:
+        return 0.0, take_profit, {
+            "mode": "delayed_protection",
+            "initial_broker_stop_loss": 0.0,
+            "planned_stop_loss": stop_loss if stop_loss > 0.0 else fallback_stop,
+            "take_profit": take_profit,
+            "reason": "delayed_stop_loss_enabled",
+        }
+
+    if stop_loss <= 0.0 and fallback_stop > 0.0:
+        return fallback_stop, take_profit, {
+            "mode": "standard",
+            "initial_broker_stop_loss": fallback_stop,
+            "planned_stop_loss": fallback_stop,
+            "take_profit": take_profit,
+            "reason": "fallback_stop_loss_applied",
+        }
+
+    return stop_loss, take_profit, {
+        "mode": "standard",
+        "initial_broker_stop_loss": stop_loss,
+        "planned_stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "reason": "plan_stop_loss_applied",
+    }
+
+
 def _place_programmed_order(
     adapter: MT5Adapter,
     app_config: Dict[str, Any],
@@ -1549,13 +1641,14 @@ def _place_programmed_order(
 ) -> Dict[str, Any]:
     exec_cfg = (trading_cfg.get("execution") or {})
     symbol = str(exec_cfg.get("symbol") or app_config.get("symbol") or "XAUUSD")
+    stop_loss, take_profit, _risk_meta = _order_risk_levels_for_plan(plan, trading_cfg)
     return adapter.place_programmed_order(
         symbol=symbol,
         side=str(plan.get("decision", "hold")).lower(),
-        volume=float(plan.get("volume", exec_cfg.get("default_volume", 0.01))),
+        volume=_order_volume_for_plan(plan, trading_cfg),
         entry=float(plan.get("entry", 0.0)),
-        stop_loss=float(plan.get("stop_loss", 0.0)),
-        take_profit=float(plan.get("take_profit", 0.0)),
+        stop_loss=stop_loss,
+        take_profit=take_profit,
         expiration_utc=expiration_utc,
     )
 
@@ -3290,6 +3383,8 @@ def _build_agent_b_management_plan(
         "consensus_score": float(score),
         "close_threshold": float(close_threshold),
         "recommendation": recommendation,
+        "should_close": bool(should_close),
+        "close_reason": f"mode_b_consensus_close({consensus},{score:.3f})" if should_close else "",
         "rationale": rationale,
         "base_deadline_utc": _iso(base_deadline),
         "extension_approved": bool(extension_approved),
@@ -3438,8 +3533,6 @@ def _agent_b_risk_adjustment(
     breakeven_activation_ratio = float(trailing_cfg.get("breakeven_activation_ratio", 0.75) or 0.75)
     breakeven_activation_move = max(base_sl_distance * breakeven_activation_ratio, trail_gap)
     favorable_move = current_price - entry if side == "buy" else entry - current_price
-    if favorable_move <= min_delta:
-        return None
 
     recommendation = str(current_plan.get("recommendation") or "").lower()
     risk_recommendation = recommendation
@@ -3458,6 +3551,55 @@ def _agent_b_risk_adjustment(
     desired_tp = current_tp if current_tp is not None else base_tp
     actions: list[str] = []
     reasons: list[str] = []
+
+    delayed_cfg = _delayed_stop_loss_cfg(trading_cfg)
+    protection_meta = (base_plan.get("stop_loss_protection") or state.get("stop_loss_protection") or {}) if isinstance(state, dict) else {}
+    delayed_active = (
+        bool(delayed_cfg.get("enabled", False))
+        and current_sl is None
+        and (
+            str(protection_meta.get("mode") or "").strip().lower() == "delayed_protection"
+            or _plan_requests_delayed_stop_loss(base_plan, trading_cfg)
+        )
+    )
+    if delayed_active:
+        age_seconds = 0.0
+        started_raw = str(state.get("agent_b_started_at") or state.get("started_at") or "").strip()
+        try:
+            if started_raw:
+                age_seconds = max((_now_utc() - datetime.strptime(started_raw, "%Y-%m-%d %H:%M:%S")).total_seconds(), 0.0)
+        except Exception:
+            age_seconds = 0.0
+        max_unprotected_seconds = max(_safe_float(delayed_cfg.get("max_unprotected_seconds", 900), 900), 1.0)
+        max_adverse_pct = max(_safe_float(delayed_cfg.get("max_unprotected_adverse_pct", 0.25), 0.25), 0.01)
+        adverse_move = max((entry - current_price) if side == "buy" else (current_price - entry), 0.0)
+        adverse_pct = (adverse_move / entry) * 100.0 if entry > 0.0 else 0.0
+        planned_stop = _safe_float(protection_meta.get("planned_stop_loss"), 0.0)
+        if planned_stop <= 0.0:
+            planned_stop = _fallback_stop_loss_for_plan(base_plan, trading_cfg)
+        attach_due_to_time = age_seconds >= max_unprotected_seconds
+        attach_due_to_adverse = adverse_pct >= max_adverse_pct
+        attach_due_to_defense = risk_recommendation in {"monitor_closely", "prepare_defensive_exit"}
+        if planned_stop > 0.0 and (attach_due_to_time or attach_due_to_adverse or attach_due_to_defense):
+            out: Dict[str, Any] = {
+                "action": "attach_delayed_stop_loss",
+                "rationale": (
+                    "attached delayed stop loss after "
+                    f"unprotected_seconds={int(age_seconds)}, adverse_pct={adverse_pct:.3f}, "
+                    f"risk_recommendation={risk_recommendation}"
+                ),
+                "favorable_move": round(float(favorable_move), 6),
+                "breakeven_activation_move": round(float(breakeven_activation_move), 6),
+                "previous_stop_loss": current_sl,
+                "previous_take_profit": current_tp,
+                "stop_loss": round(float(planned_stop), 6),
+            }
+            if desired_tp is not None:
+                out["take_profit"] = round(float(desired_tp), 6)
+            return out
+
+    if favorable_move <= min_delta:
+        return None
 
     if risk_recommendation in {"monitor_closely", "prepare_defensive_exit"}:
         if favorable_move >= breakeven_activation_move:
@@ -3536,6 +3678,8 @@ def _agent_b_risk_adjustment(
         "rationale": "; ".join(reasons),
         "favorable_move": round(float(favorable_move), 6),
         "breakeven_activation_move": round(float(breakeven_activation_move), 6),
+        "previous_stop_loss": current_sl,
+        "previous_take_profit": current_tp,
     }
     if desired_sl is not None:
         out["stop_loss"] = round(float(desired_sl), 6)
@@ -3567,6 +3711,49 @@ def _agent_b_plan_changed(previous: Optional[Dict[str, Any]], current: Dict[str,
     prev_tp = float(prev_adj.get("take_profit", 0.0) or 0.0)
     curr_tp = float(curr_adj.get("take_profit", 0.0) or 0.0)
     return abs(prev_tp - curr_tp) >= 0.05
+
+
+def _agent_b_risk_adjustment_signature(risk_adjustment: Dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "action": risk_adjustment.get("action"),
+            "stop_loss": risk_adjustment.get("stop_loss"),
+            "take_profit": risk_adjustment.get("take_profit"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _apply_agent_b_risk_adjustment(
+    adapter: MT5Adapter,
+    state: Dict[str, Any],
+    pos_ticket: int,
+    risk_adjustment: Dict[str, Any],
+) -> Dict[str, Any]:
+    signature = _agent_b_risk_adjustment_signature(risk_adjustment)
+    previous = state.get("last_risk_adjustment") if isinstance(state.get("last_risk_adjustment"), dict) else {}
+    previous_result = previous.get("result") if isinstance(previous.get("result"), dict) else {}
+    already_applied = bool(previous_result.get("ok", False)) and signature == str(previous.get("signature") or "")
+    if already_applied:
+        return {"attempted": False, "signature": signature, "result": previous_result}
+
+    modify_res = adapter.modify_position_risk(
+        pos_ticket,
+        stop_loss=risk_adjustment.get("stop_loss"),
+        take_profit=risk_adjustment.get("take_profit"),
+    )
+    state["last_risk_adjustment"] = {
+        "timestamp_utc": _iso(_now_utc()),
+        "signature": signature,
+        "action": risk_adjustment.get("action"),
+        "stop_loss": risk_adjustment.get("stop_loss"),
+        "take_profit": risk_adjustment.get("take_profit"),
+        "previous_stop_loss": risk_adjustment.get("previous_stop_loss"),
+        "previous_take_profit": risk_adjustment.get("previous_take_profit"),
+        "result": modify_res,
+    }
+    return {"attempted": True, "signature": signature, "result": modify_res}
 
 
 def _maybe_llm_assist(trading_cfg: Dict[str, Any], prompt: str) -> Dict[str, Any]:
@@ -4221,7 +4408,6 @@ def _launch_followup_agent_a_start(
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_JOB_ID", None)
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_CONFIG_PATH", None)
     env.pop("TSMM_ACCOUNT_MIRROR_SOURCE_PROFILE", None)
-    if os.name == "nt" and len(sys.executable) > 0:
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -4462,6 +4648,47 @@ def _run_agent_b_loop(
                     return state
                 state["last_pending_close_retry_at"] = _iso(_now_utc())
 
+            fail_safe_plan = {
+                "position_side": side,
+                "recommendation": "maintain_position",
+                "consensus_score": 0.0,
+                "close_threshold": close_threshold,
+            }
+            fail_safe_adjustment = _agent_b_risk_adjustment(
+                state=state,
+                position=live_position,
+                current_plan=fail_safe_plan,
+                trading_cfg=trading_cfg,
+            )
+            if fail_safe_adjustment and fail_safe_adjustment.get("action") == "attach_delayed_stop_loss":
+                fail_safe_apply = _apply_agent_b_risk_adjustment(
+                    adapter=adapter,
+                    state=state,
+                    pos_ticket=pos_ticket,
+                    risk_adjustment=fail_safe_adjustment,
+                )
+                fail_safe_result = fail_safe_apply.get("result") or {}
+                if fail_safe_result.get("ok") and isinstance(fail_safe_result.get("position"), dict):
+                    state["position"] = fail_safe_result.get("position")
+                    live_position = fail_safe_result.get("position")
+                if fail_safe_apply.get("attempted"):
+                    if fail_safe_result.get("ok") and not fail_safe_result.get("skipped"):
+                        mirror_res = _mirror_agent_b_position_action(
+                            action="risk_update",
+                            output_dir=output_dir,
+                            source_trading_cfg=trading_cfg,
+                            source_state=state,
+                            source_job_id=job_id,
+                            risk_adjustment=fail_safe_adjustment,
+                        )
+                        state["last_risk_adjustment"]["mirror_result"] = mirror_res
+                    logger.warning(
+                        "Agent B delayed-stop fail-safe attempted action=%s ok=%s",
+                        fail_safe_adjustment.get("action"),
+                        bool(fail_safe_result.get("ok", False)),
+                    )
+                    _save_job_state(output_dir, trading_cfg, state_file, state)
+
             data_sync = _ensure_assessment_data_fresh(trading_cfg=trading_cfg, logger=logger)
             state["last_data_sync"] = data_sync
             state["last_data_sync_at"] = _iso(now)
@@ -4534,27 +4761,14 @@ def _run_agent_b_loop(
                 )
 
             if risk_adjustment:
-                adjustment_signature = json.dumps(
-                    {
-                        "action": risk_adjustment.get("action"),
-                        "stop_loss": risk_adjustment.get("stop_loss"),
-                        "take_profit": risk_adjustment.get("take_profit"),
-                    },
-                    sort_keys=True,
-                    default=str,
+                adjustment_apply = _apply_agent_b_risk_adjustment(
+                    adapter=adapter,
+                    state=state,
+                    pos_ticket=pos_ticket,
+                    risk_adjustment=risk_adjustment,
                 )
-                last_signature = str(((state.get("last_risk_adjustment") or {}).get("signature") or ""))
-                if adjustment_signature != last_signature:
-                    modify_res = adapter.modify_position_risk(
-                        pos_ticket,
-                        stop_loss=risk_adjustment.get("stop_loss"),
-                        take_profit=risk_adjustment.get("take_profit"),
-                    )
-                    state["last_risk_adjustment"] = {
-                        "timestamp_utc": _iso(_now_utc()),
-                        "signature": adjustment_signature,
-                        "result": modify_res,
-                    }
+                if adjustment_apply.get("attempted"):
+                    modify_res = adjustment_apply.get("result") or {}
                     if modify_res.get("ok") and not modify_res.get("skipped"):
                         mirror_res = _mirror_agent_b_position_action(
                             action="risk_update",
@@ -5401,8 +5615,14 @@ def _execute_approved_order(
         strict_pending_guard_enabled = bool(tj.get("prevent_new_programmed_when_pending_exists", False))
         target_side = str(plan.get("decision", "hold")).strip().lower()
         target_entry = _safe_float(plan.get("entry"), 0.0)
-        target_volume = _safe_float(plan.get("volume", exec_cfg.get("default_volume", 0.01)), 0.01)
+        target_volume = _order_volume_for_plan(plan, trading_cfg)
         stack_policy = _intentional_same_side_stack_policy(plan, trading_cfg)
+        order_stop_loss, order_take_profit, stop_protection = _order_risk_levels_for_plan(plan, trading_cfg)
+        stop_protection["requested_volume"] = _safe_float(plan.get("volume", exec_cfg.get("default_volume", 0.01)), 0.01)
+        stop_protection["effective_volume"] = target_volume
+        plan["stop_loss_protection"] = stop_protection
+        state["plan"] = plan
+        state["stop_loss_protection"] = stop_protection
 
         def _finalize_duplicate_guard_block(blocked_order: Dict[str, Any]) -> Dict[str, Any]:
             dedup_payload = dict(blocked_order.get("dedup") or {})
@@ -5552,9 +5772,9 @@ def _execute_approved_order(
             return adapter.place_market_order(
                 symbol=schedule_symbol,
                 side=str(plan.get("decision", "hold")).lower(),
-                volume=float(plan.get("volume", exec_cfg.get("default_volume", 0.01))),
-                stop_loss=float(plan.get("stop_loss", 0.0)),
-                take_profit=float(plan.get("take_profit", 0.0)),
+                volume=target_volume,
+                stop_loss=order_stop_loss,
+                take_profit=order_take_profit,
             )
 
         order_res = _submit_order_attempt()
