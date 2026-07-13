@@ -11,6 +11,7 @@ built by utils.investing_agent._build_endpoint_payloads.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Tuple
@@ -38,7 +39,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.investing_agent import _discover_endpoint_specs
+from utils.investing_agent import _discover_endpoint_specs, _latest_inference_window
+from utils.recursive_inference import recursive_forecast_matrix
 
 TRADING_CFG_PATH = Path(os.environ.get("TRADING_CONFIG_PATH", str(ROOT / "config" / "trading_agent.yaml")))
 MODEL_DIR = ROOT / "model_files"
@@ -59,6 +61,8 @@ class LoadedModel:
         self.spec = spec
         self.model_path = model_path
         self.artifacts_path = artifacts_path
+        self.model_mtime_ns = model_path.stat().st_mtime_ns
+        self.artifacts_mtime_ns = artifacts_path.stat().st_mtime_ns if artifacts_path and artifacts_path.exists() else None
         self.model = joblib.load(model_path)
         artifacts: Dict[str, Any] = {}
         if artifacts_path and artifacts_path.exists():
@@ -142,6 +146,7 @@ def _load_spec_from_config(timeframe: str, config_path: str, fallback: Dict[str,
                 "r2": spec.get("r2"),
                 "n_steps": int(cfg.get("n_steps", spec.get("n_steps", 1)) or 1),
                 "m_steps": int(cfg.get("m_steps", spec.get("m_steps", 1)) or 1),
+                "horizon": int(cfg.get("horizon", spec.get("horizon", cfg.get("m_steps", 1))) or 1),
                 "input_features": list(cfg.get("input_features") or spec.get("input_features") or []),
                 "target_features": list(cfg.get("target_features") or spec.get("target_features") or []),
                 "target_col": str(cfg.get("target_col") or spec.get("target_col") or "HIGH"),
@@ -188,12 +193,20 @@ def _get_loaded_model(timeframe: str, payload: PredictPayload) -> LoadedModel | 
 
     cache_key = _spec_cache_key(spec)
     cached = LOADED_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     m_path, a_path = _resolve_model_paths(spec)
     if not m_path or not m_path.exists():
         return None
+
+    model_mtime_ns = m_path.stat().st_mtime_ns
+    artifacts_mtime_ns = a_path.stat().st_mtime_ns if a_path and a_path.exists() else None
+    if (
+        cached is not None
+        and cached.model_path == m_path
+        and cached.artifacts_path == a_path
+        and cached.model_mtime_ns == model_mtime_ns
+        and cached.artifacts_mtime_ns == artifacts_mtime_ns
+    ):
+        return cached
 
     lm = LoadedModel(timeframe=timeframe, spec=spec, model_path=m_path, artifacts_path=a_path)
     LOADED_CACHE[cache_key] = lm
@@ -232,52 +245,79 @@ def _predict_with_loaded(lm: LoadedModel, rows: List[Dict[str, Any]]) -> Dict[st
     spec = lm.spec
     n_steps = int(spec.get("n_steps", 1) or 1)
     m_steps = int(spec.get("m_steps", 1) or 1)
+    forecast_steps = int(spec.get("horizon", m_steps) or m_steps)
     feats = [str(c) for c in (spec.get("input_features") or [])]
-    min_need = n_steps + m_steps
-    if len(rows) < min_need:
-        raise ValueError(f"insufficient_rows: need={min_need} got={len(rows)}")
+    if len(rows) < n_steps:
+        raise ValueError(f"insufficient_rows: need={n_steps} got={len(rows)}")
 
-    # Align the input window to match training's sequence construction:
-    # training sequences use X of shape (n_steps, n_feats) whose target y
-    # begins at position i+n_steps.  For inference we offset by -m_steps so
-    # the most-recent-available datum is the *target* of the implicit
-    # training window, not part of the input.
-    tail = rows[-(n_steps + m_steps):-m_steps] if len(rows) >= n_steps + m_steps else rows[-n_steps:]
+    # Training maps n_steps observations to m_steps future outputs. At
+    # inference time the input must therefore be the newest n_steps rows.
+    tail = _latest_inference_window(rows, n_steps)
     x2 = np.array([[float(r.get(c, 0.0) or 0.0) for c in feats] for r in tail], dtype=np.float64)
 
     model_name = str(spec.get("model") or "").strip().lower()
-    if model_name == "nbeats":
-        x = x2.reshape(1, -1)
-        if lm.scaler_x is not None:
-            x = lm.scaler_x.transform(x)
-        if torch is None:
-            raise RuntimeError(f"torch_unavailable:{_TORCH_IMPORT_ERROR}")
-        xt = torch.tensor(x, dtype=torch.float32)
-        with torch.no_grad():
-            yp = lm.model(xt).cpu().numpy()
-    else:
-        x = x2
-        if lm.scaler_x is not None:
-            x = lm.scaler_x.transform(x)
-        x = x.reshape(1, -1)
-        yp = lm.model.predict(x)
+    target_features = [str(value) for value in (spec.get("target_features") or ["y_diff"])]
+    target_col = str(spec.get("target_col") or "HIGH")
 
-    y = np.asarray(yp)
-    if lm.scaler_y is not None:
-        y = lm.scaler_y.inverse_transform(y)
+    def predict_window(window: np.ndarray) -> np.ndarray:
+        if model_name == "nbeats":
+            model_input = window.reshape(1, -1)
+            if lm.scaler_x is not None:
+                model_input = lm.scaler_x.transform(model_input)
+            if torch is None:
+                raise RuntimeError(f"torch_unavailable:{_TORCH_IMPORT_ERROR}")
+            tensor = torch.tensor(model_input, dtype=torch.float32)
+            with torch.no_grad():
+                prediction = lm.model(tensor).cpu().numpy()
+        else:
+            model_input = window
+            if lm.scaler_x is not None:
+                model_input = lm.scaler_x.transform(model_input)
+            prediction = lm.model.predict(model_input.reshape(1, -1))
+        prediction = np.asarray(prediction)
+        if lm.scaler_y is not None:
+            prediction = lm.scaler_y.inverse_transform(prediction)
+        return prediction.reshape(-1, len(target_features))
 
-    y_flat = y.reshape(-1)
-    lead = float(y_flat[0]) if y_flat.size else 0.0
+    rolling_windows = [int(value) for value in (spec.get("rolling_windows") or [2, 7, 30, 60])]
+    y_matrix = recursive_forecast_matrix(
+        predict_window=predict_window,
+        initial_window=x2,
+        steps=forecast_steps,
+        m_steps=m_steps,
+        input_features=feats,
+        target_features=target_features,
+        target_col=target_col,
+        max_window=max(rolling_windows + [1]),
+    )
+    feature_horizons = {
+        target: [float(value) for value in y_matrix[:, idx].tolist()]
+        for idx, target in enumerate(target_features)
+    }
+    primary_target = "y_diff" if "y_diff" in feature_horizons else target_features[0]
+    horizon = feature_horizons[primary_target]
+    lead = float(horizon[0]) if horizon else 0.0
     sig = "buy" if lead > 0 else ("sell" if lead < 0 else "hold")
     conf = _confidence_from_rows(rows, lead)
 
     return {
         "signal": sig,
         "confidence": conf,
+        "inference_strength": conf,
         "forecast_sign": lead,
         "prediction": lead,
+        "horizon": horizon,
+        "target_feature": primary_target,
+        "feature_horizons": feature_horizons,
+        "configured_horizon_steps": forecast_steps,
+        "model_output_steps": m_steps,
         "timeframe": lm.timeframe,
         "model": model_name,
+        "r2_train": spec.get("r2"),
+        "data_as_of_utc": str((rows[-1] or {}).get("DATE") or "") if rows else "",
+        "input_window_start_utc": str((tail[0] or {}).get("DATE") or "") if tail else "",
+        "input_window_end_utc": str((tail[-1] or {}).get("DATE") or "") if tail else "",
+        "inference_generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "model_path": str(lm.model_path),
         "artifacts_path": str(lm.artifacts_path) if lm.artifacts_path else None,
     }

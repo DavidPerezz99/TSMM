@@ -53,6 +53,19 @@ Read these files before changing that behavior:
 - `utils/trading_job.py`
 - `utils/investing_agent.py`
 
+`scripts/full_horizon_report.py` is a recurring inference path, not a training
+report. Keep its market refresh, live cache-tail merge, latest-`n_steps` input
+selection, atomic output, and freshness metadata intact. `m_steps` is the number
+of future outputs and must never be used to offset the inference input window.
+`horizon` is the requested future path length; when it exceeds `m_steps`, use
+`utils/recursive_inference.py` to recursively produce every step. Do not flatten
+auxiliary target features into the primary time horizon or reduce the configured
+six-step path to the model's one-step output.
+Keep `r2_train`, `inference_strength`, and `r2_live_rolling` semantically
+separate. Live R2 must use only matured `y_diff` forecasts matched to completed
+future candles. Preserve both lineage-level rolling R2 across retrains and the
+separate exact-artifact metric.
+
 ## Verification
 
 After structural changes, verify that no stale paths remain and run at least:

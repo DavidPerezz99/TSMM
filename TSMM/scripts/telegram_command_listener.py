@@ -4804,6 +4804,8 @@ def run_listener(trading_config_path: Path) -> int:
     poll_seconds = max(int(lcfg.get("poll_seconds", 3) or 3), 1)
     progress_interval_sec = max(int(lcfg.get("latest_request_status_interval_seconds", 120) or 120), 30)
     active_jobs_interval_sec = max(int(lcfg.get("active_jobs_status_interval_seconds", 600) or 600), 60)
+    inference_report_enabled = bool(lcfg.get("inference_report_enabled", True))
+    inference_report_interval_sec = max(int(lcfg.get("inference_report_interval_seconds", 300) or 300), 60)
     auto_resume_enabled = bool(lcfg.get("auto_resume_waiting_jobs_enabled", True))
     auto_resume_interval_sec = max(int(lcfg.get("auto_resume_waiting_jobs_interval_seconds", 60) or 60), 15)
     autonomy_cfg = _autonomy_cfg(trading_cfg)
@@ -4834,6 +4836,8 @@ def run_listener(trading_config_path: Path) -> int:
             auto_resume_interval_sec = max(int(lcfg.get("auto_resume_waiting_jobs_interval_seconds", 60) or 60), 15)
             progress_interval_sec = max(int(lcfg.get("latest_request_status_interval_seconds", 120) or 120), 30)
             active_jobs_interval_sec = max(int(lcfg.get("active_jobs_status_interval_seconds", 600) or 600), 60)
+            inference_report_enabled = bool(lcfg.get("inference_report_enabled", True))
+            inference_report_interval_sec = max(int(lcfg.get("inference_report_interval_seconds", 300) or 300), 60)
             autonomy_cfg = _autonomy_cfg(trading_cfg)
             autonomy_enabled = bool(autonomy_cfg.get("enabled", False))
             autonomy_interval_sec = max(int(autonomy_cfg.get("scan_interval_seconds", 600) or 600), 60)
@@ -5245,9 +5249,10 @@ def run_listener(trading_config_path: Path) -> int:
                     _send_to_chat_ids(trading_cfg, target_chat_ids, digest_msg, allow_agent_mode=True)
                 next_active_jobs_at = time.time() + float(active_jobs_interval_sec)
 
-            # Periodic inference refresh (~5 min) when no active position
-            if time.time() >= next_inference_at and not weekend_quiet_mode:
-                next_inference_at = time.time() + 300
+            # Periodic live inference report. The report refreshes market data,
+            # then predicts from the newest n_steps without retraining.
+            if inference_report_enabled and time.time() >= next_inference_at and not weekend_quiet_mode:
+                next_inference_at = time.time() + float(inference_report_interval_sec)
                 try:
                     _run_cmd_async(
                         [sys.executable or 'python', 'scripts/full_horizon_report.py'],

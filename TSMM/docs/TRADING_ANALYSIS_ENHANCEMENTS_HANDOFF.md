@@ -225,6 +225,71 @@ Do not enable delayed protection in production yet.
 - The root temporary files are gone, but generated reports and runtime evidence
   must remain under their ignored data directories.
 
+## Full-Horizon Inference Freshness
+
+`scripts/full_horizon_report.py` was corrected after the original enhancement
+commit to ensure its recurring report is independent of model retraining.
+
+Two stale-data defects were found:
+
+- `query_ohlc()` preferred materialized timeframe cache tables that were built
+  during retraining but never refreshed with new minute rows;
+- inference discarded the newest `m_steps` rows, incorrectly treating forecast
+  horizon length as an input lag.
+
+The market query now merges cached history with a live aggregation beginning at
+the cache's final bucket. Inference always consumes the newest `n_steps`; the
+model still emits `m_steps` future values. The local endpoint uses the same
+window rule and returns its complete horizon plus inference timestamps.
+
+The primary Telegram listener launches the report every 300 seconds by default
+through `listener.inference_report_interval_seconds`. The FTMO profile disables
+its duplicate launcher so both listeners do not write the same report at once.
+
+Each report now records:
+
+- report start/completion time;
+- minute-source `data_as_of` time;
+- timeframe bucket and input-window bounds;
+- an input fingerprint;
+- model path and model modification time;
+- dynamic confidence and static training R2 semantics;
+- market-refresh result.
+
+The report's `horizon` is the configured future path, not the flattened set of
+target features from one model call. Production configs currently use
+`m_steps: 1` and `horizon: 6`, so inference recursively generates six candles:
+each predicted `y_diff` and auxiliary target feature is fed into the next input
+window. `feature_horizons` preserves the same six-step path for every predicted
+target feature. Keep the report and local signal endpoint on the shared
+`utils/recursive_inference.py` implementation.
+
+Online inference evaluation is persisted in
+`reports/runtime/full_horizon_metrics.sqlite`. Every issued primary `y_diff`
+forecast is matured only after its corresponding future timeframe candle is
+complete. The report exposes:
+
+- `r2_train`: static R2 from the newest completed training evaluation;
+- `inference_strength`: dynamic forecast-magnitude versus volatility heuristic;
+- `r2_live_rolling`: rolling R2 from matured live forecasts;
+- `r2_live_samples`: distinct origin candles currently supporting live R2;
+- `r2_live_delta`: movement from the previous metric snapshot.
+
+Primary rolling live R2 follows the model lineage (timeframe, family, and model
+type) across retraining generations so higher timeframes can accumulate enough
+samples despite daily retraining. `r2_live_current_model` and its sample count
+show the exact current artifact separately. Repeated five-minute inferences
+within one partial timeframe candle are retained for audit, but only the latest
+forecast from that origin candle is included in R2 to avoid overweighting one
+realized outcome. The current defaults require 10 matured origin candles and use
+a 100-sample window.
+
+Writes are atomic, and `reports/runtime/full_horizon_report_status.json` records
+running, completed, or failed state. R2 remains static until a newer completed
+training evaluation exists. Confidence is recomputed every inference, although
+its numeric value may repeat when forecast magnitude and recent volatility have
+not materially changed.
+
 ## Recommended Next Work
 
 1. Build per-trade lifecycle records joining Agent A plan, order submission,

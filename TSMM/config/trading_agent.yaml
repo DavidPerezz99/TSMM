@@ -332,6 +332,8 @@ telegram_listener:
   - ui
   - resource
   poll_seconds: 3
+  inference_report_enabled: true
+  inference_report_interval_seconds: 300
   trading_start_state_wait_seconds: 3.0
   latest_request_status_interval_seconds: 120
   active_jobs_status_interval_seconds: 300
@@ -367,6 +369,13 @@ resource_guard:
   cooldown_seconds: 900
   disable_endpoint_on_relief: false
   disable_uis_on_relief: true
+inference_performance:
+  enabled: true
+  database_path: reports/runtime/full_horizon_metrics.sqlite
+  rolling_window_samples: 100
+  min_samples: 10
+  forecast_retention_days: 180
+  snapshot_retention_days: 365
 boot_recovery:
   enabled: true
   restart_listener: true

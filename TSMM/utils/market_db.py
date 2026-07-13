@@ -75,6 +75,75 @@ def _aggregate_recent_minutes(df: pd.DataFrame, timeframe_minutes: int) -> pd.Da
     return grouped[["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]]
 
 
+def _merge_cached_history_with_live_tail(
+    conn: sqlite3.Connection,
+    source_table: str,
+    cache_table: str,
+    timeframe_minutes: int,
+    latest_records: int,
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> pd.DataFrame:
+    """Use the materialized cache for history and rebuild its mutable tail."""
+    cache_max_row = conn.execute(f"SELECT MAX(DATE) FROM {cache_table}").fetchone()
+    cache_boundary = str((cache_max_row or [None])[0] or "").strip()
+    if not cache_boundary:
+        return pd.DataFrame()
+
+    cache_where = ["DATE < ?"]
+    cache_params: list[object] = [cache_boundary]
+    if start_date:
+        cache_where.append("DATE >= ?")
+        cache_params.append(start_date)
+    if end_date:
+        cache_where.append("DATE <= ?")
+        cache_params.append(end_date)
+    cached = pd.read_sql_query(
+        f"""
+        SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
+        FROM {cache_table}
+        WHERE {' AND '.join(cache_where)}
+        ORDER BY DATE DESC
+        LIMIT ?
+        """,
+        conn,
+        params=cache_params + [int(max(latest_records, 1))],
+    )
+
+    live_where = ["DATE >= ?"]
+    live_params: list[object] = [cache_boundary]
+    if end_date:
+        live_where.append("DATE <= ?")
+        live_params.append(end_date)
+    live_minutes = pd.read_sql_query(
+        f"""
+        SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
+        FROM {source_table}
+        WHERE {' AND '.join(live_where)}
+        ORDER BY DATE
+        """,
+        conn,
+        params=live_params,
+    )
+    live = _aggregate_recent_minutes(live_minutes, timeframe_minutes)
+
+    combined = pd.concat([cached, live], ignore_index=True)
+    if combined.empty:
+        return combined
+    combined["DATE"] = pd.to_datetime(combined["DATE"], errors="coerce")
+    combined = combined.dropna(subset=["DATE"])
+    if start_date:
+        combined = combined[combined["DATE"] >= pd.to_datetime(start_date)]
+    if end_date:
+        combined = combined[combined["DATE"] <= pd.to_datetime(end_date)]
+    return (
+        combined.sort_values("DATE")
+        .drop_duplicates(subset=["DATE"], keep="last")
+        .tail(int(max(latest_records, 1)))
+        .reset_index(drop=True)
+    )
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -586,14 +655,15 @@ def query_ohlc(
         ).fetchone()
 
         if row:
-            sql = f"""
-                SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
-                FROM {table_name}
-                WHERE {where_sql}
-                ORDER BY DATE DESC
-                LIMIT ?
-            """
-            df = pd.read_sql_query(sql, conn, params=params + [int(max(latest_records, 1))])
+            df = _merge_cached_history_with_live_tail(
+                conn=conn,
+                source_table=source_table,
+                cache_table=table_name,
+                timeframe_minutes=tf,
+                latest_records=latest_records,
+                start_date=start_date,
+                end_date=end_date,
+            )
         else:
             # Avoid write-time cache builds and expensive grouped SQL over the
             # full minute table. Read only the recent minute slice via the DATE

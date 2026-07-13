@@ -1899,6 +1899,8 @@ def _discover_endpoint_specs(
             best.update(
                 {
                     "n_steps": int(cfg.get("n_steps", 1) or 1),
+                    "m_steps": int(cfg.get("m_steps", 1) or 1),
+                    "horizon": int(cfg.get("horizon", cfg.get("m_steps", 1)) or 1),
                     "input_features": list(cfg.get("input_features") or []),
                     "target_features": list(cfg.get("target_features") or []),
                     "target_col": str(cfg.get("target_col") or "HIGH"),
@@ -2024,15 +2026,13 @@ def _build_endpoint_payloads(
             payloads[tf] = {"error": f"Insufficient enriched rows for timeframe {tf}: need {n_steps}, got {len(enriched)}"}
             continue
 
-        m_steps = int(spec.get("m_steps", 1) or 1)
         needed = list(dict.fromkeys(["DATE"] + [str(c) for c in (spec.get("input_features") or [])]))
         missing = [c for c in needed if c != "DATE" and c not in enriched.columns]
         if missing:
             payloads[tf] = {"error": f"Missing engineered columns for timeframe {tf}: {missing}"}
             continue
 
-        payload_rows = n_steps + m_steps
-        rows_df = enriched[needed].tail(payload_rows).copy()
+        rows_df = enriched[needed].tail(n_steps).copy()
         rows: List[Dict[str, Any]] = []
         for _, row in rows_df.iterrows():
             item: Dict[str, Any] = {"DATE": pd.to_datetime(row["DATE"]).strftime("%Y-%m-%d %H:%M:%S")}
@@ -2053,6 +2053,12 @@ def _build_endpoint_payloads(
         }
 
     return payloads
+
+
+def _latest_inference_window(rows: Any, n_steps: int) -> Any:
+    """Select the newest feature window; forecast horizon does not offset inputs."""
+    window_size = max(int(n_steps or 1), 1)
+    return rows[-window_size:]
 
 
 def _is_local_signal_url(url: str, host: str, port: int) -> bool:
