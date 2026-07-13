@@ -11,11 +11,24 @@ weaknesses in trade selection and management while preparing a guarded version
 of delayed stop-loss protection. The delayed-stop feature is implemented but
 remains disabled by default.
 
-## Current Working Tree
+## Branch And Deployment State
 
-The changes have not been committed. Preserve unrelated user work and inspect
-`git status` before staging. The untracked `chat_sessions/` directory is not
-part of this implementation and should not be staged without explicit approval.
+The tracked implementation is on `trading-analysis-enhancements`, with no
+`codex` prefix. The original analysis, risk-management, cleanup, and repository
+organization work was committed as `5ebd11a`. Live inference freshness,
+recursive horizons, and online R2 evaluation were committed and pushed as
+`7aba69e` on 2026-07-13.
+
+At the end of that deployment, local `HEAD` and
+`origin/trading-analysis-enhancements` both resolved to `7aba69e`. The local
+signal endpoint and primary Telegram listener were restarted from that checkout
+and passed live readiness checks. Future documentation-only commits may move the
+branch tip, so always verify the deployed branch and commit rather than assuming
+this snapshot remains current.
+
+Preserve unrelated user work and inspect `git status` before staging. The
+untracked `chat_sessions/` directory is not part of this implementation and
+must not be staged, moved, or deleted without explicit approval.
 
 The pre-existing edit near `_launch_followup_agent_a_start` in
 `utils/trading_job.py` was already present before this work. Do not revert it as
@@ -289,6 +302,109 @@ running, completed, or failed state. R2 remains static until a newer completed
 training evaluation exists. Confidence is recomputed every inference, although
 its numeric value may repeat when forecast magnitude and recent volatility have
 not materially changed.
+
+## Deployment Verification
+
+The 2026-07-13 deployment used the following sequence:
+
+1. Verify `trading-analysis-enhancements` is checked out and tracks the branch
+   with the same name on `origin`.
+2. Compile all changed inference modules and run focused tests.
+3. Stage only tracked enhancement files; exclude `chat_sessions/` and runtime
+   outputs.
+4. Commit and push the enhancement branch.
+5. Confirm MT5 has zero open positions and zero pending orders before restarting
+   runtime processes.
+6. Stop the old endpoint, listener, and canceled session workers.
+7. Start `scripts/local_signal_endpoint_service.py` and
+   `scripts/telegram_command_listener.py` from the deployed checkout.
+8. Verify `/health`, Telegram network connectivity, MT5 connectivity, and a real
+   full-horizon report.
+
+The post-deployment report produced 28 successful model/family rows, zero
+errors, six future steps per row, and a healthy online evaluator. MT5 was
+authenticated with zero positions and zero pending orders. The endpoint loaded
+all seven configured timeframes. Process IDs are intentionally omitted because
+they are ephemeral.
+
+Focused verification for the inference deployment passed eight tests:
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_inference_window_freshness.py"
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_inference_performance.py"
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_market_db_multi_asset.py"
+```
+
+## Operational Health Snapshot
+
+The following findings are a point-in-time snapshot from 2026-07-13 and must be
+re-measured before making a new operational decision.
+
+Healthy components at inspection time:
+
+- market minute data was current and Tiingo refreshes were succeeding;
+- the market and inference-metrics SQLite databases passed integrity checks;
+- the endpoint, Telegram listener, Ollama, MT5 terminal, scheduled model
+  refresh, and report scheduler were running;
+- MT5 authentication succeeded and there was no live exposure;
+- the recurring report and online forecast maturation were current.
+
+Trading-quality concerns at inspection time:
+
+- only 6 of 28 latest training R2 values were positive;
+- live rolling R2 was available for 16 model/family lines and 15 were negative;
+- several retraining logs warned that the discriminator had insufficient
+  samples;
+- R2 is a regression-quality diagnostic, not direct proof of trade P/L, but the
+  breadth of negative scores is a material warning against unrestricted
+  autonomous execution.
+
+Current policy does not directly block a base 7h plan when model safeguards are
+breached. In `config/trading_agent.yaml`, both
+`mode_a.block_on_confidence_thresholds` and
+`mode_a.block_on_input_fooling_risk` are `false`. Do not claim that poor R2 by
+itself is why no entry was placed.
+
+The observed no-entry sequence was:
+
+- the London session created a programmed entry near 4018.10;
+- pending-order maintenance canceled it when refreshed consensus changed;
+- the New York session created another programmed entry near 4005.28;
+- maintenance canceled that order after another consensus invalidation;
+- `autonomous_trading.followup_enabled` was `false`, so neither cancellation
+  received a replacement entry.
+
+The practical causal chain was weak or unstable predictions, followed by a
+consensus reversal, order cancellation, and no follow-up. Model quality
+contributed indirectly by making consensus unstable.
+
+## Known Runtime Issues
+
+- `reports/runtime/trading_job_registry.json` contained hundreds of entries,
+  including temporary test-runtime paths and stale jobs. The global
+  `trading_job_state.json` also pointed at an obsolete failed job while newer
+  jobs existed. Treat active-job monitoring as unreliable until registry scope
+  and cleanup are repaired.
+- Two canceled autonomous-session workers remained alive and idle after their
+  pending orders were removed. They were stopped during deployment, but the
+  lifecycle defect remains in code: a canceled programmed order should make its
+  worker exit and close its state cleanly.
+- `scripts/recover_runtime_after_reboot.py` can resume jobs that the contaminated
+  registry labels active. Do not use it for a routine service restart until the
+  registry has been audited; restart endpoint/listener explicitly after checking
+  broker exposure.
+- The parity enforcer was launched with `config/trading_agent.yaml` as source
+  and `config/trading_agent_ftmo.yaml` as target, but both resolved to the same
+  FTMO account. It therefore compared FTMO to itself and continuously grew a
+  large no-op log. Disable it when only one account is intended, or restore a
+  genuinely distinct source account.
+- The full test suite has shared production-runtime contamination failures. Run
+  focused tests, or set an isolated runtime root before running the entire suite
+  on a machine hosting live TSMM services.
+
+No safety configuration was changed during the health audit or deployment.
+Delayed stop protection remained disabled, and model-quality blocks remained at
+their existing values.
 
 ## Recommended Next Work
 

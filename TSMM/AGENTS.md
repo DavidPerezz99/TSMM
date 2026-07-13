@@ -66,6 +66,26 @@ separate. Live R2 must use only matured `y_diff` forecasts matched to completed
 future candles. Preserve both lineage-level rolling R2 across retrains and the
 separate exact-artifact metric.
 
+The tracked deployment and operational audit are documented in
+`docs/TRADING_ANALYSIS_ENHANCEMENTS_HANDOFF.md`. Health figures in that document
+are dated snapshots, not permanent truths; re-run live checks before acting.
+Important current cautions include contaminated job-registry state, workers that
+may survive programmed-order cancellation, and a parity process that can become
+a no-op when source and target resolve to the same MT5 account.
+
+Do not use `scripts/recover_runtime_after_reboot.py` as a routine restart while
+the registry is contaminated because it may resume a stale job. Before any
+runtime restart, verify MT5 positions and pending orders directly, then restart
+only the intended services. The full test suite can also contaminate production
+runtime state unless tests use an isolated runtime root.
+
+Poor training/live R2 does not currently hard-block the base trading plan:
+`mode_a.block_on_confidence_thresholds` and
+`mode_a.block_on_input_fooling_risk` are both false. Observed missing entries
+were caused by consensus-based pending-order cancellation followed by disabled
+autonomous follow-up. Preserve that distinction when diagnosing trading
+behavior.
+
 ## Verification
 
 After structural changes, verify that no stale paths remain and run at least:
