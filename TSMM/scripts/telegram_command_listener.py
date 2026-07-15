@@ -727,6 +727,10 @@ def _autonomous_capacity_limit(trading_cfg: Dict[str, Any]) -> int:
     configured = int(autonomy.get("max_jobs_per_session", 0) or 0)
     if configured > 0:
         return configured
+    mode_a_cfg = dict(trading_cfg.get("mode_a") or {})
+    mode_a_limit = int(mode_a_cfg.get("max_operations_per_session", 0) or 0)
+    if mode_a_limit > 0:
+        return mode_a_limit
     risk_cfg = (trading_cfg.get("risk") or {})
     return max(int(risk_cfg.get("max_open_positions", 3) or 3), 1)
 
@@ -843,6 +847,11 @@ def _seconds_since(moment: datetime | None, now_utc: datetime) -> float:
 def _mode_b_supervision_active(trading_cfg: Dict[str, Any]) -> bool:
     mb_cfg = dict(trading_cfg.get("mode_b") or {})
     return bool(mb_cfg.get("enabled", False)) and bool(mb_cfg.get("manage_existing_positions", True))
+
+
+def _mode_b_can_trigger_new_entries(trading_cfg: Dict[str, Any]) -> bool:
+    mb_cfg = dict(trading_cfg.get("mode_b") or {})
+    return _mode_b_supervision_active(trading_cfg) and bool(mb_cfg.get("allow_open_new_positions", False))
 
 
 def _launch_autonomous_trading_start(
@@ -5033,7 +5042,7 @@ def run_listener(trading_config_path: Path) -> int:
                         and bool(autonomy_cfg.get("followup_enabled", True))
                         and not pending_approval
                         and session_active_jobs < session_capacity
-                        and _mode_b_supervision_active(trading_cfg)
+                        and _mode_b_can_trigger_new_entries(trading_cfg)
                         and followup_ready
                         and int(session_stats.get("followup_launches") or 0) < max_followup_launches
                         and int(session_stats.get("filtered_followups") or 0) < max_filtered_followups

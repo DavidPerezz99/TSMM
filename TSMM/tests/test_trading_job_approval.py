@@ -99,6 +99,30 @@ class TradingJobApprovalTests(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertEqual(threshold, 3)
 
+    def test_auto_created_countertrade_bypasses_followup_approval(self):
+        cfg = {
+            "approval_policy": {
+                "auto_approve_opposing_countertrade": True,
+                "auto_approve_below_agent_b_count": 0,
+            },
+            "risk": {"max_open_positions": 3},
+            "agent": {"followup_agent_a_requires_approval": True},
+        }
+
+        with patch("utils.trading_job._active_agent_b_position_count", return_value=3):
+            required, reason, count, threshold = _agent_a_approval_decision(
+                "reports",
+                cfg,
+                auto_created=True,
+                autonomous_trigger="opposing_countertrade",
+                submission_mode="market",
+            )
+
+        self.assertFalse(required)
+        self.assertEqual(reason, "opposing_countertrade")
+        self.assertEqual(count, 3)
+        self.assertEqual(threshold, 3)
+
     def test_followup_requires_approval_even_when_below_threshold(self):
         cfg = {
             "approval_policy": {"auto_approve_below_agent_b_count": 3},

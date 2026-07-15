@@ -406,6 +406,32 @@ No safety configuration was changed during the health audit or deployment.
 Delayed stop protection remained disabled, and model-quality blocks remained at
 their existing values.
 
+## Entry Throughput And Manual-Trade Ownership
+
+The 2026-07-14 entry-policy update made these behavioral changes:
+
+- auto-created opposing countertrades now evaluate their explicit auto-approval
+  policy before the generic follow-up approval rule, so they do not wait for a
+  Telegram approval when `auto_approve_opposing_countertrade` is enabled;
+- follow-up Agent A scans no longer require explicit approval in the two tracked
+  trading profiles;
+- the active profile permits three concurrent autonomous jobs per session and
+  up to three Agent B-supervised follow-up scans;
+- `mode_b.allow_open_new_positions` is now enforced by the listener and permits
+  Agent B supervision to trigger a new Agent A scan; Agent B still does not
+  submit broker orders directly;
+- autonomous follow-up plans still pass the configured success-probability,
+  confidence, confusion-matrix accuracy, input-fooling-risk, consensus, and
+  account-level risk checks before submission;
+- both profiles explicitly exclude manual and otherwise untracked broker
+  positions from automatic adoption.
+
+Manual positions are intentionally managed by the human operator. Agents must
+not attach SL/TP, rebind, close, or adopt a magic-0/unlabeled position unless the
+operator explicitly transfers that individual trade to TSMM. These policy
+changes do not modify positions or pending orders that already exist at the
+broker, and delayed stop protection remains disabled.
+
 ## Recommended Next Work
 
 1. Build per-trade lifecycle records joining Agent A plan, order submission,

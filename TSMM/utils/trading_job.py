@@ -3880,13 +3880,12 @@ def _agent_a_approval_decision(
     active_agent_b_count = _active_agent_b_position_count(output_dir, trading_cfg)
     threshold = int(policy.get("auto_approve_below_agent_b_count", 0) or 0)
 
-    if auto_created and bool(agent_cfg.get("followup_agent_a_requires_approval", False)):
-        return True, "followup_manual_approval_required", active_agent_b_count, threshold
-
     if bool(policy.get("auto_approve_mandatory_session_programmed", True)) and autonomous_trigger == "mandatory_session" and submission_mode == "programmed":
         return False, "mandatory_session_programmed", active_agent_b_count, threshold
     if bool(policy.get("auto_approve_opposing_countertrade", True)) and autonomous_trigger == "opposing_countertrade":
         return False, "opposing_countertrade", active_agent_b_count, threshold
+    if auto_created and bool(agent_cfg.get("followup_agent_a_requires_approval", False)):
+        return True, "followup_manual_approval_required", active_agent_b_count, threshold
     if threshold > 0 and active_agent_b_count < threshold:
         return False, "below_agent_b_threshold", active_agent_b_count, threshold
     if auto_created and not bool(agent_cfg.get("followup_agent_a_requires_approval", False)):

@@ -86,6 +86,20 @@ were caused by consensus-based pending-order cancellation followed by disabled
 autonomous follow-up. Preserve that distinction when diagnosing trading
 behavior.
 
+The active entry policy was expanded on 2026-07-14. Opposing countertrades are
+policy exceptions that bypass approval even when they are auto-created. The
+primary profile permits up to three concurrent autonomous jobs per session and
+up to three Agent B-supervised follow-up scans, but follow-up plans still pass
+the configured quality filters and account risk checks. Agent B does not submit
+orders itself; `mode_b.allow_open_new_positions` permits it to trigger a new
+Agent A scan through the listener.
+
+Manual broker positions are human-owned. Both trading profiles set
+`telegram_listener.adopt_manual_entries` and
+`telegram_listener.adopt_any_running_positions` to `false`. Do not adopt,
+modify, seed SL/TP on, close, or otherwise manage a position unless it is
+clearly TSMM-tagged or the user explicitly transfers ownership to TSMM.
+
 ## Verification
 
 After structural changes, verify that no stale paths remain and run at least:

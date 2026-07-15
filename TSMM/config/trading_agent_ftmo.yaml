@@ -4,14 +4,14 @@ agent:
   default_start_mode_a: true
   confirm_live_execution: true
   signal_interpretation: contrarian
-  followup_agent_a_requires_approval: true
+  followup_agent_a_requires_approval: false
   followup_agent_a_submission_mode: programmed
   approval_channels:
   - telegram
   timezone: America/Bogota
 mode_a:
   enabled: true
-  max_operations_per_session: 1
+  max_operations_per_session: 3
   allow_long: true
   allow_short: true
   selected_model: ''
@@ -47,7 +47,7 @@ agent_a_fallback:
     model: nbeats
 mode_b:
   enabled: true
-  allow_open_new_positions: false
+  allow_open_new_positions: true
   manage_existing_positions: true
   poll_seconds: 300
   allow_endpoint_signals: true
@@ -306,8 +306,8 @@ telegram_listener:
   reply_on_non_command: true
   auto_resume_waiting_jobs_enabled: true
   auto_resume_waiting_jobs_interval_seconds: 15
-  adopt_manual_entries: true
-  adopt_any_running_positions: true
+  adopt_manual_entries: false
+  adopt_any_running_positions: false
   rebind_existing_non_agent_b: true
   seed_missing_sltp_on_adopt: true
   ai_agent:
