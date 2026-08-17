@@ -16,6 +16,9 @@ Key Features:
 
 import argparse
 import asyncio
+from copy import deepcopy
+from collections import Counter
+import hashlib
 import itertools
 import json
 import os
@@ -29,6 +32,13 @@ from typing import Dict, List, Any, Optional, Iterator
 import yaml
 import numpy as np
 from utils.cache_management import clear_cache
+
+
+RESERVED_SWEEP_KEYS = {
+    'smart_generation',
+    'models_to_run',
+    'input_target_sets',
+}
 
 
 # -----------------------------------------------------------------------------
@@ -133,6 +143,8 @@ def extract_model_specific_params(sweep_cfg: Dict[str, Any]) -> Dict[str, Dict[s
     
     # Group parameters by model
     for param_key, param_value in sweep_cfg.items():
+        if param_key in RESERVED_SWEEP_KEYS:
+            continue
         if not isinstance(param_value, list):
             continue
             
@@ -164,6 +176,8 @@ def get_global_params(sweep_cfg: Dict[str, Any]) -> Dict[str, Any]:
     model_prefixes = ['nbeats.', 'svr.', 'xgboost.', 'prophet.', 'lstm.']
     
     for param_key, param_value in sweep_cfg.items():
+        if param_key in RESERVED_SWEEP_KEYS:
+            continue
         if not isinstance(param_value, list):
             continue
             
@@ -257,7 +271,7 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
             stacks_values = [stacks_params[k] for k in stacks_keys]
             
             for stacks_combo in itertools.product(*stacks_values):
-                variant = base_variant.copy()
+                variant = deepcopy(base_variant)
                 for key, value in zip(stacks_keys, stacks_combo):
                     set_nested_value(variant, key, value)
                 variants.append(variant)
@@ -268,7 +282,7 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
             blackbox_values = [blackbox_params[k] for k in blackbox_keys]
             
             for blackbox_combo in itertools.product(*blackbox_values):
-                variant = base_variant.copy()
+                variant = deepcopy(base_variant)
                 for key, value in zip(blackbox_keys, blackbox_combo):
                     set_nested_value(variant, key, value)
                 variants.append(variant)
@@ -281,7 +295,8 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
 
 def generate_smart_experiments(
     base_cfg: Dict[str, Any],
-    sweep_cfg: Dict[str, Any]
+    sweep_cfg: Dict[str, Any],
+    verbose: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     """
     Generate experiment configurations intelligently per model.
@@ -327,7 +342,9 @@ def generate_smart_experiments(
     
     # Generate experiments for each model
     experiment_count = 0
-    all_models = models_to_run.get('univariate', []) + models_to_run.get('multivariate', [])
+    all_models = list(dict.fromkeys(
+        models_to_run.get('univariate', []) + models_to_run.get('multivariate', [])
+    ))
     
     for model_name in all_models:
         # Get parameters specific to this model
@@ -336,12 +353,13 @@ def generate_smart_experiments(
         # Build valid model configuration variants
         model_variants = build_model_config_variants(model_name, model_specific)
         
-        print(f"  {model_name}: {len(model_variants)} model variants × {len(global_combinations)} global combinations")
+        if verbose:
+            print(f"  {model_name}: {len(model_variants)} model variants × {len(global_combinations)} global combinations")
         
         # Combine global and model-specific parameters
         for global_combo in global_combinations:
             for model_variant in model_variants:
-                experiment = base_cfg.copy()
+                experiment = deepcopy(base_cfg)
                 
                 # Add global parameters
                 for key, value in zip(global_keys, global_combo):
@@ -359,7 +377,7 @@ def generate_smart_experiments(
                 # Add input_target_sets if specified
                 if special_sets:
                     for rec in special_sets:
-                        exp_with_set = experiment.copy()
+                        exp_with_set = deepcopy(experiment)
                         exp_with_set.update(rec)
                         experiment_count += 1
                         yield exp_with_set
@@ -367,7 +385,8 @@ def generate_smart_experiments(
                     experiment_count += 1
                     yield experiment
     
-    print(f"\nTotal experiments generated: {experiment_count}")
+    if verbose:
+        print(f"\nTotal experiments generated: {experiment_count}")
 
 
 # -----------------------------------------------------------------------------
@@ -433,14 +452,66 @@ def generate_factorial_experiments(
         
         if special_sets:
             for rec in special_sets:
-                experiment = base_cfg.copy()
+                experiment = deepcopy(base_cfg)
                 deep_merge_dict(experiment, patch)
                 experiment.update(rec)
+                experiment['models_to_run'] = deepcopy(sweep_cfg.get('models_to_run') or {})
                 yield experiment
         else:
-            experiment = base_cfg.copy()
+            experiment = deepcopy(base_cfg)
             deep_merge_dict(experiment, patch)
+            experiment['models_to_run'] = deepcopy(sweep_cfg.get('models_to_run') or {})
             yield experiment
+
+
+def experiment_fingerprint(config: Dict[str, Any]) -> str:
+    """Return a stable identity for an effective experiment configuration."""
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def unique_experiments(experiments: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    """Yield effective configurations once, preserving generation order."""
+    seen = set()
+    for experiment in experiments:
+        snapshot = deepcopy(experiment)
+        fingerprint = experiment_fingerprint(snapshot)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        yield snapshot
+
+
+def build_sweep_plan(base_cfg: Dict[str, Any], sweep_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Calculate exact raw and unique counts without writing configuration files."""
+    if bool(sweep_cfg.get('smart_generation', True)):
+        generated = generate_smart_experiments(base_cfg, sweep_cfg, verbose=False)
+        generation_mode = 'smart'
+    else:
+        generated = generate_factorial_experiments(base_cfg, sweep_cfg)
+        generation_mode = 'legacy'
+
+    raw_count = 0
+    unique_by_hash: Dict[str, Dict[str, Any]] = {}
+    per_model = Counter()
+    for experiment in generated:
+        raw_count += 1
+        snapshot = deepcopy(experiment)
+        fingerprint = experiment_fingerprint(snapshot)
+        if fingerprint in unique_by_hash:
+            continue
+        unique_by_hash[fingerprint] = snapshot
+        models = snapshot.get('models_to_run') or {}
+        names = list(models.get('univariate') or []) + list(models.get('multivariate') or [])
+        per_model[','.join(names) if names else 'default_models'] += 1
+
+    return {
+        'generation_mode': generation_mode,
+        'raw_generated': int(raw_count),
+        'unique_experiments': int(len(unique_by_hash)),
+        'duplicates_removed': int(raw_count - len(unique_by_hash)),
+        'per_model': dict(sorted(per_model.items())),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -450,7 +521,17 @@ def generate_factorial_experiments(
 class BulkSearchEngine:
     """Engine for running bulk hyperparameter searches."""
     
-    def __init__(self, base_cfg, sweep_cfg, out_dir, sem, summary_dir=None, restart=False, experiment_timeout_sec=None):
+    def __init__(
+        self,
+        base_cfg,
+        sweep_cfg,
+        out_dir,
+        sem,
+        summary_dir=None,
+        restart=False,
+        experiment_timeout_sec=None,
+        max_experiments=None,
+    ):
         self.base_cfg = base_cfg
         self.sweep_cfg = sweep_cfg
         self.out_dir = Path(out_dir)
@@ -458,6 +539,7 @@ class BulkSearchEngine:
         self.sem = sem
         self.restart = bool(restart)
         self.experiment_timeout_sec = experiment_timeout_sec
+        self.max_experiments = int(max_experiments or 0)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.failure_log_dir = self.out_dir / "failed_logs"
@@ -580,22 +662,34 @@ class BulkSearchEngine:
         
         if use_smart:
             print("Using SMART generation (recommended)")
-            return generate_smart_experiments(self.base_cfg, self.sweep_cfg)
+            generated = generate_smart_experiments(self.base_cfg, self.sweep_cfg)
         else:
             print("WARNING: Using LEGACY factorial expansion (may generate many experiments)")
-            return generate_factorial_experiments(self.base_cfg, self.sweep_cfg)
+            generated = generate_factorial_experiments(self.base_cfg, self.sweep_cfg)
+        return unique_experiments(generated)
 
     def materialize_configs(self):
         """Generate and save experiment configuration files, or reuse existing ones."""
         existing = self._existing_cfg_paths()
         if existing:
+            if self.max_experiments and len(existing) > self.max_experiments:
+                raise RuntimeError(
+                    f"Existing session contains {len(existing)} configs, above "
+                    f"max_experiments={self.max_experiments}."
+                )
             print(f"Found {len(existing)} existing config files in {self.out_dir}; reusing for resume")
             return existing
 
+        experiments = list(self.expand_grid())
+        if self.max_experiments and len(experiments) > self.max_experiments:
+            raise RuntimeError(
+                f"Sweep has {len(experiments)} unique experiments, above "
+                f"max_experiments={self.max_experiments}; no config files were written."
+            )
+
         cfg_paths = []
-        for idx, param_patch in enumerate(self.expand_grid(), 1):
-            cfg = self.base_cfg.copy()
-            deep_merge_dict(cfg, param_patch)
+        for idx, experiment in enumerate(experiments, 1):
+            cfg = deepcopy(experiment)
             cfg_name = f"cfg_{idx:05d}.yaml"
             cfg_path = self.out_dir / cfg_name
             yaml_dump(cfg, cfg_path)
@@ -801,6 +895,9 @@ def main_cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    # Preview exact counts without generating files
+    python hypersearch.py plan --base-config config_templates/univariate.yaml --param-grid config/sweeps/sweep_30m_high_return.yaml
+
     # Run bulk search with smart experiment generation (creates isolated execution folder)
     python hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
 
@@ -816,6 +913,13 @@ Examples:
     )
     sub = p.add_subparsers(dest="mode", required=True)
 
+    # read-only exact-count preflight
+    sp_plan = sub.add_parser("plan", help="Preview exact raw and unique experiment counts")
+    sp_plan.add_argument("--base-config", required=True, help="Path to base configuration file")
+    sp_plan.add_argument("--param-grid", required=True, help="Path to sweep definition file")
+    sp_plan.add_argument("--legacy", action="store_true", help="Plan with legacy factorial expansion")
+    sp_plan.add_argument("--json", action="store_true", help="Print the plan as JSON")
+
     # bulk
     sp = sub.add_parser("bulk_search", help="Run bulk hyperparameter search")
     sp.add_argument("--base-config", required=True, help="Path to base configuration file")
@@ -825,6 +929,7 @@ Examples:
     sp.add_argument("--summary-dir", default=None, help="Optional summary directory (defaults to the execution folder)")
     sp.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
     sp.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
+    sp.add_argument("--max-experiments", type=int, default=0, help="Refuse to run above this exact unique count")
     sp.add_argument("--legacy", action="store_true", help="Use legacy factorial expansion (WARNING: may generate many experiments)")
     sp.add_argument("--restart", action="store_true", help="Ignore resume and run all experiments from the beginning")
 
@@ -836,6 +941,7 @@ Examples:
     sp_resume.add_argument("--summary-dir", default=None, help="Explicit summary directory to use")
     sp_resume.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
     sp_resume.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
+    sp_resume.add_argument("--max-experiments", type=int, default=0, help="Refuse to resume a session above this count")
 
     # smart
     sp2 = sub.add_parser("smart_search", help="Rerun top configurations from previous experiments")
@@ -844,9 +950,26 @@ Examples:
     sp2.add_argument("--max-parallel", type=int, default=2, help="Maximum parallel experiments")
 
     args = p.parse_args()
-    sem = asyncio.Semaphore(args.max_parallel)
 
-    if args.mode == "bulk_search":
+    if args.mode == "plan":
+        base_cfg = yaml_load(args.base_config)
+        sweep_cfg = yaml_load(args.param_grid)
+        if args.legacy:
+            sweep_cfg['smart_generation'] = False
+        plan = build_sweep_plan(base_cfg, sweep_cfg)
+        if args.json:
+            print(json.dumps(plan, indent=2, default=str))
+        else:
+            print(f"Generation mode:    {plan['generation_mode']}")
+            print(f"Raw generated:      {plan['raw_generated']}")
+            print(f"Unique experiments: {plan['unique_experiments']}")
+            print(f"Duplicates removed: {plan['duplicates_removed']}")
+            print("Per model:")
+            for model_name, count in plan['per_model'].items():
+                print(f"  {model_name}: {count}")
+
+    elif args.mode == "bulk_search":
+        sem = asyncio.Semaphore(args.max_parallel)
         base_cfg = yaml_load(args.base_config)
         sweep_cfg = yaml_load(args.param_grid)
 
@@ -863,6 +986,17 @@ Examples:
         else:
             sweep_cfg['smart_generation'] = True
             print("Using smart experiment generation (recommended)")
+
+        plan = build_sweep_plan(base_cfg, sweep_cfg)
+        print(
+            f"Preflight: {plan['unique_experiments']} unique experiments "
+            f"({plan['duplicates_removed']} duplicates removed)"
+        )
+        if args.max_experiments and plan['unique_experiments'] > args.max_experiments:
+            raise SystemExit(
+                f"[bulk_search] Plan has {plan['unique_experiments']} unique experiments, "
+                f"above --max-experiments {args.max_experiments}."
+            )
         
         engine = BulkSearchEngine(
             base_cfg,
@@ -871,11 +1005,13 @@ Examples:
             sem,
             summary_dir=summary_dir,
             restart=args.restart,
-            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+            experiment_timeout_sec=(args.experiment_timeout_sec or None),
+            max_experiments=(args.max_experiments or None),
         )
         asyncio.run(engine.launch_all())
 
     elif args.mode == "resume_bulk":
+        sem = asyncio.Semaphore(args.max_parallel)
         resume_cfg_dir = Path(args.config_dir) if args.config_dir else _find_latest_execution_dir(Path(args.configs_root))
         if resume_cfg_dir is None:
             raise SystemExit("[resume_bulk] No execution folder with cfg_*.yaml found.")
@@ -897,11 +1033,13 @@ Examples:
             sem,
             summary_dir=resume_summary_dir,
             restart=False,
-            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+            experiment_timeout_sec=(args.experiment_timeout_sec or None),
+            max_experiments=(args.max_experiments or None),
         )
         asyncio.run(engine.launch_all())
 
     elif args.mode == "smart_search":
+        sem = asyncio.Semaphore(args.max_parallel)
         engine = SmartSearchEngine(args.from_experiments, args.top_n, sem)
         asyncio.run(engine.launch_top())
 
