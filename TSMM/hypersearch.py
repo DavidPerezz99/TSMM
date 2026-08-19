@@ -305,7 +305,31 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
     # Build combinations of flat parameters
     flat_keys = list(flat_params.keys())
     flat_values = [flat_params[k] for k in flat_keys]
-    
+
+    def _apply_interpretable_stack_hidden_size(variant: Dict[str, Any]) -> Dict[str, Any]:
+        nbeats_cfg = variant.get("nbeats") or {}
+        if str(nbeats_cfg.get("model_type", "interpretable")).strip().lower() != "interpretable":
+            return variant
+        hidden_size = nbeats_cfg.get("hidden_size")
+        stacks_config = nbeats_cfg.get("stacks_config")
+        if hidden_size is None or not isinstance(stacks_config, list):
+            return variant
+
+        normalized_stacks = []
+        for stack in stacks_config:
+            if isinstance(stack, dict):
+                stack_copy = dict(stack)
+                stack_copy.setdefault("hidden_size", hidden_size)
+                normalized_stacks.append(stack_copy)
+            else:
+                normalized_stacks.append(stack)
+
+        nbeats_copy = dict(nbeats_cfg)
+        nbeats_copy["stacks_config"] = normalized_stacks
+        variant_copy = dict(variant)
+        variant_copy["nbeats"] = nbeats_copy
+        return variant_copy
+
     for flat_combo in itertools.product(*flat_values):
         base_variant = {}
         for key, value in zip(flat_keys, flat_combo):
@@ -323,7 +347,7 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
                 variant = deepcopy(base_variant)
                 for key, value in zip(stacks_keys, stacks_combo):
                     set_nested_value(variant, key, value)
-                variants.append(variant)
+                variants.append(_apply_interpretable_stack_hidden_size(variant))
         
         elif model_type == 'blackbox' and blackbox_params:
             # Build blackbox_config variants
@@ -337,7 +361,7 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
                 variants.append(variant)
         else:
             # No nested params or unknown mode
-            variants.append(base_variant)
+            variants.append(_apply_interpretable_stack_hidden_size(base_variant))
     
     return variants
 
