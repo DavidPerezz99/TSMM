@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -15,11 +16,13 @@ if str(ROOT) not in sys.path:
 
 from hypersearch import (  # noqa: E402
     BulkSearchEngine,
+    build_nbeats_variants,
     build_sweep_plan,
     generate_smart_experiments,
     get_global_params,
     unique_experiments,
 )
+from utils.tracking import write_run_summary  # noqa: E402
 
 
 class HypersearchPlanningTests(unittest.TestCase):
@@ -63,6 +66,54 @@ class HypersearchPlanningTests(unittest.TestCase):
             if config["models_to_run"]["univariate"] == ["nbeats"]
         }
         self.assertEqual(nbeats_hidden, {128, 256})
+
+    def test_nbeats_direct_stacks_config_expands_inner_list_values(self):
+        variants = build_nbeats_variants(
+            {
+                "nbeats.model_type": ["interpretable"],
+                "nbeats.hidden_size": [128],
+                "nbeats.learning_rate": [0.003],
+                "nbeats.stacks_config": [[
+                    {"type": "trend", "num_blocks": [3, 6], "degree": 3},
+                    {"type": "seasonality", "num_blocks": [3, 6], "num_harmonics": [8, 24]},
+                ]],
+            }
+        )
+        self.assertEqual(len(variants), 8)
+        self.assertEqual(
+            {
+                (
+                    variant["nbeats"]["stacks_config"][0]["num_blocks"],
+                    variant["nbeats"]["stacks_config"][1]["num_blocks"],
+                    variant["nbeats"]["stacks_config"][1]["num_harmonics"],
+                )
+                for variant in variants
+            },
+            {
+                (3, 3, 8),
+                (3, 3, 24),
+                (3, 6, 8),
+                (3, 6, 24),
+                (6, 3, 8),
+                (6, 3, 24),
+                (6, 6, 8),
+                (6, 6, 24),
+            },
+        )
+
+    def test_write_run_summary_marks_nested_metrics_as_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            summary_path = write_run_summary(
+                config_path="cfg_00001.yaml",
+                metrics={
+                    "nbeats": {
+                        "primary": {"MAE": 1.0, "RMSE": 2.0, "R2": 0.4, "MAPE": 3.0}
+                    }
+                },
+                summary_dir=temp_dir,
+            )
+            payload = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "SUCCESS")
 
     def test_materialized_file_count_matches_plan_and_cap_is_preflighted(self):
         base = self._yaml("config_templates/univariate.yaml")

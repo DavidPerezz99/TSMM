@@ -238,14 +238,63 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
     
     These are mutually exclusive, so we need to handle them separately.
     """
+    def _expand_dict_choice_variants(raw_choices: List[Any]) -> List[Dict[str, Any]]:
+        """Expand dict-valued sweep choices whose leaf values may still be lists."""
+        variants: List[Dict[str, Any]] = []
+        for choice in raw_choices:
+            if not isinstance(choice, dict):
+                variants.append(choice)
+                continue
+            keys = list(choice.keys())
+            value_options = [
+                value if isinstance(value, list) else [value]
+                for value in (choice[key] for key in keys)
+            ]
+            for combo in itertools.product(*value_options):
+                variants.append({key: value for key, value in zip(keys, combo)})
+        return variants
+
+    def _expand_stacks_config_variants(raw_choices: List[Any]) -> List[List[Dict[str, Any]]]:
+        """Expand stack templates whose per-stack fields still contain sweep lists."""
+        variants: List[List[Dict[str, Any]]] = []
+        for choice in raw_choices:
+            if not isinstance(choice, list):
+                variants.append(choice)
+                continue
+
+            per_stack_variants: List[List[Dict[str, Any]]] = []
+            for stack in choice:
+                if not isinstance(stack, dict):
+                    per_stack_variants.append([stack])
+                    continue
+                stack_keys = list(stack.keys())
+                stack_value_options = [
+                    value if isinstance(value, list) else [value]
+                    for value in (stack[key] for key in stack_keys)
+                ]
+                expanded_stack_variants = []
+                for combo in itertools.product(*stack_value_options):
+                    expanded_stack_variants.append(
+                        {key: value for key, value in zip(stack_keys, combo)}
+                    )
+                per_stack_variants.append(expanded_stack_variants)
+
+            for stack_combo in itertools.product(*per_stack_variants):
+                variants.append([deepcopy(item) for item in stack_combo])
+        return variants
+
     # Separate parameters by category
     flat_params = {}  # e.g., model_type, hidden_size, epochs
     stacks_params = {}  # e.g., stacks_config.0.type, stacks_config.0.num_blocks
     blackbox_params = {}  # e.g., blackbox_config.num_blocks, blackbox_config.num_layers
     
     for key, values in nbeats_params.items():
-        if 'stacks_config' in key:
+        if key == 'nbeats.stacks_config':
+            stacks_params[key] = _expand_stacks_config_variants(values)
+        elif 'stacks_config' in key:
             stacks_params[key] = values
+        elif key == 'nbeats.blackbox_config':
+            blackbox_params[key] = _expand_dict_choice_variants(values)
         elif 'blackbox_config' in key:
             blackbox_params[key] = values
         else:
@@ -766,9 +815,15 @@ class BulkSearchEngine:
 
             out_text = out.decode(errors="replace") if out else ""
             err_text = err.decode(errors="replace") if err else ""
-            status = "OK" if proc.returncode == 0 else "FAIL"
-            print(f"[{cfg_path.name}] finished -> {status}")
-            if status == "FAIL":
+            if proc.returncode == 0:
+                summary_info = self._latest_summary_info(cfg_path.stem) or {}
+                summary_status = str(summary_info.get("status") or "").strip().upper()
+                display_status = summary_status or "NO_SUMMARY"
+            else:
+                display_status = "FAIL"
+
+            print(f"[{cfg_path.name}] finished -> {display_status}")
+            if proc.returncode != 0:
                 self._write_failure_log(
                     cfg_path=cfg_path,
                     cmd=cmd,
