@@ -13,13 +13,6 @@ import matplotlib.pyplot as plt
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Conv1D, LeakyReLU, Bidirectional, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import layers
-import tensorflow as tf
 import itertools
 import logging
 import holidays
@@ -59,6 +52,47 @@ except Exception as exc:
     TensorDataset = None
 
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
+
+
+def _load_tensorflow():
+    """Import TensorFlow only when the LSTM model is explicitly requested."""
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import (
+            LSTM,
+            Dense,
+            Conv1D,
+            LeakyReLU,
+            Bidirectional,
+            Dropout,
+        )
+        from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+        from tensorflow.keras.regularizers import l2
+        from tensorflow.keras.optimizers import Adam
+        from tensorflow.keras import layers
+    except ImportError as exc:
+        raise ImportError(
+            "TensorFlow dependencies are not installed. Remove 'lstm' from "
+            "models_to_run or add the TensorFlow packages back to requirements.txt."
+        ) from exc
+
+    return {
+        "tf": tf,
+        "Sequential": Sequential,
+        "LSTM": LSTM,
+        "Dense": Dense,
+        "Conv1D": Conv1D,
+        "LeakyReLU": LeakyReLU,
+        "Bidirectional": Bidirectional,
+        "Dropout": Dropout,
+        "EarlyStopping": EarlyStopping,
+        "ReduceLROnPlateau": ReduceLROnPlateau,
+        "Callback": Callback,
+        "l2": l2,
+        "Adam": Adam,
+        "layers": layers,
+    }
 
 
 # N-BEATS Model Classes (from original code)
@@ -1228,6 +1262,22 @@ def train_cnn_bilstm_model(
         patience_rlr=5,
         seed=42):
     """CNN-BiLSTM model with all 4 required plots."""
+    tf_keras = _load_tensorflow()
+    tf = tf_keras["tf"]
+    Sequential = tf_keras["Sequential"]
+    LSTM = tf_keras["LSTM"]
+    Dense = tf_keras["Dense"]
+    Conv1D = tf_keras["Conv1D"]
+    LeakyReLU = tf_keras["LeakyReLU"]
+    Bidirectional = tf_keras["Bidirectional"]
+    Dropout = tf_keras["Dropout"]
+    EarlyStopping = tf_keras["EarlyStopping"]
+    ReduceLROnPlateau = tf_keras["ReduceLROnPlateau"]
+    Callback = tf_keras["Callback"]
+    l2 = tf_keras["l2"]
+    Adam = tf_keras["Adam"]
+    layers = tf_keras["layers"]
+
     results = {
         'model': None,
         'metrics': {},
