@@ -12,8 +12,6 @@ import matplotlib
 matplotlib.use('Agg')  
 import matplotlib.pyplot as plt
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from prophet import Prophet
-from xgboost import XGBRegressor
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
@@ -31,6 +29,30 @@ from models.multivariate_models import (
     multiVrecurrent_LR, train_nbeats_model, multiVrecurrent_SVR
 )
 from utils.sequence_utils import prepare_sequences_cached as prepare_sequences
+
+
+def _load_prophet():
+    """Import Prophet only when the Prophet model is explicitly requested."""
+    try:
+        from prophet import Prophet
+    except ImportError as exc:
+        raise ImportError(
+            "Prophet dependencies are not installed. Remove 'prophet' from "
+            "models_to_run or add the Prophet packages back to requirements.txt."
+        ) from exc
+    return Prophet
+
+
+def _load_xgboost_regressor():
+    """Import XGBoost only when the XGBoost model is explicitly requested."""
+    try:
+        from xgboost import XGBRegressor
+    except ImportError as exc:
+        raise ImportError(
+            "XGBoost dependencies are not installed. Remove 'xgboost' from "
+            "models_to_run or add the XGBoost package back to requirements.txt."
+        ) from exc
+    return XGBRegressor
 
 
 def save_training_fit_plot(y_train_true, y_train_pred,
@@ -356,6 +378,7 @@ def train_univariate_models(df, config, logger, input_features, target_features,
 def train_xgboost_model(df, config, input_features, target_features):
     """Train XGBoost model with all 4 required plots."""
     from utils.evaluator import save_forecast_plot
+    XGBRegressor = _load_xgboost_regressor()
     
     results = {
         'model': None,
@@ -541,6 +564,7 @@ def generate_xgboost_forecast(model, df, target_col, horizon, lags, rolling_wind
 
 def train_prophet_model(df, config):
     """Train Prophet model with all 4 required plots."""
+    Prophet = _load_prophet()
     results = {
         'model': None,
         'metrics': {},
