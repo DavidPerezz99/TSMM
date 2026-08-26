@@ -16,8 +16,8 @@ mode_a:
   allow_short: true
   selected_model: ''
   use_llm_explanation: true
-  block_on_confidence_thresholds: false
-  block_on_input_fooling_risk: false
+  block_on_confidence_thresholds: true
+  block_on_input_fooling_risk: true
 agent_a_fallback:
   enabled: true
   auto_discover: true
@@ -42,9 +42,18 @@ agent_a_fallback:
   - config_path: config/high30mResults/nbeats/top1_07163.yaml
     timeframe: 30m
     model: nbeats
-  - config_path: config/high10mResults/nbeats/top1_07175.yaml
+  - config_path: config/high10mResults/nbeats/top1_06000.yaml
     timeframe: 10m
     model: nbeats
+model_quality:
+  minimum_r2_for_vote: 0.0
+  prefer_refreshed_r2: true
+hybrid_strategy:
+  enabled: true
+  min_qualified_models: 2
+  min_abs_consensus: 0.15
+  minimum_expected_value_price: 0.0
+  max_forecast_range_pct: 3.0
 mode_b:
   enabled: true
   allow_open_new_positions: true
@@ -76,7 +85,10 @@ risk:
   daily_max_loss_pct: 2.0
   weekly_max_loss_pct: 5.0
   max_drawdown_pct: 15.0
-  max_open_positions: 5
+  max_open_positions: 1
+  account_sizing:
+    enabled: true
+    fail_closed_below_minimum_volume: true
   stop_loss_pct: 0.8
   take_profit_pct: 1.6
   trailing:
@@ -118,10 +130,13 @@ execution:
   slippage_bps: 2.0
   commission_per_trade: 0.0
   spread_bps: 2.0
+shadow_mode:
+  enabled: false
+  output_dir: reports/shadow
 broker:
   active: mt5
   mt5:
-    enabled: true
+    enabled: false
     login: env:MT5_FTMO_LOGIN
     password: env:MT5_FTMO_PASSWORD
     server: FTMO-Server3
@@ -132,14 +147,17 @@ broker:
     password: env:IQOPTION_PASSWORD
     balance_mode: PRACTICE
 model_endpoints:
-  10m: http://127.0.0.1:8000/predict/10m
+  10m:
+    url: http://127.0.0.1:8000/predict/10m
+    model: nbeats
+    config_path: config/high10mResults/nbeats/top1_06000.yaml
   30m: http://127.0.0.1:8000/predict/30m
   1h: http://127.0.0.1:8000/predict/1h
   3h: http://127.0.0.1:8000/predict/3h
   7h:
     url: http://127.0.0.1:8000/predict/7h
-    model: ulr
-    config_path: config/high7hResults/ulr/top1_07890.yaml
+    model: nbeats
+    config_path: config/high7hResults/nbeats/top1_07000.yaml
   12h:
     url: http://127.0.0.1:8000/predict/12h
     model: nbeats
@@ -194,7 +212,7 @@ opposing_countertrade:
   target_price_tolerance_abs: 2.0
   stop_distance_multiplier: 1.0
 autonomous_trading:
-  enabled: true
+  enabled: false
   timezone: America/Bogota
   scan_interval_seconds: 600
   max_jobs_per_session: 3
@@ -227,7 +245,7 @@ autonomous_trading:
     end: '21:00'
 llm:
   enabled: true
-  provider: local_ollama
+  provider: local_transformers
   providers_config_path: config\llm_providers.yaml
   timeout_seconds: 120
   assist_every_seconds: 300
@@ -378,10 +396,11 @@ inference_performance:
   forecast_retention_days: 180
   snapshot_retention_days: 365
 boot_recovery:
-  enabled: true
-  restart_listener: true
-  restart_endpoint: true
-  resume_active_jobs: true
+  enabled: false
+  restart_listener: false
+  restart_endpoint: false
+  restart_parity_enforcer: false
+  resume_active_jobs: false
   send_telegram_alert: true
   send_console_alert: true
   console_alert_timeout_seconds: 20

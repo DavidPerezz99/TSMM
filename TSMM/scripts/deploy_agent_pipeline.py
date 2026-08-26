@@ -859,7 +859,7 @@ def _start_trading_job(pipeline_cfg: Dict[str, Any], dry_run: bool = False) -> D
         return {"started": False, "reason": "disabled_in_pipeline_config"}
 
     plan_model = str(tcfg.get("plan_model", "")).strip()
-    exec_cfg = _as_abs(str(tcfg.get("execution_config", "config/high7hResults/ulr/top1_07890.yaml")))
+    exec_cfg = _as_abs(str(tcfg.get("execution_config", "config/high7hResults/nbeats/top1_07000.yaml")))
     trading_cfg = _as_abs(str(tcfg.get("trading_config_path", "config/trading_agent.yaml")))
     pipeline_mt5_terminal_path = _resolve_secret(tcfg.get("mt5_terminal_path", ""))
     trading_cfg_payload = _load_yaml(trading_cfg)

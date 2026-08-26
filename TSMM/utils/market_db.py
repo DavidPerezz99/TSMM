@@ -449,6 +449,68 @@ def create_timeframe_cache_table(
         conn.close()
 
 
+def materialize_timeframe_cache_tables(
+    db_path: str,
+    timeframes_minutes: list[int],
+    symbol: str = DEFAULT_MARKET_SYMBOL,
+) -> list[str]:
+    """Materialize several grouped timeframe tables from one master-table read.
+
+    The older single-table SQL builder repeats a costly grouped CTE for every
+    timeframe. Bulk-search preparation benefits from reading the indexed minute
+    master once, grouping each requested timeframe in pandas, and atomically
+    swapping the resulting cache tables into place.
+    """
+    resolved_timeframes = list(dict.fromkeys(
+        int(max(value, 1)) for value in timeframes_minutes if int(value) > 1
+    ))
+    if not resolved_timeframes:
+        return []
+
+    source_table = master_table_name(symbol)
+    init_market_db(db_path, symbol=symbol)
+    conn = _connect(db_path)
+    try:
+        minute_data = pd.read_sql_query(
+            f"""
+            SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
+            FROM {source_table}
+            ORDER BY DATE
+            """,
+            conn,
+            parse_dates=["DATE"],
+        )
+    finally:
+        conn.close()
+
+    if minute_data.empty:
+        raise ValueError(f"No minute rows found in {source_table}")
+    minute_data["DATE"] = pd.to_datetime(minute_data["DATE"], errors="coerce")
+    minute_data = minute_data.dropna(subset=["DATE"]).sort_values("DATE")
+
+    created = []
+    for tf in resolved_timeframes:
+        target_table = timeframe_cache_table_name(tf, symbol=symbol)
+        temporary_table = f"{target_table}__building"
+        grouped = _aggregate_recent_minutes(minute_data, tf)
+        write_conn = _connect(db_path)
+        try:
+            write_conn.execute(f"DROP TABLE IF EXISTS {temporary_table}")
+            write_conn.commit()
+            grouped.to_sql(temporary_table, write_conn, if_exists="replace", index=False)
+            write_conn.execute("BEGIN IMMEDIATE")
+            write_conn.execute(f"DROP TABLE IF EXISTS {target_table}")
+            write_conn.execute(f"ALTER TABLE {temporary_table} RENAME TO {target_table}")
+            write_conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{target_table}_date ON {target_table}(DATE)"
+            )
+            write_conn.commit()
+        finally:
+            write_conn.close()
+        created.append(target_table)
+    return created
+
+
 def create_timeframe_views(
     db_path: str,
     timeframes_minutes: list[int],
@@ -458,8 +520,8 @@ def create_timeframe_views(
     created = []
     for tf in timeframes_minutes:
         created.append(create_timeframe_view(db_path, int(tf), symbol=symbol))
-        if include_cache_tables:
-            create_timeframe_cache_table(db_path, int(tf), symbol=symbol)
+    if include_cache_tables:
+        materialize_timeframe_cache_tables(db_path, timeframes_minutes, symbol=symbol)
     return created
 
 
@@ -601,11 +663,25 @@ def ensure_timeframe_artifacts(
     timeframes_minutes: list[int],
     symbol: str = DEFAULT_MARKET_SYMBOL,
 ) -> list[str]:
-    created = []
     for tf in timeframes_minutes:
         ensure_timeframe_view(db_path, int(tf), symbol=symbol)
-        created.append(ensure_timeframe_cache_table(db_path, int(tf), symbol=symbol))
-    return created
+    expected = [timeframe_cache_table_name(int(tf), symbol=symbol) for tf in timeframes_minutes]
+    conn = _connect(db_path)
+    try:
+        existing = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    missing_timeframes = [
+        int(tf) for tf, table_name in zip(timeframes_minutes, expected) if table_name not in existing
+    ]
+    if missing_timeframes:
+        materialize_timeframe_cache_tables(db_path, missing_timeframes, symbol=symbol)
+    return expected
 
 
 def query_ohlc(
@@ -615,7 +691,25 @@ def query_ohlc(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     symbol: str = DEFAULT_MARKET_SYMBOL,
+    source_mode: str = "auto",
 ) -> pd.DataFrame:
+    """Query recent OHLC candles from the market database.
+
+    ``source_mode`` controls grouped-timeframe reads:
+
+    - ``auto`` preserves the existing cache/recent-minute behavior;
+    - ``view`` reads the configured SQL timeframe view directly;
+    - ``cache`` requires a materialized timeframe cache table.
+
+    A view read avoids loading and aggregating the underlying minute rows in
+    pandas. It does not reduce the memory used later by model sequence tensors.
+    """
+    resolved_source_mode = str(source_mode or "auto").strip().lower()
+    if resolved_source_mode not in {"auto", "view", "cache"}:
+        raise ValueError(
+            f"Unsupported SQL source_mode '{source_mode}'. Expected auto, view, or cache."
+        )
+
     source_table = master_table_name(symbol)
     init_market_db(db_path, symbol=symbol)
     conn = _connect(db_path)
@@ -648,13 +742,49 @@ def query_ohlc(
 
         tf = int(max(timeframe_minutes, 1))
         table_name = timeframe_cache_table_name(tf, symbol=symbol)
+        view_name = timeframe_view_name(tf, symbol=symbol)
 
-        row = conn.execute(
+        cache_row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
             (table_name,),
         ).fetchone()
+        view_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='view' AND name=?",
+            (view_name,),
+        ).fetchone()
 
-        if row:
+        if resolved_source_mode == "view":
+            if not view_row:
+                raise ValueError(
+                    f"SQL timeframe view '{view_name}' does not exist in {db_path}"
+                )
+            sql = f"""
+                SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
+                FROM {view_name}
+                WHERE {where_sql}
+                ORDER BY DATE DESC
+                LIMIT ?
+            """
+            df = pd.read_sql_query(
+                sql,
+                conn,
+                params=params + [int(max(latest_records, 1))],
+            )
+        elif resolved_source_mode == "cache":
+            if not cache_row:
+                raise ValueError(
+                    f"SQL timeframe cache table '{table_name}' does not exist in {db_path}"
+                )
+            df = _merge_cached_history_with_live_tail(
+                conn=conn,
+                source_table=source_table,
+                cache_table=table_name,
+                timeframe_minutes=tf,
+                latest_records=latest_records,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        elif cache_row:
             df = _merge_cached_history_with_live_tail(
                 conn=conn,
                 source_table=source_table,

@@ -1,15 +1,17 @@
-# Sweep for 10m HIGH return modeling
-# Target objective: optimize prediction quality for High_return
+# Sweep for 10m HIGH modeling with y_diff as the primary forecast target.
 
 smart_generation: true
 
 models_to_run:
-  univariate: [nbeats]
+  univariate: [ulr, nbeats]
   multivariate: []
 
 # Dataset + task
 problem_type: ["univariate"]
-data_path: ["data/xauusd/xauusd_10m_enriched.csv"]
+data_path: ["data/market_data.sqlite"]
+data_timeframe_minutes: [10]
+sql_symbol: ["XAUUSD"]
+sql_source_mode: ["cache"]
 target_col: ["HIGH"]
 
 # Global search space (kept compact for practical runtime)
@@ -19,33 +21,23 @@ horizon: [6]
 split_ratio: [0.82]
 test_size: [120]
 records: [4000, 3000, 2000, 1000]
-epochs: [60]
-
-# SVR-specific
-svr.kernel: ["rbf"]
-svr.C: [0.5, 2.0]
-svr.epsilon: [0.03, 0.08]
-svr.gamma: ["scale"]
-svr.max_iter: [10000]
-svr.tol: [0.001]
 
 # N-BEATS-specific
 nbeats.model_type: ["interpretable"]
 nbeats.hidden_size: [128, 256]
 nbeats.learning_rate: [0.001, 0.003]
+nbeats.epochs: [60]
 nbeats.stacks_config:
   -
     - type: "trend"
       num_blocks: 3
-      hidden_size: 128
       degree: 3
     - type: "seasonality"
       num_blocks: 3
-      hidden_size: 128
       num_harmonics: 8
 
 # Input/target recipes
-# Keep High_return as first target metric anchor.
+# Keep y_diff as the primary metric anchor.
 input_target_sets:
   -
     input_features: ["HIGH", "y_diff", "Low_return", "Price_return", "Open_return"]

@@ -1,0 +1,33 @@
+# Shared 10-minute sweep. The session target profile supplies one OHLC target
+# and its paired input/target feature recipes.
+smart_generation: true
+
+models_to_run:
+  univariate: [ulr, nbeats]
+  multivariate: []
+
+problem_type: [univariate]
+data_path: [data/market_data.sqlite]
+data_timeframe_minutes: [10]
+sql_symbol: [XAUUSD]
+sql_source_mode: [cache]
+
+n_steps: [10, 36, 72, 96]
+m_steps: [1]
+horizon: [6]
+split_ratio: [0.82]
+test_size: [120]
+records: [4000, 8000, 12000, 15000]
+
+nbeats.model_type: [interpretable, blackbox]
+nbeats.hidden_size: [128, 256]
+nbeats.learning_rate: [0.001, 0.003]
+nbeats.epochs: [60]
+nbeats.stacks_config:
+  -
+    - type: trend
+      num_blocks: 3
+      degree: 3
+    - type: seasonality
+      num_blocks: 3
+      num_harmonics: 8

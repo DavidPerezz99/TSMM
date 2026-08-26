@@ -177,6 +177,29 @@ def _load_training_r2_map() -> dict:
                 "evaluated_at_utc": _utc_iso(log_path.stat().st_mtime),
             }
 
+    # Direct production refreshes record their current holdout result in the
+    # endpoint version manifest. Those values are newer and more specific than
+    # historical bulk-run logs, so they must override the older lineage score.
+    versions_path = ROOT / "config" / "model_endpoint_versions.yaml"
+    try:
+        versions = yaml.safe_load(versions_path.read_text(encoding="utf-8")) or {}
+        for endpoint_key, endpoint_entry in (versions.get("endpoints") or {}).items():
+            current = (endpoint_entry or {}).get("current") or {}
+            refreshed_r2 = current.get("refreshed_r2")
+            if refreshed_r2 is None or "_" not in str(endpoint_key):
+                continue
+            timeframe, family = str(endpoint_key).split("_", 1)
+            model_name = str(current.get("model") or "").strip().lower()
+            if not model_name:
+                continue
+            r2_map[(timeframe.lower(), family.lower(), model_name)] = {
+                "value": float(refreshed_r2),
+                "source_log": str(versions_path),
+                "evaluated_at_utc": str(current.get("refreshed_at_utc") or "") or None,
+            }
+    except Exception:
+        pass
+
     return r2_map
 
 
@@ -356,6 +379,13 @@ def main() -> int:
         "10m": "nbeats", "30m": "nbeats", "1h": "nbeats",
         "3h": "nbeats", "7h": "ulr", "12h": "nbeats", "24h": "nbeats",
     }
+    models_by_family_tf = {
+        ("7h", "high"): "nbeats",
+        ("7h", "low"): "nbeats",
+    }
+
+    def selected_model(timeframe: str, family: str) -> str:
+        return models_by_family_tf.get((timeframe, family), models_by_tf[timeframe])
 
     # Load actual training R² from forecast logs
     training_r2 = _load_training_r2_map()
@@ -364,10 +394,10 @@ def main() -> int:
     errors: list[str] = []
 
     for tf in timeframes:
-        model_name = models_by_tf[tf]
         results[tf] = {}
 
         for family in families:
+            model_name = selected_model(tf, family)
             cfg_dir = ROOT / "config" / f"{family}{tf}Results" / model_name
             if not cfg_dir.exists():
                 results[tf][family] = {"error": "config_dir_not_found"}
@@ -397,6 +427,7 @@ def main() -> int:
                 training_metric = training_r2.get((tf, family, model_name)) or {}
                 train_r2 = training_metric.get("value") if isinstance(training_metric, dict) else training_metric
                 results[tf][family] = {
+                    "model": model_name,
                     "horizon": pred,
                     "r2_train": round(train_r2, 4) if train_r2 is not None else None,
                     "r2_train_source_log": training_metric.get("source_log") if isinstance(training_metric, dict) else None,
@@ -428,7 +459,7 @@ def main() -> int:
                                 "timeframe": tf,
                                 "timeframe_minutes": _tf_to_minutes(tf),
                                 "family": family,
-                                "model": models_by_tf[tf],
+                                "model": selected_model(tf, family),
                                 "model_path": result.get("model_path"),
                                 "model_updated_at_utc": result.get("model_updated_at_utc"),
                                 "target_feature": result.get("target_feature") or "y_diff",
@@ -455,14 +486,14 @@ def main() -> int:
                     metrics = store.rolling_metrics(
                         timeframe=tf,
                         family=family,
-                        model=models_by_tf[tf],
+                        model=selected_model(tf, family),
                         window_samples=window_samples,
                         min_samples=min_samples,
                     )
                     current_model_metrics = store.rolling_metrics(
                         timeframe=tf,
                         family=family,
-                        model=models_by_tf[tf],
+                        model=selected_model(tf, family),
                         model_path=str(result.get("model_path") or ""),
                         window_samples=window_samples,
                         min_samples=min_samples,
@@ -471,7 +502,7 @@ def main() -> int:
                         generated_at_utc=report_started_at,
                         timeframe=tf,
                         family=family,
-                        model=models_by_tf[tf],
+                        model=selected_model(tf, family),
                         model_path=str(result.get("model_path") or ""),
                         metrics=metrics,
                     )
@@ -511,7 +542,7 @@ def main() -> int:
         for family in families:
             r = results[tf].get(family, {})
             if "error" in r:
-                print(f"{tf:<8} {family:<8} {models_by_tf[tf]:<10} {'ERR':<6} {'':<10} {'':<8} {'':<8} {r['error'][:95]}")
+                print(f"{tf:<8} {family:<8} {selected_model(tf, family):<10} {'ERR':<6} {'':<10} {'':<8} {'':<8} {r['error'][:95]}")
             else:
                 h = r.get("horizon", [])
                 n = len(h)
@@ -522,10 +553,10 @@ def main() -> int:
                 live_r2_str = f"{r.get('r2_live_rolling', 0):.4f}" if r.get("r2_live_rolling") is not None else "N/A"
                 live_delta_str = f"{r.get('r2_live_delta', 0):+.4f}" if r.get("r2_live_delta") is not None else "N/A"
                 live_n = int(r.get("r2_live_samples") or 0)
-                print(f"{tf:<8} {family:<8} {models_by_tf[tf]:<10} {n:<6} {r2_str:<10} {strength_str:<10} {live_r2_str:<10} {live_delta_str:<10} {live_n:<5} {sig:<8} [{h_str}]")
+                print(f"{tf:<8} {family:<8} {selected_model(tf, family):<10} {n:<6} {r2_str:<10} {strength_str:<10} {live_r2_str:<10} {live_delta_str:<10} {live_n:<5} {sig:<8} [{h_str}]")
 
     print(f"\n{'=' * 202}")
-    print("\nR²: Extraído del log de entrenamiento (evaluación real del último retrain).")
+    print("\nR²: evaluación del último retrain, tomada del manifiesto de producción o del log más reciente.")
     if errors:
         print(f"\nWarnings ({len(errors)}):")
         for e in errors:
@@ -541,7 +572,7 @@ def main() -> int:
         "source_data_as_of_utc": source_data_as_of,
         "market_refresh": refresh_result,
         "online_evaluation": online_evaluation,
-        "r2_semantics": "Static training evaluation from the newest retraining log for each timeframe/family.",
+        "r2_semantics": "Static holdout evaluation from the production version manifest or newest retraining log for each timeframe/family/model.",
         "inference_strength_semantics": "Dynamic magnitude-versus-volatility heuristic; not a calibrated probability.",
         "r2_live_semantics": "Rolling R2 over matured forecasts versus realized target-family y_diff, scoped to the timeframe/family/model lineage across retraining.",
         "r2_live_current_model_semantics": "Rolling R2 over matured forecasts scoped to the exact current model artifact.",

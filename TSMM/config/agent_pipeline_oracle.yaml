@@ -1,0 +1,53 @@
+# Deployment defaults for the isolated Upcomers Oracle 5K profile.
+refresh:
+  enabled: true
+  master_csv: data/xauusd/master_table.csv
+  db_path: data/market_data.sqlite
+  symbol: XAUUSD
+  chunksize: 250000
+  views: [10, 30, 60, 180, 420, 720, 1440, 10080]
+  update_trading_config: true
+
+targets:
+  enabled: true
+  mirror_from: high
+  families: [low, open, close]
+
+storage_optimizer:
+  enabled: true
+  model_dirs: [model_files]
+  keep_recent_model_generations: 1
+  keep_recent_artifact_generations: 1
+  delete_orphan_artifacts: true
+  prune_runtime_stale_files: true
+  clear_joblib_cache_on_refresh: false
+  cache_clear_min_size_mb: 4096
+
+llm:
+  enable: true
+  prefer_provider: local_ollama
+  fallback_provider: local_transformers
+  providers_config_path: config/llm_providers.yaml
+  trading_config_path: config/trading_agent_oracle.yaml
+
+models:
+  retrain_targets: []
+  retrain_all_targets_on_refresh: true
+  retrain_progress_log_interval_seconds: 60
+
+endpoints:
+  deploy_local_service: false
+  service_script: scripts/local_signal_endpoint_service.py
+  host: 127.0.0.1
+  port: 8000
+
+trading:
+  start_job: false
+  plan_model: nbeats
+  execution_config: config/high7hResults/nbeats/top1_07000.yaml
+  trading_config_path: config/trading_agent_oracle.yaml
+  mt5_terminal_path: env:MT5_UPCOMERS_TERMINAL_PATH
+
+backtest_policy:
+  llm_enabled: false
+  mode: technical_only

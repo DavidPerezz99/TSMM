@@ -192,6 +192,15 @@ class _FakeMT5MarketStopsFallback:
 
 
 class MT5AdapterTests(unittest.TestCase):
+    def test_connect_does_not_initialize_explicitly_disabled_broker(self):
+        adapter = MT5Adapter({"enabled": False})
+
+        ok, message = adapter.connect()
+
+        self.assertFalse(ok)
+        self.assertEqual(message, "MT5 broker disabled by configuration")
+        self.assertIsNone(adapter._mt5)
+
     def test_modify_position_risk_normalizes_crossed_stop_against_live_price(self):
         adapter = MT5Adapter({})
         fake_mt5 = _FakeMT5MarketStopsFallback()

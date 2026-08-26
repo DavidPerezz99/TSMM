@@ -54,19 +54,21 @@ def write_run_summary(
         stem = f"{stem}__{suffix}"
     summary_file = summary_dir / f"{stem}__summary.json"
 
+    def _contains_numeric_metrics(payload):
+        if isinstance(payload, dict):
+            if any(
+                key in payload and isinstance(payload.get(key), (int, float, np.generic))
+                for key in ("MAE", "RMSE", "R2", "MAPE")
+            ):
+                return True
+            return any(_contains_numeric_metrics(value) for value in payload.values())
+        if isinstance(payload, (list, tuple, set)):
+            return any(_contains_numeric_metrics(value) for value in payload)
+        return False
+
     # Heuristic status: SUCCESS only if at least one model has
     # non-empty numeric metrics; otherwise mark as NO_METRICS.
-    status = "NO_METRICS"
-    try:
-        for model_name, model_metrics in (metrics or {}).items():
-            if isinstance(model_metrics, dict):
-                # Look for common regression keys
-                if any(k in model_metrics for k in ("MAE", "RMSE", "R2", "MAPE")):
-                    status = "SUCCESS"
-                    break
-    except Exception:
-        # Fallback: keep default status if inspection fails
-        pass
+    status = "SUCCESS" if _contains_numeric_metrics(metrics or {}) else "NO_METRICS"
 
     payload = {
         "config_path": str(Path(config_path).resolve()),

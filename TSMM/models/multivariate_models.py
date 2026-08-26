@@ -9,6 +9,7 @@ import os
 import itertools
 import logging
 import tempfile
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -596,6 +597,16 @@ def prepare_sequences_nbeats(df, input_features, target_features, n_steps, m_ste
     return np.array(X), np.array(y)
 
 
+def resolve_interpretable_stacks_config(stacks_config, hidden_size):
+    """Apply the swept N-BEATS hidden size unless a stack overrides it."""
+    if stacks_config is None:
+        return None
+    resolved = [dict(stack) for stack in stacks_config]
+    for stack in resolved:
+        stack.setdefault('hidden_size', hidden_size)
+    return resolved
+
+
 def train_nbeats_model(
         df,
         input_features,
@@ -612,7 +623,10 @@ def train_nbeats_model(
         patience_rlr=10,
         stacks_config=None,
         blackbox_config=None,
-        device="cpu"):
+        device="cpu",
+        test_size=None,
+        validation_size=None,
+        random_seed=42):
     """
     N-BEATS model training with all 4 required plots.
     """
@@ -629,7 +643,8 @@ def train_nbeats_model(
             'target_features': target_features,
             'split_ratio': split_ratio,
             'hidden_size': hidden_size,
-            'epochs': epochs
+            'epochs': epochs,
+            'random_seed': random_seed,
         },
         'scalers': {'X': None, 'y': None},
         'history': None,
@@ -643,6 +658,12 @@ def train_nbeats_model(
                 f"{TORCH_IMPORT_ERROR}"
             ) from TORCH_IMPORT_ERROR
 
+        random_seed = int(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(random_seed)
+
         df = df.dropna().reset_index(drop=True)
         X, y = prepare_sequences_nbeats(df, input_features, target_features, n_steps, m_steps)
 
@@ -655,28 +676,57 @@ def train_nbeats_model(
         X_reshaped = X.reshape(X.shape[0], -1) 
         y_reshaped = y.reshape(y.shape[0], -1)  
 
-        scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
+        total_sequences = len(X_reshaped)
+        holdout_count = int(test_size or max(20, round(total_sequences * (1.0 - split_ratio))))
+        holdout_count = max(20, holdout_count)
+        remaining_count = total_sequences - holdout_count
+        validation_count = (
+            max(10, round(remaining_count * 0.10))
+            if validation_size is None
+            else max(int(validation_size), 2)
+        )
+        if remaining_count - validation_count < max(batch_size, 10):
+            raise ValueError(
+                "Not enough chronological sequences for separate train, validation, and "
+                f"holdout sets: total={total_sequences}, validation={validation_count}, "
+                f"holdout={holdout_count}. Increase records or reduce test_size."
+            )
+        train_end = remaining_count - validation_count
+        validation_end = remaining_count
 
-        X_scaled = scaler_X.fit_transform(X_reshaped)
-        y_scaled = scaler_y.fit_transform(y_reshaped)
+        # Fit preprocessing only on the earliest training period. Neither the
+        # early-stopping validation block nor the final holdout can affect it.
+        scaler_X = StandardScaler().fit(X_reshaped[:train_end])
+        scaler_y = StandardScaler().fit(y_reshaped[:train_end])
+        X_train = scaler_X.transform(X_reshaped[:train_end])
+        y_train = scaler_y.transform(y_reshaped[:train_end])
+        X_val = scaler_X.transform(X_reshaped[train_end:validation_end])
+        y_val = scaler_y.transform(y_reshaped[train_end:validation_end])
+        X_test = scaler_X.transform(X_reshaped[validation_end:])
+        y_test = scaler_y.transform(y_reshaped[validation_end:])
 
         results['scalers']['X'] = scaler_X
         results['scalers']['y'] = scaler_y
 
-        split_idx = int(len(X_scaled) * split_ratio)
-        X_train, X_test = X_scaled[:split_idx], X_scaled[split_idx:]
-        y_train, y_test = y_scaled[:split_idx], y_scaled[split_idx:]
+        results['parameters']['validation_size'] = validation_count
+        results['parameters']['test_size'] = holdout_count
+        results['parameters']['validation_policy'] = 'chronological_train_only_scaling'
 
         # Convert to PyTorch tensors
         X_train_tensor = torch.FloatTensor(X_train)
         y_train_tensor = torch.FloatTensor(y_train)
+        X_val_tensor = torch.FloatTensor(X_val)
+        y_val_tensor = torch.FloatTensor(y_val)
         X_test_tensor = torch.FloatTensor(X_test)
         y_test_tensor = torch.FloatTensor(y_test)
 
         # Create data loaders
         train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(random_seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, generator=loader_generator
+        )
 
         device = torch.device(device if torch.cuda.is_available() else "cpu")
 
@@ -684,6 +734,7 @@ def train_nbeats_model(
         forecast_size = m_steps * n_target_features
 
         if model_type == "interpretable":
+            stacks_config = resolve_interpretable_stacks_config(stacks_config, hidden_size)
             model = InterpretableNBeats(
                 input_size=input_size,
                 forecast_size=forecast_size,
@@ -716,6 +767,9 @@ def train_nbeats_model(
 
         train_losses = []
         val_losses = []
+        best_val_loss = float('inf')
+        best_state = None
+        stale_epochs = 0
 
         model.train()
         for epoch in range(epochs):
@@ -736,8 +790,8 @@ def train_nbeats_model(
 
             model.eval()
             with torch.no_grad():
-                val_predictions = model(X_test_tensor.to(device))
-                val_loss = criterion(val_predictions, y_test_tensor.to(device))
+                val_predictions = model(X_val_tensor.to(device))
+                val_loss = criterion(val_predictions, y_val_tensor.to(device))
                 val_losses.append(val_loss.item())
             model.train()
 
@@ -746,9 +800,18 @@ def train_nbeats_model(
             if epoch % 10 == 0:
                 logging.info(f'Epoch {epoch}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss.item():.6f}')
 
-            if epoch > patience_es and min(val_losses[-patience_es:]) >= min(val_losses):
+            if val_loss.item() < best_val_loss - 1e-12:
+                best_val_loss = val_loss.item()
+                best_state = deepcopy(model.state_dict())
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if stale_epochs >= max(int(patience_es), 1):
                 logging.info(f'Early stopping at epoch {epoch}')
                 break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
 
         results['history'] = {'train_loss': train_losses, 'val_loss': val_losses}
 

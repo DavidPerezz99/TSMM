@@ -43,9 +43,9 @@ endpoints:
   port: 8000
 
 trading:
-  start_job: true
-  plan_model: ulr
-  execution_config: config/high7hResults/ulr/top1_07890.yaml
+  start_job: false
+  plan_model: nbeats
+  execution_config: config/high7hResults/nbeats/top1_07000.yaml
   trading_config_path: config/trading_agent_ftmo.yaml
   mt5_terminal_path: "C:\\Program Files\\FTMO Global Markets MT5 Terminal\\terminal64.exe"
 

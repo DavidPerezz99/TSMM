@@ -1,6 +1,6 @@
 # TSMM CLI Runbook
 
-This runbook documents reliable command-line operations for deployment, trading, endpoint service, and Telegram command control.
+This runbook documents reliable command-line operations for deployment, trading, historical strategy evaluation, endpoint service, and Telegram command control.
 
 ## 1) End-to-end deployment
 
@@ -96,7 +96,43 @@ Runtime state file:
 
 - reports/runtime/trading_job_state.json
 
-## 3) Endpoint service operations
+## 3) Historical strategy evaluation
+
+Evaluate the previous local calendar month without connecting to MT5:
+
+```powershell
+python app.py backtest --previous-month
+```
+
+Evaluate an explicit period:
+
+```powershell
+python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31
+```
+
+The standalone command exposes the same engine and additional execution inputs:
+
+```powershell
+python scripts/run_trading_backtest.py --previous-month --initial-balance 100000 --contract-size 100
+```
+
+Each run writes a Markdown report, JSON summary, daily summary, trade lifecycle,
+entry-attempt audit, and five-minute signal timeline under
+`reports/backtests/run_<timestamp>/` by default.
+
+While the replay is running, the console shows a live progress bar with the
+completed percentage, inference-tick count, elapsed time, estimated remaining
+time, and current simulated timestamp. When output is redirected to a file, the
+same information is written at five-percent milestones instead of using an
+in-place animated line.
+
+The replay never connects to MT5. It uses only market rows available at each
+simulated timestamp, including partial higher-timeframe candles. By default it
+freezes the newest fitted model artifacts for the whole period. If those models
+were trained after or through the period, the report labels the result as an
+exploratory retrospective replay rather than unbiased walk-forward evidence.
+
+## 4) Endpoint service operations
 
 Default policy is on-demand startup (not always-on). Keep deploy endpoint stage disabled unless explicitly required.
 
@@ -112,7 +148,7 @@ Health check:
 python -c "import requests; print(requests.get('http://127.0.0.1:8000/health', timeout=5).json())"
 ```
 
-## 4) Telegram command listener
+## 5) Telegram command listener
 
 Start listener (always-on process):
 
@@ -185,7 +221,7 @@ Steward governance instructions:
 
 - docs/AGENT_STEWARD_INSTRUCTIONS.md
 
-## 5) UI lifecycle (minimal-by-default)
+## 6) UI lifecycle (minimal-by-default)
 
 Do not keep UIs running permanently. Launch only when explicitly requested.
 
@@ -207,7 +243,7 @@ Stop all UIs:
 python scripts/stop_all_uis.py
 ```
 
-## 6) Stage logs and output artifacts
+## 7) Stage logs and output artifacts
 
 Deployment summary JSON:
 

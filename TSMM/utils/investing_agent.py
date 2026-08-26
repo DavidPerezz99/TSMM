@@ -28,6 +28,7 @@ import yaml
 from .backtester import run_backtest_from_validation
 from .market_db import query_ohlc
 from .trading_reporter import generate_trading_plan_report
+from .trading_quality import apply_hybrid_trade_gate, model_quality_weight
 from .iqoption_adapter import IQOptionAdapter
 from .runtime_scope import resolve_runtime_file
 
@@ -61,6 +62,9 @@ class MT5Adapter:
         self._mt5 = None
 
     def connect(self) -> tuple[bool, str]:
+        if "enabled" in self.cfg and not bool(self.cfg.get("enabled")):
+            return False, "MT5 broker disabled by configuration"
+
         try:
             import MetaTrader5 as mt5  # type: ignore
         except Exception:
@@ -273,6 +277,136 @@ class MT5Adapter:
         mt5 = self._mt5
         orders = mt5.orders_get() or []
         return {"ok": True, "orders": [self._serialize_order(order) for order in orders]}
+
+    def get_account_snapshot(self) -> Dict[str, Any]:
+        """Return the account fields needed by pre-trade risk guards."""
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        info = self._mt5.account_info()
+        if info is None:
+            return {"ok": False, "message": "account_info returned None"}
+
+        return {
+            "ok": True,
+            "login": int(getattr(info, "login", 0) or 0),
+            "server": str(getattr(info, "server", "") or ""),
+            "company": str(getattr(info, "company", "") or ""),
+            "currency": str(getattr(info, "currency", "") or ""),
+            "balance": float(getattr(info, "balance", 0.0) or 0.0),
+            "equity": float(getattr(info, "equity", 0.0) or 0.0),
+            "profit": float(getattr(info, "profit", 0.0) or 0.0),
+            "margin": float(getattr(info, "margin", 0.0) or 0.0),
+            "margin_free": float(getattr(info, "margin_free", 0.0) or 0.0),
+            "trade_allowed": bool(getattr(info, "trade_allowed", False)),
+            "trade_expert": bool(getattr(info, "trade_expert", False)),
+        }
+
+    def estimate_trade_loss(
+        self,
+        symbol: str,
+        side: str,
+        volume: float,
+        entry: float,
+        stop_loss: float,
+    ) -> Dict[str, Any]:
+        """Estimate broker-currency loss at the requested hard stop."""
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        mt5 = self._mt5
+        side_token = str(side or "").strip().lower()
+        if side_token not in {"buy", "sell"}:
+            return {"ok": False, "message": f"unsupported side: {side_token}"}
+
+        entry_price = float(entry or 0.0)
+        stop_price = float(stop_loss or 0.0)
+        requested_volume = float(volume or 0.0)
+        if entry_price <= 0.0 or stop_price <= 0.0 or requested_volume <= 0.0:
+            return {"ok": False, "message": "entry, stop_loss, and volume must be positive"}
+
+        order_type = mt5.ORDER_TYPE_BUY if side_token == "buy" else mt5.ORDER_TYPE_SELL
+        estimate = mt5.order_calc_profit(order_type, str(symbol), requested_volume, entry_price, stop_price)
+        if estimate is None:
+            return {
+                "ok": False,
+                "message": "order_calc_profit returned None",
+                "last_error": mt5.last_error(),
+            }
+
+        estimated_pnl = float(estimate)
+        return {
+            "ok": True,
+            "symbol": str(symbol),
+            "side": side_token,
+            "volume": requested_volume,
+            "entry": entry_price,
+            "stop_loss": stop_price,
+            "estimated_pnl": estimated_pnl,
+            "estimated_loss": max(-estimated_pnl, 0.0),
+        }
+
+    def get_symbol_trade_spec(self, symbol: str) -> Dict[str, Any]:
+        """Return broker volume constraints used for fail-closed risk sizing."""
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+        info = self._mt5.symbol_info(str(symbol))
+        if info is None:
+            return {"ok": False, "message": "symbol_info returned None"}
+        return {
+            "ok": True,
+            "symbol": str(symbol),
+            "volume_min": float(getattr(info, "volume_min", 0.0) or 0.0),
+            "volume_max": float(getattr(info, "volume_max", 0.0) or 0.0),
+            "volume_step": float(getattr(info, "volume_step", 0.0) or 0.0),
+        }
+
+    def get_utc_day_realized_pnl(self, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
+        """Return today's closed trading P/L, including costs, from 00:00 UTC."""
+        ok, msg = self._require_mt5()
+        if not ok:
+            return {"ok": False, "message": msg}
+
+        now = now_utc or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        try:
+            deals = self._mt5.history_deals_get(start, now) or []
+        except Exception as exc:
+            return {"ok": False, "message": f"history_deals_get failed: {exc}"}
+
+        mt5 = self._mt5
+        closing_entries = {
+            int(getattr(mt5, "DEAL_ENTRY_OUT", -2001)),
+            int(getattr(mt5, "DEAL_ENTRY_OUT_BY", -2002)),
+            int(getattr(mt5, "DEAL_ENTRY_INOUT", -2003)),
+        }
+        realized = 0.0
+        counted = 0
+        for deal in deals:
+            entry_code = int(getattr(deal, "entry", -1) or -1)
+            if entry_code not in closing_entries:
+                continue
+            realized += float(getattr(deal, "profit", 0.0) or 0.0)
+            realized += float(getattr(deal, "commission", 0.0) or 0.0)
+            realized += float(getattr(deal, "swap", 0.0) or 0.0)
+            realized += float(getattr(deal, "fee", 0.0) or 0.0)
+            counted += 1
+
+        return {
+            "ok": True,
+            "start_utc": start.isoformat(),
+            "end_utc": now.isoformat(),
+            "realized_pnl": float(realized),
+            "closing_deals": int(counted),
+        }
 
     def _candidate_filling_modes(self, symbol: str) -> list[int]:
         mt5 = self._mt5
@@ -1280,6 +1414,14 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
     endpoint_map = dict(trading_cfg.get("model_endpoints") or {})
     project_root = Path(__file__).resolve().parents[1]
     config_root = project_root / "config"
+    endpoint_versions: Dict[str, Any] = {}
+    versions_path = config_root / "model_endpoint_versions.yaml"
+    if versions_path.exists():
+        try:
+            with versions_path.open("r", encoding="utf-8") as stream:
+                endpoint_versions = dict((yaml.safe_load(stream) or {}).get("endpoints") or {})
+        except Exception:
+            endpoint_versions = {}
     if not config_root.exists() or not endpoint_map:
         return []
 
@@ -1297,7 +1439,10 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
             best_model = ""
             best_r2 = -1.0
             for model_dir in [d for d in tf_dir.iterdir() if d.is_dir()]:
-                for cfg_file in list(model_dir.glob("*.yaml")) + list(model_dir.glob("*.yml")):
+                cfg_files = list(model_dir.glob("top1*.yaml")) + list(model_dir.glob("top1*.yml"))
+                if not cfg_files:
+                    cfg_files = list(model_dir.glob("*.yaml")) + list(model_dir.glob("*.yml"))
+                for cfg_file in cfg_files:
                     r2 = _parse_r2_from_filename(str(cfg_file))
                     if r2 > best_r2:
                         best_r2 = r2
@@ -1307,6 +1452,9 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
             if best_path is None:
                 continue
 
+            version_current = dict(
+                (endpoint_versions.get(f"{tf_label}_{family}") or {}).get("current") or {}
+            )
             discovered.append(
                 {
                     "family": family,
@@ -1314,6 +1462,8 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
                     "model": best_model,
                     "config_path": str(best_path),
                     "r2": float(best_r2),
+                    "refreshed_r2": version_current.get("refreshed_r2"),
+                    "validation_status": version_current.get("validation_status"),
                 }
             )
 
@@ -1350,6 +1500,9 @@ def _collect_agent_a_enrichment_signals(
     signals: Dict[str, Any] = {}
     weighted = 0.0
     total_w = 0.0
+    qualified_count = 0
+    quality_cfg = dict(trading_cfg.get("model_quality") or {})
+    minimum_r2 = float(quality_cfg.get("minimum_r2_for_vote", 0.0) or 0.0)
 
     for item in candidates:
         tf = str(item.get("timeframe") or "").strip()
@@ -1368,7 +1521,10 @@ def _collect_agent_a_enrichment_signals(
             conf = float(tf_sig.get("confidence", 0.5) or 0.5)
             signal = int(tf_sig.get("signal", 0) or 0)
             tf_weight = float(timeframe_weights.get(tf, 1.0))
-            vote_weight = max(conf, 0.01) * tf_weight
+            quality = model_quality_weight(item.get("r2"), item.get("refreshed_r2"), minimum_r2)
+            vote_weight = max(conf, 0.01) * tf_weight * float(quality["weight"])
+            if quality["qualified"] and signal != 0:
+                qualified_count += 1
 
             key = f"{item.get('family')}:{tf}"
             signals[key] = {
@@ -1377,6 +1533,9 @@ def _collect_agent_a_enrichment_signals(
                 "model": item.get("model"),
                 "config_path": item.get("config_path"),
                 "r2": item.get("r2"),
+                "refreshed_r2": item.get("refreshed_r2"),
+                "validation_status": item.get("validation_status"),
+                "quality": quality,
                 "signal": signal,
                 "confidence": conf,
                 "vote_weight": vote_weight,
@@ -1408,6 +1567,11 @@ def _collect_agent_a_enrichment_signals(
         "consensus": consensus,
         "consensus_score": float(consensus_score),
         "n_signals": len(signals),
+        "n_qualified_signals": qualified_count,
+        "avg_confidence": float(np.mean([
+            float(value.get("confidence", 0.5) or 0.5)
+            for value in signals.values() if float(value.get("vote_weight", 0.0) or 0.0) > 0.0
+        ])) if qualified_count else 0.0,
     }
 
 
@@ -1500,6 +1664,7 @@ def _apply_agent_a_enrichment_to_plan(
         "consensus_score": round(consensus_score, 4),
         "alignment": alignment,
         "n_signals": int(enrichment.get("n_signals", 0) or 0),
+        "n_qualified_signals": int(enrichment.get("n_qualified_signals", 0) or 0),
         "avg_confidence": round(avg_conf, 4),
         "signals": signals,
     }
@@ -1598,25 +1763,25 @@ def _apply_conviction_to_plan(
 
     # ── risk mode ──
     if raw_conviction >= min_no_sl:
-        risk_mode = "no_sl"
-        sl_mult = 5.0
-        tp_mult = 3.0
-        vol_mult = 1.5
-    elif raw_conviction >= min_wide:
-        risk_mode = "wide"
-        sl_mult = 1.5
-        tp_mult = 2.0
+        risk_mode = "standard"
+        sl_mult = 1.0
+        tp_mult = 1.0
         vol_mult = 1.0
-    elif raw_conviction >= min_standard:
+    elif raw_conviction >= min_wide:
         risk_mode = "standard"
         sl_mult = 1.0
         tp_mult = 1.0
         vol_mult = 0.75
+    elif raw_conviction >= min_standard:
+        risk_mode = "standard"
+        sl_mult = 1.0
+        tp_mult = 1.0
+        vol_mult = 0.5
     elif raw_conviction >= min_tight:
         risk_mode = "tight"
         sl_mult = 0.5
         tp_mult = 0.6
-        vol_mult = 0.5
+        vol_mult = 0.25
     else:
         risk_mode = "skip"
         sl_mult = 0.0
@@ -1629,11 +1794,7 @@ def _apply_conviction_to_plan(
         entry = float(out.get("entry") or 0.0)
         sl_pct = base_sl_pct * sl_mult
         tp_pct = base_tp_pct * tp_mult
-        if risk_mode == "no_sl":
-            out["stop_loss"] = None
-            out["take_profit"] = round(entry * (1 + tp_mult * base_tp_pct if decision == "buy" else 1 - tp_mult * base_tp_pct), 6)
-            out["risk_notes"].append(f"Conviction={raw_conviction:.3f}: NO STOP LOSS mode (wide SL={sl_pct*100:.1f}%).")
-        elif decision == "buy":
+        if decision == "buy":
             out["stop_loss"] = round(entry * (1 - sl_pct), 6)
             out["take_profit"] = round(entry * (1 + tp_pct), 6)
         else:
@@ -1641,8 +1802,8 @@ def _apply_conviction_to_plan(
             out["take_profit"] = round(entry * (1 - tp_pct), 6)
 
         if vol_mult != 1.0:
-            volume = round(base_volume * vol_mult, 4)
-            out["volume"] = max(volume, 0.01)
+            volume = round(base_volume * vol_mult, 6)
+            out["volume"] = max(volume, 0.0)
             out["risk_notes"].append(f"Volume adjusted by conviction ({vol_mult}x) to {out.get('volume')}.")
 
         out["conviction"] = {
@@ -1871,24 +2032,35 @@ def _discover_endpoint_specs(
                     "r2": _parse_r2_from_filename(pref_path),
                 }
 
-        for model_name in os.listdir(tf_dir):
-            if preferred_model and str(model_name).strip().lower() != preferred_model:
-                continue
-            model_dir = os.path.join(tf_dir, model_name)
-            if not os.path.isdir(model_dir):
-                continue
-            for fn in os.listdir(model_dir):
-                if not fn.lower().endswith((".yaml", ".yml")):
+        # An explicit endpoint config is authoritative. Otherwise select from
+        # the active top1 files only, so historical runners-up and nested
+        # legacy versions cannot silently replace the promoted endpoint model.
+        if best is None:
+            for model_name in os.listdir(tf_dir):
+                if preferred_model and str(model_name).strip().lower() != preferred_model:
                     continue
-                full = os.path.join(model_dir, fn)
-                rec = {
-                    "timeframe": tf_label,
-                    "model": str(model_name),
-                    "config_path": full,
-                    "r2": _parse_r2_from_filename(full),
-                }
-                if best is None or float(rec["r2"]) > float(best["r2"]):
-                    best = rec
+                model_dir = os.path.join(tf_dir, model_name)
+                if not os.path.isdir(model_dir):
+                    continue
+                filenames = [
+                    fn for fn in os.listdir(model_dir)
+                    if fn.lower().endswith((".yaml", ".yml")) and fn.lower().startswith("top1")
+                ]
+                if not filenames:
+                    filenames = [
+                        fn for fn in os.listdir(model_dir)
+                        if fn.lower().endswith((".yaml", ".yml"))
+                    ]
+                for fn in filenames:
+                    full = os.path.join(model_dir, fn)
+                    rec = {
+                        "timeframe": tf_label,
+                        "model": str(model_name),
+                        "config_path": full,
+                        "r2": _parse_r2_from_filename(full),
+                    }
+                    if best is None or float(rec["r2"]) > float(best["r2"]):
+                        best = rec
 
         if best is None:
             continue
@@ -2318,6 +2490,7 @@ def run_investing_agent(
 
     # Conviction assessment — modulates SL/TP/sizing based on signal strength
     plan = _apply_conviction_to_plan(plan, enrichment, trading_cfg)
+    plan = apply_hybrid_trade_gate(plan, trading_cfg)
 
     backtest = run_backtest_from_validation(
         results.get("df"),

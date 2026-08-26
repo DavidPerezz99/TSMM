@@ -1632,6 +1632,184 @@ def _order_risk_levels_for_plan(plan: Dict[str, Any], trading_cfg: Dict[str, Any
     }
 
 
+def _prop_firm_guard_preflight(
+    adapter: MT5Adapter,
+    trading_cfg: Dict[str, Any],
+    symbol: str,
+    side: str,
+    volume: float,
+    entry: float,
+    stop_loss: float,
+) -> Dict[str, Any]:
+    """Fail closed before an order can consume a prop-firm risk allowance."""
+    cfg = dict((trading_cfg.get("prop_firm_guard") or {}))
+    sizing_cfg = dict(((trading_cfg.get("risk") or {}).get("account_sizing") or {}))
+    sizing_enabled = bool(sizing_cfg.get("enabled", False))
+    effective_volume = float(volume or 0.0)
+    sizing: Dict[str, Any] = {"enabled": sizing_enabled, "requested_volume": effective_volume}
+    if sizing_enabled:
+        if float(stop_loss or 0.0) <= 0.0:
+            return {"ok": False, "enabled": True, "reason": "account_sizing_requires_hard_stop", "sizing": sizing}
+        account = adapter.get_account_snapshot()
+        symbol_spec = adapter.get_symbol_trade_spec(symbol)
+        sizing["account"] = account
+        sizing["symbol_spec"] = symbol_spec
+        if not account.get("ok") or not symbol_spec.get("ok"):
+            return {"ok": False, "enabled": True, "reason": "account_sizing_broker_metadata_failed", "sizing": sizing}
+        equity = max(float(account.get("equity", 0.0) or 0.0), 0.0)
+        risk_pct = max(float((trading_cfg.get("risk") or {}).get("risk_per_trade_pct", 0.5) or 0.5), 0.0)
+        allowance = equity * risk_pct / 100.0
+        one_lot = adapter.estimate_trade_loss(
+            symbol=symbol, side=side, volume=1.0, entry=entry, stop_loss=stop_loss
+        )
+        sizing["one_lot_loss"] = one_lot
+        if not one_lot.get("ok") or float(one_lot.get("estimated_loss", 0.0) or 0.0) <= 0.0:
+            return {"ok": False, "enabled": True, "reason": "account_sizing_loss_estimate_failed", "sizing": sizing}
+        risk_sized_volume = allowance / float(one_lot["estimated_loss"])
+        raw_volume = min(risk_sized_volume, effective_volume) if effective_volume > 0.0 else risk_sized_volume
+        volume_min = max(float(symbol_spec.get("volume_min", 0.0) or 0.0), 0.0)
+        volume_max = max(float(symbol_spec.get("volume_max", raw_volume) or raw_volume), 0.0)
+        volume_step = max(float(symbol_spec.get("volume_step", volume_min) or volume_min), 1e-12)
+        stepped_volume = int((min(raw_volume, volume_max) + 1e-12) / volume_step) * volume_step
+        precision = max(0, min(8, len(f"{volume_step:.8f}".rstrip("0").split(".")[-1])))
+        effective_volume = round(stepped_volume, precision)
+        sizing.update({"equity": equity, "risk_pct": risk_pct, "risk_allowance": allowance,
+                       "risk_sized_volume": risk_sized_volume, "raw_volume": raw_volume,
+                       "effective_volume": effective_volume})
+        if effective_volume < volume_min or effective_volume <= 0.0:
+            return {"ok": False, "enabled": True, "reason": "minimum_broker_volume_exceeds_risk_budget", "sizing": sizing}
+
+    if not bool(cfg.get("enabled", False)):
+        return {"ok": True, "enabled": False, "reason": "guard_disabled", "sized_volume": effective_volume, "sizing": sizing}
+
+    result: Dict[str, Any] = {"ok": False, "enabled": True, "checks": {}}
+
+    require_hard_stop = bool(cfg.get("require_hard_stop", True))
+    if require_hard_stop and float(stop_loss or 0.0) <= 0.0:
+        result["reason"] = "hard_stop_required"
+        return result
+
+    positions_res = adapter.list_open_positions()
+    orders_res = adapter.list_pending_orders()
+    if not positions_res.get("ok") or not orders_res.get("ok"):
+        result["reason"] = "broker_exposure_check_failed"
+        result["positions_check"] = positions_res
+        result["orders_check"] = orders_res
+        return result
+
+    positions = list(positions_res.get("positions") or [])
+    orders = list(orders_res.get("orders") or [])
+    result["checks"]["open_positions"] = len(positions)
+    result["checks"]["pending_orders"] = len(orders)
+    if bool(cfg.get("block_on_any_account_exposure", True)) and (positions or orders):
+        result["reason"] = "existing_account_exposure"
+        result["exposure"] = {
+            "positions": positions,
+            "orders": orders,
+        }
+        return result
+
+    account = adapter.get_account_snapshot()
+    if not account.get("ok"):
+        result["reason"] = "account_snapshot_failed"
+        result["account"] = account
+        return result
+    result["account"] = account
+
+    expected_login_env = str(cfg.get("expected_login_env") or "").strip()
+    if expected_login_env:
+        expected_login_raw = str(os.environ.get(expected_login_env, "") or "").strip()
+        if not expected_login_raw:
+            result["reason"] = "expected_login_environment_missing"
+            return result
+        if str(int(account.get("login", 0) or 0)) != expected_login_raw:
+            result["reason"] = "unexpected_broker_account"
+            return result
+
+    expected_server = str(cfg.get("expected_server") or "").strip()
+    if expected_server and str(account.get("server") or "").strip().lower() != expected_server.lower():
+        result["reason"] = "unexpected_broker_server"
+        return result
+
+    expected_currency = str(cfg.get("expected_currency") or "").strip()
+    if expected_currency and str(account.get("currency") or "").strip().upper() != expected_currency.upper():
+        result["reason"] = "unexpected_account_currency"
+        return result
+
+    if not bool(account.get("trade_allowed", False)) or not bool(account.get("trade_expert", False)):
+        result["reason"] = "broker_does_not_allow_expert_trading"
+        return result
+
+    loss_estimate = adapter.estimate_trade_loss(
+        symbol=str(symbol),
+        side=str(side),
+        volume=float(effective_volume),
+        entry=float(entry),
+        stop_loss=float(stop_loss),
+    )
+    result["loss_estimate"] = loss_estimate
+    if not loss_estimate.get("ok"):
+        result["reason"] = "planned_loss_estimate_failed"
+        return result
+
+    estimated_loss = float(loss_estimate.get("estimated_loss", 0.0) or 0.0)
+    hard_single_trade_loss = max(float(cfg.get("hard_single_trade_loss_usd", 0.0) or 0.0), 0.0)
+    internal_trade_loss = max(float(cfg.get("internal_trade_loss_cap_usd", hard_single_trade_loss) or hard_single_trade_loss), 0.0)
+    if hard_single_trade_loss > 0.0 and estimated_loss >= hard_single_trade_loss:
+        result["reason"] = "hard_single_trade_loss_limit"
+        return result
+    if internal_trade_loss > 0.0 and estimated_loss > internal_trade_loss:
+        result["reason"] = "internal_trade_loss_cap"
+        return result
+
+    day_pnl = adapter.get_utc_day_realized_pnl()
+    result["utc_day"] = day_pnl
+    if not day_pnl.get("ok"):
+        result["reason"] = "utc_day_pnl_check_failed"
+        return result
+
+    realized_pnl = float(day_pnl.get("realized_pnl", 0.0) or 0.0)
+    projected_daily_loss = max(-realized_pnl, 0.0) + estimated_loss
+    result["checks"]["projected_daily_loss"] = projected_daily_loss
+    hard_daily_loss = max(float(cfg.get("hard_daily_loss_usd", 0.0) or 0.0), 0.0)
+    internal_daily_loss = max(float(cfg.get("internal_daily_loss_cap_usd", hard_daily_loss) or hard_daily_loss), 0.0)
+    if hard_daily_loss > 0.0 and projected_daily_loss >= hard_daily_loss:
+        result["reason"] = "hard_daily_loss_limit"
+        return result
+    if internal_daily_loss > 0.0 and projected_daily_loss > internal_daily_loss:
+        result["reason"] = "internal_daily_loss_cap"
+        return result
+
+    initial_balance = max(float(cfg.get("initial_balance_usd", 0.0) or 0.0), 0.0)
+    hard_shield_pct = min(max(float(cfg.get("hard_dynamic_shield_pct", 0.0) or 0.0), 0.0), 100.0)
+    balance = float(account.get("balance", 0.0) or 0.0)
+    equity = float(account.get("equity", 0.0) or 0.0)
+    projected_equity = equity - estimated_loss
+    result["checks"]["projected_equity"] = projected_equity
+
+    if initial_balance > 0.0 and hard_shield_pct > 0.0:
+        observed_peak = max(initial_balance, balance, equity)
+        hard_floor = min(observed_peak * (1.0 - hard_shield_pct / 100.0), initial_balance)
+        result["checks"]["observed_dynamic_shield_floor"] = hard_floor
+        if projected_equity <= hard_floor:
+            result["reason"] = "dynamic_risk_shield_buffer"
+            return result
+
+    internal_equity_buffer = max(float(cfg.get("internal_equity_buffer_usd", 0.0) or 0.0), 0.0)
+    if initial_balance > 0.0 and internal_equity_buffer > 0.0:
+        internal_floor = max(initial_balance - internal_equity_buffer, balance - internal_equity_buffer)
+        result["checks"]["internal_equity_floor"] = internal_floor
+        if projected_equity <= internal_floor:
+            result["reason"] = "internal_equity_buffer"
+            return result
+
+    result["ok"] = True
+    result["reason"] = "all_prop_firm_checks_passed"
+    result["sized_volume"] = effective_volume
+    result["sizing"] = sizing
+    return result
+
+
 def _place_programmed_order(
     adapter: MT5Adapter,
     app_config: Dict[str, Any],
@@ -5563,6 +5741,20 @@ def _execute_approved_order(
     max_wait_fill_minutes = int(tj.get("max_wait_fill_minutes", 420) or 420)
     submission_mode = str(state.get("order_submission_mode") or _agent_a_order_submission_mode(plan, trading_cfg))
 
+    shadow_cfg = dict(trading_cfg.get("shadow_mode") or {})
+    if bool(shadow_cfg.get("enabled", False)):
+        state["status"] = "completed"
+        state["closed_reason"] = "shadow_mode_no_broker_submission"
+        state["shadow_evaluation"] = {
+            "enabled": True,
+            "recorded_at": _iso(_now_utc()),
+            "decision": decision,
+            "plan": plan,
+        }
+        state["ended_at"] = _iso(_now_utc())
+        _save_job_state(output_dir, trading_cfg, state_file, state)
+        return state
+
     mt5_cfg = (((trading_cfg.get("broker") or {}).get("mt5") or {}))
     adapter = MT5Adapter(mt5_cfg)
     ok_conn, msg_conn = adapter.connect()
@@ -5677,7 +5869,66 @@ def _execute_approved_order(
             _save_job_state(output_dir, trading_cfg, state_file, state)
             return state
 
+        def _finalize_prop_firm_guard_block(blocked_order: Dict[str, Any]) -> Dict[str, Any]:
+            guard = dict(blocked_order.get("guard") or {})
+            reason = str(guard.get("reason") or blocked_order.get("message") or "prop_firm_guard_blocked")
+            state["prop_firm_guard"] = guard
+            state["order"] = {
+                "ok": False,
+                "blocked": True,
+                "message": "prop_firm_guard_blocked",
+                "reason": reason,
+            }
+            state.setdefault("notifications", []).append(
+                _notify(
+                    output_dir=output_dir,
+                    trading_cfg=trading_cfg,
+                    channel="agent_a",
+                    kind="prop_firm_guard_blocked",
+                    message=(
+                        "The prop-firm safety guard blocked this MT5 order before submission. "
+                        f"reason={reason}. No broker order was sent."
+                    ),
+                    requires_approval=False,
+                    emergency=False,
+                    approval_deadline_utc=None,
+                    metadata={"signal_json_path": signal_json_path, "guard": guard},
+                    force_telegram=True,
+                    job_id=resolved_job_id,
+                )
+            )
+            state["status"] = "completed"
+            state["closed_reason"] = f"prop_firm_guard_blocked:{reason}"
+            state["ended_at"] = _iso(_now_utc())
+            _save_job_state(output_dir, trading_cfg, state_file, state)
+            return state
+
         def _submit_order_attempt() -> Dict[str, Any]:
+            guard = _prop_firm_guard_preflight(
+                adapter=adapter,
+                trading_cfg=trading_cfg,
+                symbol=schedule_symbol,
+                side=target_side,
+                volume=target_volume,
+                entry=target_entry,
+                stop_loss=order_stop_loss,
+            )
+            state["prop_firm_guard"] = guard
+            _save_job_state(output_dir, trading_cfg, state_file, state)
+            if not guard.get("ok"):
+                return {
+                    "ok": False,
+                    "prop_firm_guard_blocked": True,
+                    "message": "prop_firm_guard_blocked",
+                    "guard": guard,
+                }
+
+            effective_volume = _safe_float(guard.get("sized_volume"), target_volume)
+            effective_plan = dict(plan)
+            effective_plan["volume"] = effective_volume
+            state["plan"] = effective_plan
+            state["account_risk_sizing"] = guard.get("sizing")
+
             if submission_mode == "programmed":
                 state.pop("programmed_order_expiration_utc", None)
 
@@ -5710,7 +5961,7 @@ def _execute_approved_order(
                         symbol=schedule_symbol,
                         side=target_side,
                         entry=target_entry,
-                        volume=target_volume,
+                        volume=effective_volume,
                         entry_tolerance=duplicate_entry_tolerance,
                         volume_tolerance=duplicate_volume_tolerance,
                         tsmm_only=duplicate_tsmm_only,
@@ -5763,7 +6014,7 @@ def _execute_approved_order(
                     adapter,
                     app_config,
                     trading_cfg,
-                    plan,
+                    effective_plan,
                     expiration_utc=programmed_order_expiration_utc,
                 )
 
@@ -5771,12 +6022,14 @@ def _execute_approved_order(
             return adapter.place_market_order(
                 symbol=schedule_symbol,
                 side=str(plan.get("decision", "hold")).lower(),
-                volume=target_volume,
+                volume=effective_volume,
                 stop_loss=order_stop_loss,
                 take_profit=order_take_profit,
             )
 
         order_res = _submit_order_attempt()
+        if order_res.get("prop_firm_guard_blocked"):
+            return _finalize_prop_firm_guard_block(order_res)
         if order_res.get("dedup_blocked"):
             return _finalize_duplicate_guard_block(order_res)
         if not order_res.get("ok") and _is_market_closed_retcode(order_res):
@@ -5809,6 +6062,8 @@ def _execute_approved_order(
                 time.sleep(wait_seconds)
                 state["status"] = "agent_a_completed"
                 order_res = _submit_order_attempt()
+                if order_res.get("prop_firm_guard_blocked"):
+                    return _finalize_prop_firm_guard_block(order_res)
                 if order_res.get("dedup_blocked"):
                     return _finalize_duplicate_guard_block(order_res)
 

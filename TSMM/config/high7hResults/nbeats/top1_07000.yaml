@@ -47,10 +47,14 @@ confidence:
   n_estimators: 100
   test_size: 0.4
   threshold: 0.5
-data_path: data/xauusd/xauusd_7h_2009.csv
+data_path: data/market_data.sqlite
+data_timeframe_minutes: 420
+sql_symbol: XAUUSD
+sql_source_mode: auto
+use_sql_master: true
 date_col: DATE
 end_date: ''
-epochs: 60
+epochs: 80
 exclude_cols: []
 forecast_validation:
   enabled: true
@@ -58,17 +62,11 @@ forecast_validation:
   max_growth_rate: 2.0
 horizon: 6
 inference_batches: 1
-input_features: &id001
+input_features:
 - HIGH
 - y_diff
 - Low_return
 - Price_return
-input_target_sets:
-  input_features: *id001
-  target_features: &id002
-  - y_diff
-  - Price_return
-  - Low_return
 lags:
 - 2
 - 7
@@ -80,35 +78,36 @@ model_dir: models
 models_to_run:
   multivariate: []
   univariate:
-  - ulr
-n_steps: 10
+  - nbeats
+n_steps: 6
 nbeats:
   batch_size: 32
   blackbox_config:
     num_blocks: 4
     num_layers: 4
   device: cpu
-  epochs: 100
-  hidden_size: 512
+  epochs: 60
+  hidden_size: 128
   learning_rate: 0.001
   model_type: interpretable
   patience_es: 20
   patience_rlr: 10
   stacks_config:
   - degree: 3
-    hidden_size: 256
+    hidden_size: 128
     num_blocks: 3
     type: trend
-  - hidden_size: 256
-    num_blocks: 3
-    num_harmonics: 6
+  - hidden_size: 128
+    num_blocks: 6
+    num_harmonics: 24
     type: seasonality
 output:
   directory: reports
   filename_prefix: forecast_report
   format: pdf
 problem_type: univariate
-records: 12000
+timeframe: 7h
+records: 1000
 rolling_windows:
 - 2
 - 7
@@ -118,8 +117,11 @@ seasonal_period: 15
 split_ratio: 0.82
 start_date: ''
 target_col: HIGH
-target_features: *id002
-test_size: 3
+target_features:
+- y_diff
+- Price_return
+- Low_return
+test_size: 5
 watermark_opacity: 0.1
 watermark_path: vrz.png
 watermark_size: 70

@@ -931,16 +931,20 @@ def evaluate_models(models, df, config):
                 print('Starting N-BEATS Evaluation')
                 scalers = model_data['scalers']
                 device = model_data.get('device', 'cpu')
+                model_test_size = max(
+                    int(test_size),
+                    int((model_data.get('parameters') or {}).get('test_size', test_size) or test_size),
+                )
 
                 # Prepare validation window
-                val_start = -(test_size + n_steps)
-                val_end = -test_size
+                val_start = -(model_test_size + n_steps)
+                val_end = -model_test_size
                 X_val = df[input_features].iloc[val_start:val_end].values
                 X_last = df[input_features].iloc[-n_steps:].values
 
                 # Get predictions
                 y_val_pred = recursive_forecast_nbeats(
-                    model, scalers, X_val, test_size,
+                    model, scalers, X_val, model_test_size,
                     n_steps, n_features, config, max_window,
                     input_features, target_features, m_steps, device
                 )
@@ -951,7 +955,7 @@ def evaluate_models(models, df, config):
                     input_features, target_features, m_steps, device
                 )
 
-                y_val_true = df[target_features].iloc[-test_size:].values
+                y_val_true = df[target_features].iloc[-model_test_size:].values
                 min_val_length = min(len(y_val_true), len(y_val_pred))
 
                 # Calculate confidence intervals

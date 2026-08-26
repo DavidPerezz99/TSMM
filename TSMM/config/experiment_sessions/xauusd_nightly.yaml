@@ -1,0 +1,216 @@
+# Complete, manually started XAUUSD recalibration program.
+# Every timeframe/target pair is an independent ordered and resumable sweep.
+session_name: xauusd_all_ohlc_timeframes_v1
+manual_start_only: true
+deadline_local: "05:00"
+worthy_r2_threshold: 0.6
+stop_entry_on_worthy_artifact: true
+minimum_start_window_minutes: 30
+
+# Zero continues until the deadline. The CLI can override this with
+# --max-experiments 1 (single experiment) or another manual batch size.
+max_experiments_per_run: 0
+output_root: output/hypersearch_sessions
+
+data_source:
+  db_path: data/market_data.sqlite
+  symbol: XAUUSD
+  timeframes_minutes: [10, 30, 60, 180, 420, 720, 1440]
+
+resources:
+  max_process_ram_gb: 20.0
+  min_free_ram_before_start_gb: 6.0
+  critical_free_ram_gb: 2.0
+  cpu_threads_per_experiment: 6
+  max_estimated_experiment_minutes: 90
+
+# These profiles pair an OHLC target with valid feature recipes. Keeping the
+# profile paired prevents a HIGH target from being accidentally combined with
+# an OPEN/LOW/CLOSE feature search definition.
+target_profiles:
+  OPEN:
+    target_col: [OPEN]
+    input_target_sets:
+      - input_features: [OPEN, y_diff, Open_return, Price_return]
+        target_features: [y_diff, Open_return, Price_return]
+      - input_features: [OPEN, y_diff, Low_return, High_return, Price_return]
+        target_features: [y_diff, Price_return, Low_return, High_return]
+      - input_features: [OPEN, y_diff, Price_return]
+        target_features: [y_diff, Price_return]
+  HIGH:
+    target_col: [HIGH]
+    input_target_sets:
+      - input_features: [HIGH, y_diff, High_return, Price_return]
+        target_features: [y_diff, High_return, Price_return]
+      - input_features: [HIGH, y_diff, Low_return, Price_return]
+        target_features: [y_diff, Price_return, Low_return]
+      - input_features: [HIGH, y_diff, Open_return, Low_return, Price_return]
+        target_features: [y_diff, Price_return, Open_return, Low_return]
+  LOW:
+    target_col: [LOW]
+    input_target_sets:
+      - input_features: [LOW, y_diff, Low_return, Price_return]
+        target_features: [y_diff, Low_return, Price_return]
+      - input_features: [LOW, y_diff, High_return, Price_return]
+        target_features: [y_diff, Price_return, High_return]
+      - input_features: [LOW, y_diff, Open_return, High_return, Price_return]
+        target_features: [y_diff, Price_return, Open_return, High_return]
+  CLOSE:
+    target_col: [CLOSE]
+    input_target_sets:
+      - input_features: [CLOSE, y_diff, Price_return]
+        target_features: [y_diff, Price_return]
+      - input_features: [CLOSE, y_diff, Open_return, Price_return]
+        target_features: [y_diff, Open_return, Price_return]
+      - input_features: [CLOSE, y_diff, High_return, Low_return, Price_return]
+        target_features: [y_diff, Price_return, High_return, Low_return]
+
+# Strict execution order: shortest timeframe first, then OPEN/HIGH/LOW/CLOSE.
+# ULR and N-BEATS configurations remain isolated inside every entry.
+experiments:
+  - name: xauusd_10m_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 432
+  - name: xauusd_10m_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 432
+  - name: xauusd_10m_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 432
+  - name: xauusd_10m_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 432
+
+  - name: xauusd_30m_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 432
+  - name: xauusd_30m_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 432
+  - name: xauusd_30m_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 432
+  - name: xauusd_30m_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 432
+
+  - name: xauusd_1h_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_1h_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 324
+  - name: xauusd_1h_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_1h_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 324
+  - name: xauusd_1h_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_1h_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 324
+  - name: xauusd_1h_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_1h_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 324
+
+  - name: xauusd_3h_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 432
+  - name: xauusd_3h_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 432
+  - name: xauusd_3h_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 432
+  - name: xauusd_3h_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 432
+
+  - name: xauusd_7h_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 432
+  - name: xauusd_7h_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 432
+  - name: xauusd_7h_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 432
+  - name: xauusd_7h_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 432
+
+  - name: xauusd_12h_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_12h_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 324
+  - name: xauusd_12h_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_12h_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 324
+  - name: xauusd_12h_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_12h_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 324
+  - name: xauusd_12h_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_12h_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 324
+
+  - name: xauusd_24h_open
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_24h_ohlc_return.yaml
+    target_profile: OPEN
+    max_experiments: 243
+  - name: xauusd_24h_high
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_24h_ohlc_return.yaml
+    target_profile: HIGH
+    max_experiments: 243
+  - name: xauusd_24h_low
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_24h_ohlc_return.yaml
+    target_profile: LOW
+    max_experiments: 243
+  - name: xauusd_24h_close
+    base_config: config_templates/univariate.yaml
+    sweep_config: config/sweeps/sweep_24h_ohlc_return.yaml
+    target_profile: CLOSE
+    max_experiments: 243

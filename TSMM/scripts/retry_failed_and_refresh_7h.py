@@ -11,7 +11,7 @@ from typing import Dict, List
 
 ROOT = Path(__file__).resolve().parents[1]
 SUMMARY_PATH = ROOT / "reports" / "runtime" / "deployment_pipeline_last.json"
-FINAL_7H_CFG = ROOT / "config" / "high7hResults" / "ulr" / "top1_07890.yaml"
+FINAL_7H_CFG = ROOT / "config" / "high7hResults" / "nbeats" / "top1_07000.yaml"
 MODEL_DIR = ROOT / "model_files"
 
 

@@ -1,0 +1,419 @@
+agent:
+  enabled: true
+  mode: mode_a
+  default_start_mode_a: true
+  confirm_live_execution: true
+  signal_interpretation: contrarian
+  followup_agent_a_requires_approval: true
+  followup_agent_a_submission_mode: programmed
+  approval_channels:
+  - telegram
+  timezone: America/Bogota
+
+mode_a:
+  enabled: true
+  max_operations_per_session: 1
+  allow_long: true
+  allow_short: true
+  selected_model: ''
+  use_llm_explanation: true
+  block_on_confidence_thresholds: true
+  block_on_input_fooling_risk: true
+
+agent_a_fallback:
+  enabled: true
+  auto_discover: true
+  target_families: [high, low, close, open]
+  prefer_timeframes: [3h, 1h, 30m, 12h, 24h, 1w]
+  max_attempts: 12
+  attempts:
+  - config_path: config/high3hResults/nbeats/top1_09353.yaml
+    timeframe: 3h
+    model: nbeats
+  - config_path: config/high30mResults/nbeats/top1_07163.yaml
+    timeframe: 30m
+    model: nbeats
+
+mode_b:
+  enabled: true
+  allow_open_new_positions: false
+  manage_existing_positions: true
+  poll_seconds: 300
+  allow_endpoint_signals: true
+  # Scores are bounded to [-1, 1], so this disables model-driven fast closes.
+  close_consensus_threshold: 1.1
+  interrupt_flag_path: reports/runtime/oracle/mode_b_interrupt.flag
+  operation_limits:
+    per_timeframe:
+      30m: 1
+      1h: 1
+      3h: 1
+      7h: 1
+      12h: 1
+      24h: 1
+      1w: 1
+
+conviction:
+  enabled: false
+  min_conviction_for_no_sl: 1.1
+  min_conviction_for_wide: 1.1
+  min_conviction_for_standard: 0.45
+  min_conviction_for_tight: 0.3
+  historical_weight: 0.25
+  memory_max_trades: 100
+
+risk:
+  risk_per_trade_pct: 0.25
+  daily_max_loss_pct: 1.0
+  weekly_max_loss_pct: 2.0
+  max_drawdown_pct: 2.0
+  max_open_positions: 1
+  stop_loss_pct: 0.25
+  take_profit_pct: 0.60
+  trailing:
+    enabled: false
+    mode: probability
+    trail_pct_base: 0.25
+    breakeven_activation_ratio: 0.75
+    min_confidence_to_extend: 0.70
+  min_confidence_to_trade: 0.58
+  min_cm_accuracy_to_trade: 0.55
+  max_input_fooling_risk: 0.35
+
+prop_firm_guard:
+  enabled: true
+  program: Upcomers Oracle 5K
+  expected_login_env: MT5_UPCOMERS_ORACLE_LOGIN
+  expected_server: Upcomers-Server
+  expected_currency: USD
+  initial_balance_usd: 5000.0
+  hard_dynamic_shield_pct: 5.0
+  hard_daily_loss_usd: 200.0
+  hard_single_trade_loss_usd: 100.0
+  internal_trade_loss_cap_usd: 20.0
+  internal_daily_loss_cap_usd: 50.0
+  internal_equity_buffer_usd: 100.0
+  require_hard_stop: true
+  block_on_any_account_exposure: true
+
+execution:
+  symbol: XAUUSD
+  default_volume: 0.01
+  delayed_stop_loss:
+    enabled: false
+    allowed_conviction_modes: [no_sl]
+    min_conviction: 1.1
+    max_volume_multiplier: 1.0
+    max_unprotected_seconds: 0
+    max_unprotected_adverse_pct: 0.0
+  market_schedule:
+    timezone: America/Bogota
+    max_wait_seconds: 7200
+    closed_windows:
+      XAUUSD:
+      - start: '16:00'
+        end: '17:00'
+  allowed_volume_by_timeframe:
+    30m: 0.01
+    1h: 0.01
+    3h: 0.01
+    7h: 0.01
+    12h: 0.01
+    24h: 0.01
+    1w: 0.01
+  slippage_bps: 3.0
+  commission_per_trade: 0.0
+  spread_bps: 3.0
+
+broker:
+  active: mt5
+  mt5:
+    enabled: true
+    login: env:MT5_UPCOMERS_ORACLE_LOGIN
+    password: env:MT5_UPCOMERS_ORACLE_PASSWORD
+    server: Upcomers-Server
+    path: env:MT5_UPCOMERS_TERMINAL_PATH
+  iqoption:
+    enabled: false
+    email: env:IQOPTION_EMAIL
+    password: env:IQOPTION_PASSWORD
+    balance_mode: PRACTICE
+
+model_endpoints:
+  10m:
+    url: http://127.0.0.1:8000/predict/10m
+    model: nbeats
+    config_path: config/high10mResults/nbeats/top1_06000.yaml
+  30m: http://127.0.0.1:8000/predict/30m
+  1h: http://127.0.0.1:8000/predict/1h
+  3h: http://127.0.0.1:8000/predict/3h
+  7h:
+    url: http://127.0.0.1:8000/predict/7h
+    model: nbeats
+    config_path: config/high7hResults/nbeats/top1_07000.yaml
+  12h:
+    url: http://127.0.0.1:8000/predict/12h
+    model: nbeats
+    config_path: config/high12hResults/nbeats/top1_04098.yaml
+  24h: http://127.0.0.1:8000/predict/24h
+  1w: http://127.0.0.1:8000/predict/1w
+
+reporting:
+  enabled: true
+  output_dir: reports/trading_plans/oracle
+  filename_prefix: oracle_trading_plan
+
+probability_maps:
+  enabled: true
+  n_paths: 1200
+  n_price_bins: 70
+
+trading_job:
+  order_submission_mode: programmed
+  prevent_duplicate_programmed_orders: true
+  prevent_new_programmed_when_open_position: true
+  prevent_new_programmed_when_pending_exists: true
+  duplicate_tsmm_only: false
+  intentional_same_side_stacking:
+    enabled: false
+    max_same_side_orders: 1
+    auto_enable_on_high_confidence: false
+    auto_stack_confidence_threshold: 1.1
+    auto_stack_target_orders: 1
+  session_hours: 7
+  first_session_grounding_timeframe: 7h
+  repeat_session_grounding_timeframe: 3h
+  live_request_grounding_timeframes: [1h, 30m]
+  approval_after_hours: 24
+  extension_max_hours: 24
+  extension_request_window_minutes: 15
+  approval_timeout_seconds: 1800
+  fill_check_seconds: 30
+  programmed_order_expiration_minutes: 180
+  max_wait_fill_minutes: 180
+  cleanup_closed_jobs: true
+
+runtime:
+  root_dir: reports/runtime/oracle
+  job_id_prefix: ORACLE
+  profile_label: Upcomers Oracle 5K
+
+account_mirror:
+  enabled: false
+
+opposing_countertrade:
+  enabled: false
+  allow_source_buy: false
+  launch_when_source_submission_mode: programmed
+  min_source_confidence: 1.1
+  target_price_tolerance_abs: 2.0
+  stop_distance_multiplier: 1.0
+
+autonomous_trading:
+  enabled: false
+  timezone: America/Bogota
+  scan_interval_seconds: 900
+  max_jobs_per_session: 1
+  block_after_manual_or_external_close: true
+  pending_order_maintenance:
+    enabled: true
+    assessment_timeout_seconds: 3.0
+    cancel_opposed_consensus_threshold: 0.25
+    entry_cross_tolerance_abs: 0.05
+  followup_enabled: false
+  followup_submission_mode: programmed
+  mandatory_session_cooldown_seconds: 3600
+  followup_cooldown_seconds: 3600
+  max_followup_launches_per_session: 0
+  max_filtered_followups_per_session: 0
+  min_success_probability_for_followup: 0.65
+  min_confidence_for_followup: 0.60
+  min_cm_accuracy_for_followup: 0.55
+  max_input_fooling_risk_for_followup: 0.35
+  require_consensus_alignment_for_followup: true
+  session_windows:
+  - name: asia_australia
+    start: '17:00'
+    end: '07:00'
+  - name: london
+    start: '07:00'
+    end: '14:00'
+  - name: new_york
+    start: '14:00'
+    end: '21:00'
+
+llm:
+  enabled: true
+  provider: local_ollama
+  providers_config_path: config/llm_providers.yaml
+  timeout_seconds: 120
+  assist_every_seconds: 300
+  signal_analysis:
+    enabled: true
+    max_context_chars: 14000
+    include_sentiment: true
+    include_technical_metrics: true
+
+sentiment:
+  enabled: true
+  symbol: GC=F
+  enable_yahoo: true
+  enable_reddit: true
+  enable_tradingview: true
+  tradingview_symbol: XAUUSD
+  enable_x: false
+  x_bearer_env: X_BEARER_TOKEN
+  reddit_query: xauusd gold market
+  x_query: xauusd OR gold OR fed OR inflation
+  max_items_per_source: 12
+
+memory:
+  enabled: true
+  db_path: reports/runtime/oracle/agent_memory.sqlite
+  embedding_dim: 256
+  retrieval_top_k: 6
+  retrieval_kinds: [signal, assistant_note, kb_document]
+  ingest_kb_on_start: false
+  knowledge_base_paths: []
+
+communication:
+  enabled_default: false
+  popup_on_channel_message: false
+  popup_on_emergency: false
+
+operation_feedback:
+  enabled: true
+  root_subdir: operation_feedback
+  write_by_job_logs: true
+  capture_state_transitions: true
+  capture_notifications: true
+  capture_agent_a_samples: true
+  capture_agent_b_samples: true
+
+approval_policy:
+  normal_timeout_seconds: 1800
+  fast_timeout_seconds: 120
+  emergency_lead_minutes: 5
+  channel_user_triggered_only: true
+  auto_approve_mandatory_session_programmed: false
+  auto_approve_opposing_countertrade: false
+  auto_approve_below_agent_b_count: 0
+
+emergency:
+  enabled: false
+  require_approval: true
+  score_jump_threshold: 1.1
+
+email_notifications:
+  enabled: false
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  use_tls: true
+  sender_email: env:TSMM_EMAIL_SENDER
+  receiver_email: env:TSMM_EMAIL_RECEIVER
+  username: env:TSMM_EMAIL_USERNAME
+  password: env:TSMM_EMAIL_APP_PASSWORD
+
+telegram_notifications:
+  enabled: true
+  bot_token: env:TSMM_TELEGRAM_BOT_TOKEN
+  chat_id: env:TSMM_TELEGRAM_CHAT_ID
+  parse_mode: plain
+  disable_web_page_preview: true
+  send_on_all_messages: true
+
+telegram_listener:
+  enabled: true
+  allowed_chat_ids: []
+  log_conversations: true
+  reply_on_non_command: true
+  auto_resume_waiting_jobs_enabled: false
+  auto_resume_waiting_jobs_interval_seconds: 30
+  adopt_manual_entries: false
+  adopt_any_running_positions: false
+  rebind_existing_non_agent_b: false
+  seed_missing_sltp_on_adopt: false
+  ai_agent:
+    enabled: true
+    provider: local_ollama
+    timeout_seconds: 45
+    external_service:
+      enabled: false
+      base_url: http://127.0.0.1:8787
+      chat_endpoint: /chat
+      timeout_seconds: 90
+      auto_execute: false
+      api_key: env:AORQ_AGENTIC_API_KEY
+  require_secret: false
+  secret_env: TSMM_TELEGRAM_COMMAND_SECRET
+  allowed_commands: [status, deploy, trading, endpoint, ui, resource]
+  poll_seconds: 3
+  inference_report_enabled: false
+  inference_report_interval_seconds: 300
+  trading_start_state_wait_seconds: 3.0
+  latest_request_status_interval_seconds: 120
+  active_jobs_status_interval_seconds: 300
+  command_prefix: /oracle
+  allow_natural_language: false
+  run_deploy_script: scripts/deploy_agent_pipeline.py
+  default_pipeline_config: config/agent_pipeline_oracle.yaml
+  scheduled_model_refresh:
+    enabled: false
+  allow_shell_commands: false
+
+endpoint_lifecycle:
+  on_demand_start: true
+  service_script: scripts/local_signal_endpoint_service.py
+  host: 127.0.0.1
+  port: 8000
+  startup_wait_seconds: 20
+
+resource_guard:
+  enabled: true
+  cpu_threshold_pct: 95
+  ram_threshold_pct: 95
+  sustained_seconds: 240
+  cooldown_seconds: 600
+  disable_endpoint_on_relief: true
+  disable_uis_on_relief: true
+
+inference_performance:
+  enabled: true
+  database_path: reports/runtime/oracle/full_horizon_metrics.sqlite
+  rolling_window_samples: 100
+  min_samples: 10
+  forecast_retention_days: 180
+  snapshot_retention_days: 365
+
+boot_recovery:
+  enabled: false
+  restart_listener: false
+  restart_endpoint: false
+  restart_parity_enforcer: false
+  resume_active_jobs: false
+  send_telegram_alert: true
+  send_console_alert: true
+  console_alert_timeout_seconds: 20
+  log_path: reports/runtime/oracle/reboot_recovery_last.json
+
+dashboard:
+  enabled: true
+  master_table_path: data/market_data.sqlite
+  sql_symbol: XAUUSD
+  startup_sync_enabled: true
+  startup_max_pulls: 2
+  startup_freshness_lag_minutes: 20
+  raw_data_path: data/xauusd/xauusd_1m_live.csv
+  state_path: reports/runtime/oracle/agent_state_latest.json
+  tiingo_symbol: xauusd
+  tiingo_rate: 1min
+  tiingo_token_env: TIINGO_API_TOKEN
+  tiingo_token_envs: [TIINGO_API_TOKEN, TIINGO_API_TOKEN_ALT]
+  tiingo_token_rotation_state_path: reports/runtime/tiingo_token_rotation_state.json
+  auto_update_master: true
+  auto_update_every_ticks: 1
+  live_past_minutes: 1440
+  heatmap_minutes: 480
+  pdf_minutes: 360
+  group_minutes: 420
+  refresh_seconds: 60

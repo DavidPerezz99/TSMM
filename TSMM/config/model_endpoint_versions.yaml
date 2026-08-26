@@ -1,0 +1,48 @@
+integrated_at: '2026-08-25'
+symbol: XAUUSD
+endpoints:
+  7h_low:
+    current:
+      version: v2
+      model: nbeats
+      config_path: config/low7hResults/nbeats/top1_07400.yaml
+      selected_r2: 0.74
+      refreshed_r2: -0.9016
+      refreshed_at_utc: '2026-08-26 02:40:10'
+      validation_status: evaluation_failed
+      refreshed_artifact: model_files/nbeats_low_7h_20260825_213920.joblib
+      source_config: cfg_00126.yaml
+    legacy:
+    - version: v1
+      model: ulr
+      config_path: config/low7hResults/ulr/legacy/v1/top1_07890.yaml
+  7h_high:
+    current:
+      version: v2
+      model: nbeats
+      config_path: config/high7hResults/nbeats/top1_07000.yaml
+      selected_r2: 0.70
+      refreshed_r2: -0.8743
+      refreshed_at_utc: '2026-08-26 02:41:31'
+      validation_status: evaluation_failed
+      refreshed_artifact: model_files/nbeats_high_7h_20260825_214042.joblib
+      source_config: cfg_00078.yaml
+    legacy:
+    - version: v1
+      model: ulr
+      config_path: config/high7hResults/ulr/legacy/v1/top1_07890.yaml
+  10m_high:
+    current:
+      version: v2
+      model: nbeats
+      config_path: config/high10mResults/nbeats/top1_06000.yaml
+      selected_r2: 0.60
+      refreshed_r2: -1.1332
+      refreshed_at_utc: '2026-08-26 02:43:28'
+      validation_status: evaluation_failed
+      refreshed_artifact: model_files/nbeats_high_10m_20260825_214239.joblib
+      source_config: cfg_00294.yaml
+    legacy:
+    - version: v1
+      model: nbeats
+      config_path: config/high10mResults/nbeats/legacy/v1/top1_08098.yaml

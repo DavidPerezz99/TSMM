@@ -138,13 +138,15 @@ def load_data(data_path, date_col, target_col, config):
             latest_records = int(
                 config.get('sql_latest_records', config.get('records', 50000)) or 50000
             )
+            sql_source_mode = str(config.get('sql_source_mode', 'auto') or 'auto').strip().lower()
             logging.info(
-                "Loading data from SQL source. sql_source=%s requested_path=%s symbol=%s timeframe_minutes=%s latest_records=%s start_date=%s end_date=%s",
+                "Loading data from SQL source. sql_source=%s requested_path=%s symbol=%s timeframe_minutes=%s latest_records=%s source_mode=%s start_date=%s end_date=%s",
                 sql_source_path,
                 data_path_str,
                 sql_symbol,
                 timeframe_minutes,
                 latest_records,
+                sql_source_mode,
                 config.get('start_date') or None,
                 config.get('end_date') or None,
             )
@@ -156,6 +158,7 @@ def load_data(data_path, date_col, target_col, config):
                 start_date=(config.get('start_date') or None),
                 end_date=(config.get('end_date') or None),
                 symbol=sql_symbol,
+                source_mode=sql_source_mode,
             )
             logging.info(
                 "Finished SQL data load. rows=%s elapsed_seconds=%.3f source=%s symbol=%s timeframe_minutes=%s",

@@ -162,7 +162,7 @@ def _run_validation_async(master_path: str, n_days: int, mode: str, start_date: 
     try:
         _append_status_log("Validation run started.")
         if str(mode).lower() == "advanced":
-            _append_status_log("Using advanced technical backtest runner.")
+            _append_status_log("Using model-backed point-in-time strategy replay.")
             result = run_agent_backtest_advanced(
                 master_table_path=master_path,
                 output_dir=run_dir,
@@ -254,7 +254,7 @@ app.layout = html.Div(
                     id="validation-mode",
                     options=[
                         {"label": "Simple daily replay", "value": "simple"},
-                        {"label": "Advanced technical backtest", "value": "advanced"},
+                        {"label": "Model-backed strategy evaluation", "value": "advanced"},
                     ],
                     value="advanced",
                     clearable=False,
@@ -396,7 +396,7 @@ def poll_status(_):
             with open(summary_path, "r", encoding="utf-8") as f:
                 summary = json.load(f)
             overall_txt = json.dumps(summary.get("overall", {}), indent=2)
-            sessions_txt = json.dumps(summary.get("sessions", []), indent=2)
+            sessions_txt = json.dumps(summary.get("daily", summary.get("sessions", [])), indent=2)
         except Exception as e:
             overall_txt = f"Error reading summary: {e}"
             logs_txt += f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Summary read error: {e}"

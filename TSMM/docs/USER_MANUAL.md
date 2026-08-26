@@ -233,6 +233,13 @@ python tools/search_mode.py --config config/config.yaml --bulk-search
 
 ## 10) Run bulk hyperparameter search
 
+Preview the exact unique count and conservative per-experiment RAM estimate
+before creating any files or training models:
+
+```powershell
+python tools/hypersearch.py plan --base-config config_templates/univariate.yaml --param-grid config/sweeps/sweep_30m_high_return.yaml --ram-limit-gb 20
+```
+
 Example:
 
 ```powershell
@@ -244,6 +251,140 @@ If memory is limited:
 ```powershell
 python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --output-dir generated_cfgs --max-parallel 1
 ```
+
+Use `--max-experiments` as a hard safety limit. The command refuses to start if
+the corrected unique plan is larger:
+
+```powershell
+python tools/hypersearch.py bulk_search --base-config config_templates/univariate.yaml --param-grid config/sweeps/sweep_30m_high_return.yaml --output-dir generated_cfgs --max-parallel 1 --max-experiments 250 --cpu-threads-per-experiment 6
+```
+
+Shortlist completed configurations by the highest out-of-sample R2 (the new
+default):
+
+```powershell
+python tools/hypersearch.py smart_search --from-experiments generated_cfgs/SESSION_FOLDER --top-n 20 --metric R2
+```
+
+For error metrics, `auto` uses the lower value, for example `--metric RMSE`.
+
+### 10.1) Manual overnight experiment sessions
+
+The committed XAUUSD session is:
+
+- `config/experiment_sessions/xauusd_nightly.yaml`
+- all 28 independent combinations of OPEN/HIGH/LOW/CLOSE and 10m, 30m, 1h,
+  3h, 7h, 12h, and 24h;
+- 10,476 unique experiments in the complete campaign, with no individual
+  OHLC/timeframe sweep exceeding 432 experiments;
+- execution order: shortest timeframe first, then OPEN, HIGH, LOW, and CLOSE;
+- algorithms: ULR plus interpretable and black-box N-BEATS;
+- hard local stop: 5:00 AM;
+- one experiment process at a time;
+- 20 GB per-process RAM limit, a 2 GB emergency system reserve, and six
+  numerical-library CPU threads;
+- generated configs, summaries, logs, and resume state under
+  `output/hypersearch_sessions/xauusd_all_ohlc_timeframes_v1/`.
+
+Nothing schedules or starts this session automatically. Every run must be
+started manually.
+
+Inspect the plan without creating or running anything:
+
+```powershell
+python tools/experiment_session.py plan --config config/experiment_sessions/xauusd_nightly.yaml
+```
+
+Refresh all seven SQL views and materialized cache tables before a new
+recalibration campaign or after correcting historical data:
+
+```powershell
+python tools/experiment_session.py prepare-data --config config/experiment_sessions/xauusd_nightly.yaml
+```
+
+Show the exact cached history and the RAM-, CPU-, and data-limited record
+ceiling for every model family:
+
+```powershell
+python tools/experiment_session.py capacity --config config/experiment_sessions/xauusd_nightly.yaml
+```
+
+Start or resume and continue until 5:00 AM:
+
+```powershell
+python tools/experiment_session.py run --config config/experiment_sessions/xauusd_nightly.yaml
+```
+
+Run exactly one pending experiment:
+
+```powershell
+python tools/experiment_session.py run --config config/experiment_sessions/xauusd_nightly.yaml --max-experiments 1
+```
+
+Run a manually sized batch, for example ten experiments:
+
+```powershell
+python tools/experiment_session.py run --config config/experiment_sessions/xauusd_nightly.yaml --max-experiments 10
+```
+
+Show completion by ordered sweep:
+
+```powershell
+python tools/experiment_session.py status --config config/experiment_sessions/xauusd_nightly.yaml
+```
+
+The runner never starts a new experiment inside the final 30 minutes before
+the deadline. If a running experiment reaches 5:00 AM, its process tree is
+terminated and marked `INTERRUPTED`; the next manual run retries it. A process
+that exceeds 20 GB, or leaves less than 2 GB available system RAM, is terminated
+with `RESOURCE_LIMIT`. Completed experiments are never rerun during resume.
+
+The planner reports separate RAM- and CPU-duration-limited record ceilings and
+then takes the minimum of those limits and the actual cached history. On this
+32 GB Ryzen 5 machine, with a 20 GB process cap and a 90-minute budget for the
+slowest configured shape, the August 17, 2026 capacity snapshot is:
+
+| Timeframe | Cached candles | RAM ceiling | 90-minute CPU ceiling | Effective ceiling | Largest configured experiment |
+|---|---:|---:|---:|---:|---:|
+| 10m | 617,182 | 826,132 | 15,415 | 15,415 | 15,000 |
+| 30m | 206,540 | 332,014 | 11,181 | 11,181 | 10,000 |
+| 1h | 103,880 | 589,697 | 13,829 | 13,829 | 12,000 |
+| 3h | 35,982 | 2,727,638 | 20,267 | 20,267 | 16,000 |
+| 7h | 16,213 | 2,911,245 | 20,473 | 16,213 | 16,000 |
+| 12h | 9,921 | 3,808,536 | 21,244 | 9,921 | 9,000 |
+| 24h | 5,417 | 5,505,398 | 22,109 | 5,417 | 5,000 |
+
+These figures are conservative planning estimates, not measured promises. The
+runner records actual duration and peak process RAM for every experiment and
+uses matching-shape duration history for later deadline decisions.
+
+The table is the ceiling that remains safe for **every** configured shape; its
+CPU column is therefore governed by the slowest N-BEATS black-box variant. The
+`capacity` command also prints algorithm-specific limits. Under the analytical
+estimate, ULR can use the complete cached history at every timeframe, including
+all 617,182 10m candles, while the worst-case N-BEATS limits match the effective
+short-timeframe ceilings shown above. The committed grids intentionally remain
+smaller so the first campaign can replace estimates with measured peak RAM and
+duration before expanding any individual search.
+
+The XAUUSD sweeps use the SQLite market database and materialized cache tables
+for every configured timeframe. These tables avoid reparsing CSV data and
+avoid recomputing the full dynamic view for every experiment. The live minute
+tail is still merged when a cache is read. SQL reduces ingestion and resampling
+overhead, but feature engineering, overlapping sequence creation, model
+training, recursive inference, and evaluation still happen in memory, so the
+RAM and deadline guards remain required.
+
+The lower-level migration command remains available when rebuilding from a
+different database or symbol:
+
+```powershell
+python scripts/migrate_market_data_to_sqlite.py --db-path data/market_data.sqlite --symbol XAUUSD --views 10,30,60,180,420,720,1440 --create-cache-tables
+```
+
+The multi-timeframe cache builder reads the minute master once and atomically
+replaces the seven indexed cache tables. Routine new minute rows do not require
+a rebuild because cache reads merge the mutable live tail.
 
 ## 11) Live data loop
 
@@ -302,6 +443,7 @@ pip install -r requirements.txt
 - `apps/ui.py`: config editor UI
 - `apps/dashboard.py`: live dashboard
 - `apps/validation_dashboard.py`: agent validation dashboard
+- `scripts/run_trading_backtest.py`: model-backed historical strategy evaluation
 - `tools/search_mode.py`: single experiment run
 - `tools/hypersearch.py`: bulk sweep engine
 - `scripts/validate_source_dataset.py`: disruption validation from source data
@@ -309,6 +451,13 @@ pip install -r requirements.txt
 - `config/config.yaml`: main forecasting config
 - `config/trading_agent.yaml`: trading/agent config
 - `config/sweep_definition.yaml`: sweep definitions
+
+The validation dashboard's model-backed mode and `python app.py backtest`
+replay the configured trading sessions with current forecasting artifacts,
+programmed-order fills, five-minute Agent B checks, costs, closures, and daily
+equity reporting. The generated report explicitly warns when current fitted
+models overlap the historical period, because that case is a retrospective
+stress test rather than a clean walk-forward estimate.
 
 ## 15) Recommended safe baseline
 

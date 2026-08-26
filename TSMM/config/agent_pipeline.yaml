@@ -35,7 +35,7 @@ llm:
 
 models:
   # Optional retrain targets in order.
-  # Example values: ["10m:nbeats", "30m:nbeats", "3h:nbeats", "7h:ulr"]
+  # Example values: ["10m:nbeats", "30m:nbeats", "3h:nbeats", "7h:nbeats"]
   retrain_targets: []
   # When refresh runs, retrain every discovered family/timeframe/model top config.
   retrain_all_targets_on_refresh: true
@@ -49,9 +49,9 @@ endpoints:
   port: 8000
 
 trading:
-  start_job: true
-  plan_model: ulr
-  execution_config: config/high7hResults/ulr/top1_07890.yaml
+  start_job: false
+  plan_model: nbeats
+  execution_config: config/high7hResults/nbeats/top1_07000.yaml
   trading_config_path: config/trading_agent.yaml
   mt5_terminal_path: "C:\\Program Files\\FTMO Global Markets MT5 Terminal\\terminal64.exe"
 

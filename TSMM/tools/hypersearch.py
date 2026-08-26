@@ -16,6 +16,9 @@ Key Features:
 
 import argparse
 import asyncio
+from copy import deepcopy
+from collections import Counter
+import hashlib
 import itertools
 import json
 import os
@@ -34,6 +37,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.cache_management import clear_cache
+from utils.experiment_planning import (
+    duration_signature,
+    estimate_experiment_duration_seconds,
+    estimate_experiment_memory,
+    estimate_max_records,
+    estimate_max_records_for_duration,
+    memory_shape_signature,
+)
+
+
+RESERVED_SWEEP_KEYS = {
+    'smart_generation',
+    'models_to_run',
+    'input_target_sets',
+}
 
 
 # -----------------------------------------------------------------------------
@@ -169,6 +187,8 @@ def get_global_params(sweep_cfg: Dict[str, Any]) -> Dict[str, Any]:
     model_prefixes = ['nbeats.', 'svr.', 'xgboost.', 'prophet.', 'lstm.']
     
     for param_key, param_value in sweep_cfg.items():
+        if param_key in RESERVED_SWEEP_KEYS:
+            continue
         if not isinstance(param_value, list):
             continue
             
@@ -229,14 +249,63 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
     
     These are mutually exclusive, so we need to handle them separately.
     """
+    def _expand_dict_choice_variants(raw_choices: List[Any]) -> List[Dict[str, Any]]:
+        """Expand dict-valued sweep choices whose leaf values may still be lists."""
+        variants: List[Dict[str, Any]] = []
+        for choice in raw_choices:
+            if not isinstance(choice, dict):
+                variants.append(choice)
+                continue
+            keys = list(choice.keys())
+            value_options = [
+                value if isinstance(value, list) else [value]
+                for value in (choice[key] for key in keys)
+            ]
+            for combo in itertools.product(*value_options):
+                variants.append({key: value for key, value in zip(keys, combo)})
+        return variants
+
+    def _expand_stacks_config_variants(raw_choices: List[Any]) -> List[List[Dict[str, Any]]]:
+        """Expand stack templates whose per-stack fields still contain sweep lists."""
+        variants: List[List[Dict[str, Any]]] = []
+        for choice in raw_choices:
+            if not isinstance(choice, list):
+                variants.append(choice)
+                continue
+
+            per_stack_variants: List[List[Dict[str, Any]]] = []
+            for stack in choice:
+                if not isinstance(stack, dict):
+                    per_stack_variants.append([stack])
+                    continue
+                stack_keys = list(stack.keys())
+                stack_value_options = [
+                    value if isinstance(value, list) else [value]
+                    for value in (stack[key] for key in stack_keys)
+                ]
+                expanded_stack_variants = []
+                for combo in itertools.product(*stack_value_options):
+                    expanded_stack_variants.append(
+                        {key: value for key, value in zip(stack_keys, combo)}
+                    )
+                per_stack_variants.append(expanded_stack_variants)
+
+            for stack_combo in itertools.product(*per_stack_variants):
+                variants.append([deepcopy(item) for item in stack_combo])
+        return variants
+
     # Separate parameters by category
     flat_params = {}  # e.g., model_type, hidden_size, epochs
     stacks_params = {}  # e.g., stacks_config.0.type, stacks_config.0.num_blocks
     blackbox_params = {}  # e.g., blackbox_config.num_blocks, blackbox_config.num_layers
     
     for key, values in nbeats_params.items():
-        if 'stacks_config' in key:
+        if key == 'nbeats.stacks_config':
+            stacks_params[key] = _expand_stacks_config_variants(values)
+        elif 'stacks_config' in key:
             stacks_params[key] = values
+        elif key == 'nbeats.blackbox_config':
+            blackbox_params[key] = _expand_dict_choice_variants(values)
         elif 'blackbox_config' in key:
             blackbox_params[key] = values
         else:
@@ -248,6 +317,30 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
     flat_keys = list(flat_params.keys())
     flat_values = [flat_params[k] for k in flat_keys]
     
+    def _apply_interpretable_stack_hidden_size(variant: Dict[str, Any]) -> Dict[str, Any]:
+        nbeats_cfg = variant.get("nbeats") or {}
+        if str(nbeats_cfg.get("model_type", "interpretable")).strip().lower() != "interpretable":
+            return variant
+        hidden_size = nbeats_cfg.get("hidden_size")
+        stacks_config = nbeats_cfg.get("stacks_config")
+        if hidden_size is None or not isinstance(stacks_config, list):
+            return variant
+
+        normalized_stacks = []
+        for stack in stacks_config:
+            if isinstance(stack, dict):
+                stack_copy = dict(stack)
+                stack_copy.setdefault("hidden_size", hidden_size)
+                normalized_stacks.append(stack_copy)
+            else:
+                normalized_stacks.append(stack)
+
+        nbeats_copy = dict(nbeats_cfg)
+        nbeats_copy["stacks_config"] = normalized_stacks
+        variant_copy = dict(variant)
+        variant_copy["nbeats"] = nbeats_copy
+        return variant_copy
+
     for flat_combo in itertools.product(*flat_values):
         base_variant = {}
         for key, value in zip(flat_keys, flat_combo):
@@ -262,10 +355,10 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
             stacks_values = [stacks_params[k] for k in stacks_keys]
             
             for stacks_combo in itertools.product(*stacks_values):
-                variant = base_variant.copy()
+                variant = deepcopy(base_variant)
                 for key, value in zip(stacks_keys, stacks_combo):
                     set_nested_value(variant, key, value)
-                variants.append(variant)
+                variants.append(_apply_interpretable_stack_hidden_size(variant))
         
         elif model_type == 'blackbox' and blackbox_params:
             # Build blackbox_config variants
@@ -273,20 +366,21 @@ def build_nbeats_variants(nbeats_params: Dict[str, List]) -> List[Dict]:
             blackbox_values = [blackbox_params[k] for k in blackbox_keys]
             
             for blackbox_combo in itertools.product(*blackbox_values):
-                variant = base_variant.copy()
+                variant = deepcopy(base_variant)
                 for key, value in zip(blackbox_keys, blackbox_combo):
                     set_nested_value(variant, key, value)
                 variants.append(variant)
         else:
             # No nested params or unknown mode
-            variants.append(base_variant)
+            variants.append(_apply_interpretable_stack_hidden_size(base_variant))
     
     return variants
 
 
 def generate_smart_experiments(
     base_cfg: Dict[str, Any],
-    sweep_cfg: Dict[str, Any]
+    sweep_cfg: Dict[str, Any],
+    verbose: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     """
     Generate experiment configurations intelligently per model.
@@ -332,7 +426,9 @@ def generate_smart_experiments(
     
     # Generate experiments for each model
     experiment_count = 0
-    all_models = models_to_run.get('univariate', []) + models_to_run.get('multivariate', [])
+    all_models = list(dict.fromkeys(
+        models_to_run.get('univariate', []) + models_to_run.get('multivariate', [])
+    ))
     
     for model_name in all_models:
         # Get parameters specific to this model
@@ -341,12 +437,13 @@ def generate_smart_experiments(
         # Build valid model configuration variants
         model_variants = build_model_config_variants(model_name, model_specific)
         
-        print(f"  {model_name}: {len(model_variants)} model variants × {len(global_combinations)} global combinations")
+        if verbose:
+            print(f"  {model_name}: {len(model_variants)} model variants × {len(global_combinations)} global combinations")
         
         # Combine global and model-specific parameters
         for global_combo in global_combinations:
             for model_variant in model_variants:
-                experiment = base_cfg.copy()
+                experiment = deepcopy(base_cfg)
                 
                 # Add global parameters
                 for key, value in zip(global_keys, global_combo):
@@ -364,7 +461,7 @@ def generate_smart_experiments(
                 # Add input_target_sets if specified
                 if special_sets:
                     for rec in special_sets:
-                        exp_with_set = experiment.copy()
+                        exp_with_set = deepcopy(experiment)
                         exp_with_set.update(rec)
                         experiment_count += 1
                         yield exp_with_set
@@ -372,7 +469,8 @@ def generate_smart_experiments(
                     experiment_count += 1
                     yield experiment
     
-    print(f"\nTotal experiments generated: {experiment_count}")
+    if verbose:
+        print(f"\nTotal experiments generated: {experiment_count}")
 
 
 # -----------------------------------------------------------------------------
@@ -438,14 +536,160 @@ def generate_factorial_experiments(
         
         if special_sets:
             for rec in special_sets:
-                experiment = base_cfg.copy()
+                experiment = deepcopy(base_cfg)
                 deep_merge_dict(experiment, patch)
                 experiment.update(rec)
+                experiment['models_to_run'] = deepcopy(sweep_cfg.get('models_to_run') or {})
                 yield experiment
         else:
-            experiment = base_cfg.copy()
+            experiment = deepcopy(base_cfg)
             deep_merge_dict(experiment, patch)
+            experiment['models_to_run'] = deepcopy(sweep_cfg.get('models_to_run') or {})
             yield experiment
+
+
+def experiment_fingerprint(config: Dict[str, Any]) -> str:
+    """Return a stable identity for an effective experiment configuration."""
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def unique_experiments(experiments: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    """Yield configurations once, preserving their first generated order."""
+    seen = set()
+    for experiment in experiments:
+        snapshot = deepcopy(experiment)
+        fingerprint = experiment_fingerprint(snapshot)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        yield snapshot
+
+
+def build_sweep_plan(
+    base_cfg: Dict[str, Any],
+    sweep_cfg: Dict[str, Any],
+    ram_limit_gb: float = 20.0,
+    cpu_threads: int = 6,
+    max_duration_minutes: float = 90.0,
+) -> Dict[str, Any]:
+    """Calculate an execution plan without writing configs or training models."""
+    use_smart = bool(sweep_cfg.get('smart_generation', True))
+    if use_smart:
+        generated = generate_smart_experiments(base_cfg, sweep_cfg, verbose=False)
+    else:
+        generated = generate_factorial_experiments(base_cfg, sweep_cfg)
+
+    raw_count = 0
+    unique_by_hash: Dict[str, Dict[str, Any]] = {}
+    per_model = Counter()
+    warnings = []
+    for experiment in generated:
+        raw_count += 1
+        snapshot = deepcopy(experiment)
+        fingerprint = experiment_fingerprint(snapshot)
+        if fingerprint in unique_by_hash:
+            continue
+        unique_by_hash[fingerprint] = snapshot
+        models = snapshot.get('models_to_run') or {}
+        names = list(models.get('univariate') or []) + list(models.get('multivariate') or [])
+        per_model[','.join(names) if names else 'default_models'] += 1
+
+    configs = list(unique_by_hash.values())
+    memory_estimates = [estimate_experiment_memory(cfg) for cfg in configs]
+    worst_memory = max(
+        memory_estimates,
+        key=lambda item: float(item.get('estimated_peak_gb', 0.0)),
+        default={},
+    )
+    memory_capacity_by_shape: Dict[str, int] = {}
+    for cfg in configs:
+        signature = memory_shape_signature(cfg)
+        if signature not in memory_capacity_by_shape:
+            memory_capacity_by_shape[signature] = estimate_max_records(
+                cfg, ram_limit_gb=ram_limit_gb
+            )
+    max_records = min(memory_capacity_by_shape.values(), default=0)
+
+    duration_estimates = [
+        estimate_experiment_duration_seconds(cfg, cpu_threads=cpu_threads)
+        for cfg in configs
+    ]
+    duration_capacity_by_shape: Dict[str, int] = {}
+    if configs and duration_estimates:
+        worst_duration_index = max(
+            range(len(duration_estimates)), key=lambda index: duration_estimates[index]
+        )
+        worst_duration_cfg = configs[worst_duration_index]
+        worst_duration_seconds = duration_estimates[worst_duration_index]
+        for cfg in configs:
+            signature = duration_signature(cfg)
+            if signature not in duration_capacity_by_shape:
+                duration_capacity_by_shape[signature] = estimate_max_records_for_duration(
+                    cfg,
+                    max_duration_minutes=max_duration_minutes,
+                    cpu_threads=cpu_threads,
+                )
+        duration_record_limit = min(duration_capacity_by_shape.values(), default=0)
+        worst_duration = {
+            "signature": duration_signature(worst_duration_cfg),
+            "records": int(worst_duration_cfg.get("records", 0) or 0),
+            "estimated_minutes": round(worst_duration_seconds / 60.0, 1),
+        }
+    else:
+        duration_record_limit = 0
+        worst_duration = {}
+
+    capacity_by_model: Dict[str, Dict[str, int]] = {}
+    for cfg in configs:
+        models = cfg.get('models_to_run') or {}
+        names = list(models.get('univariate') or []) + list(models.get('multivariate') or [])
+        model_name = ','.join(names) if names else 'default_models'
+        memory_limit = memory_capacity_by_shape.get(memory_shape_signature(cfg), 0)
+        duration_limit = duration_capacity_by_shape.get(duration_signature(cfg), 0)
+        current = capacity_by_model.setdefault(
+            model_name,
+            {
+                'ram_limited_records': int(memory_limit),
+                'duration_limited_records': int(duration_limit),
+            },
+        )
+        if memory_limit:
+            current['ram_limited_records'] = min(
+                int(current['ram_limited_records']), int(memory_limit)
+            )
+        if duration_limit:
+            current['duration_limited_records'] = min(
+                int(current['duration_limited_records']), int(duration_limit)
+            )
+
+    requested_models = list((sweep_cfg.get('models_to_run') or {}).get('univariate') or [])
+    if 'nbeats' in requested_models and 'epochs' in get_global_params(sweep_cfg):
+        warnings.append(
+            "Root 'epochs' does not configure N-BEATS; use 'nbeats.epochs' in the sweep."
+        )
+    test_sizes = list(sweep_cfg.get('test_size') or [])
+    if test_sizes and min(int(value) for value in test_sizes) < 20:
+        warnings.append("test_size below 20 produces an unstable out-of-sample R2 estimate.")
+    if not use_smart:
+        warnings.append("Legacy factorial generation cross-multiplies unrelated model parameters.")
+
+    return {
+        'generation_mode': 'smart' if use_smart else 'legacy',
+        'raw_generated': int(raw_count),
+        'unique_experiments': int(len(configs)),
+        'duplicates_removed': int(raw_count - len(configs)),
+        'per_model': dict(sorted(per_model.items())),
+        'ram_limit_gb': float(ram_limit_gb),
+        'worst_memory_estimate': worst_memory,
+        'estimated_max_records_for_worst_shape': int(max_records),
+        'cpu_threads': int(cpu_threads),
+        'max_duration_minutes': float(max_duration_minutes),
+        'worst_duration_estimate': worst_duration,
+        'estimated_max_records_for_duration': int(duration_record_limit),
+        'capacity_by_model': dict(sorted(capacity_by_model.items())),
+        'warnings': warnings,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -455,7 +699,19 @@ def generate_factorial_experiments(
 class BulkSearchEngine:
     """Engine for running bulk hyperparameter searches."""
     
-    def __init__(self, base_cfg, sweep_cfg, out_dir, sem, summary_dir=None, restart=False, experiment_timeout_sec=None):
+    def __init__(
+        self,
+        base_cfg,
+        sweep_cfg,
+        out_dir,
+        sem,
+        summary_dir=None,
+        restart=False,
+        experiment_timeout_sec=None,
+        max_experiments=None,
+        cpu_threads_per_experiment=None,
+        worthy_r2_threshold=0.6,
+    ):
         self.base_cfg = base_cfg
         self.sweep_cfg = sweep_cfg
         self.out_dir = Path(out_dir)
@@ -463,10 +719,16 @@ class BulkSearchEngine:
         self.sem = sem
         self.restart = bool(restart)
         self.experiment_timeout_sec = experiment_timeout_sec
+        self.max_experiments = int(max_experiments) if max_experiments else None
+        self.cpu_threads_per_experiment = (
+            int(cpu_threads_per_experiment) if cpu_threads_per_experiment else None
+        )
+        self.worthy_r2_threshold = float(worthy_r2_threshold)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.failure_log_dir = self.out_dir / "failed_logs"
         self.failure_log_dir.mkdir(parents=True, exist_ok=True)
+        self.worthy_artifact_dir = self.out_dir / "worthy_artifacts"
         self.summary_dirs = [self.summary_dir]
         if self.out_dir.resolve() != self.summary_dir.resolve():
             self.summary_dirs.append(self.out_dir)
@@ -585,21 +847,31 @@ class BulkSearchEngine:
         
         if use_smart:
             print("Using SMART generation (recommended)")
-            return generate_smart_experiments(self.base_cfg, self.sweep_cfg)
+            generated = generate_smart_experiments(self.base_cfg, self.sweep_cfg)
         else:
             print("WARNING: Using LEGACY factorial expansion (may generate many experiments)")
-            return generate_factorial_experiments(self.base_cfg, self.sweep_cfg)
+            generated = generate_factorial_experiments(self.base_cfg, self.sweep_cfg)
+        return unique_experiments(generated)
 
     def materialize_configs(self):
         """Generate and save experiment configuration files, or reuse existing ones."""
         existing = self._existing_cfg_paths()
         if existing:
+            if self.max_experiments and len(existing) > self.max_experiments:
+                raise RuntimeError(
+                    f"Existing session has {len(existing)} configs, above the "
+                    f"max_experiments limit of {self.max_experiments}."
+                )
             print(f"Found {len(existing)} existing config files in {self.out_dir}; reusing for resume")
             return existing
 
         cfg_paths = []
         for idx, param_patch in enumerate(self.expand_grid(), 1):
-            cfg = self.base_cfg.copy()
+            if self.max_experiments and idx > self.max_experiments:
+                raise RuntimeError(
+                    f"Sweep exceeds max_experiments={self.max_experiments}; refusing to continue."
+                )
+            cfg = deepcopy(self.base_cfg)
             deep_merge_dict(cfg, param_patch)
             cfg_name = f"cfg_{idx:05d}.yaml"
             cfg_path = self.out_dir / cfg_name
@@ -611,6 +883,15 @@ class BulkSearchEngine:
         """Run a single experiment."""
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "-1"
+        if self.cpu_threads_per_experiment:
+            thread_count = str(max(self.cpu_threads_per_experiment, 1))
+            for variable in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ):
+                env[variable] = thread_count
         
         cmd = [
             sys.executable,
@@ -619,7 +900,9 @@ class BulkSearchEngine:
             str(cfg_path),
             "--summary-dir",
             str(self.summary_dir),
-            "--bulk-search"
+            "--bulk-search",
+            "--worthy-artifact-dir", str(self.worthy_artifact_dir),
+            "--worthy-r2-threshold", str(self.worthy_r2_threshold),
         ]
         async with self.sem:
             try:
@@ -677,9 +960,15 @@ class BulkSearchEngine:
 
             out_text = out.decode(errors="replace") if out else ""
             err_text = err.decode(errors="replace") if err else ""
-            status = "OK" if proc.returncode == 0 else "FAIL"
-            print(f"[{cfg_path.name}] finished -> {status}")
-            if status == "FAIL":
+            if proc.returncode == 0:
+                summary_info = self._latest_summary_info(cfg_path.stem) or {}
+                summary_status = str(summary_info.get("status") or "").strip().upper()
+                display_status = summary_status or "NO_SUMMARY"
+            else:
+                display_status = "FAIL"
+
+            print(f"[{cfg_path.name}] finished -> {display_status}")
+            if proc.returncode != 0:
                 self._write_failure_log(
                     cfg_path=cfg_path,
                     cmd=cmd,
@@ -735,10 +1024,17 @@ def _find_latest_execution_dir(root_dir: Path) -> Optional[Path]:
 class SmartSearchEngine:
     """Engine for rerunning top configurations from previous experiments."""
     
-    def __init__(self, archive_dir, top_n, sem):
+    def __init__(self, archive_dir, top_n, sem, metric_name="R2", direction="auto"):
         self.archive_dir = Path(archive_dir)
         self.top_n = top_n
         self.sem = sem
+        self.metric_name = str(metric_name or "R2").upper()
+        resolved_direction = str(direction or "auto").strip().lower()
+        if resolved_direction == "auto":
+            resolved_direction = "max" if self.metric_name == "R2" else "min"
+        if resolved_direction not in {"min", "max"}:
+            raise ValueError("Smart-search direction must be auto, min, or max")
+        self.direction = resolved_direction
         clear_cache()
 
     def _best_summaries(self):
@@ -752,22 +1048,22 @@ class SmartSearchEngine:
             with open(s) as fp:
                 data = json.load(fp)
             
-            # Try to get the best metric across all models
-            metric = None
+            values = []
             if "metric" in data:
                 metrics = data["metric"]
                 if isinstance(metrics, dict):
-                    # Get MAPE or RMSE from any model
                     for model_metrics in metrics.values():
                         if isinstance(model_metrics, dict):
-                            metric = model_metrics.get("MAPE") or model_metrics.get("RMSE")
-                            if metric is not None:
-                                break
-            
-            if metric is not None:
+                            value = model_metrics.get(self.metric_name)
+                            if isinstance(value, (int, float)) and np.isfinite(value):
+                                values.append(float(value))
+
+            if values:
+                metric = max(values) if self.direction == "max" else min(values)
                 scored.append((metric, Path(data["config_path"])))
-      
-        return [p for _, p in sorted(scored)[:self.top_n]]
+
+        ranked = sorted(scored, key=lambda item: item[0], reverse=self.direction == "max")
+        return [path for _, path in ranked[:self.top_n]]
 
     async def _run_again(self, cfg_path):
         """Rerun a configuration."""
@@ -790,7 +1086,10 @@ class SmartSearchEngine:
     async def launch_top(self):
         """Launch top configurations."""
         cfgs = self._best_summaries()
-        print(f"Rerunning top {len(cfgs)} configurations...")
+        print(
+            f"Rerunning top {len(cfgs)} configurations by "
+            f"{self.metric_name} ({self.direction})..."
+        )
         tasks = [asyncio.create_task(self._run_again(p)) for p in cfgs]
         await asyncio.gather(*tasks)
 
@@ -806,6 +1105,9 @@ def main_cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    # Preview exact counts and RAM estimates without writing or training
+    python tools/hypersearch.py plan --base-config config_templates/univariate.yaml --param-grid config/sweep_definition.yaml --ram-limit-gb 20
+
     # Run bulk search with smart experiment generation (creates isolated execution folder)
     python tools/hypersearch.py bulk_search --base-config config/config.yaml --param-grid config/sweep_definition.yaml --output-dir experiments --max-parallel 4
 
@@ -821,6 +1123,15 @@ Examples:
     )
     sub = p.add_subparsers(dest="mode", required=True)
 
+    # read-only preflight plan
+    sp_plan = sub.add_parser("plan", help="Preview experiment counts and RAM estimates")
+    sp_plan.add_argument("--base-config", required=True, help="Path to base configuration file")
+    sp_plan.add_argument("--param-grid", required=True, help="Path to sweep definition file")
+    sp_plan.add_argument("--ram-limit-gb", type=float, default=20.0, help="Per-experiment RAM planning limit")
+    sp_plan.add_argument("--cpu-threads", type=int, default=6, help="CPU threads available to one experiment")
+    sp_plan.add_argument("--max-duration-minutes", type=float, default=90.0, help="Duration budget used for the record ceiling")
+    sp_plan.add_argument("--json", action="store_true", help="Print the plan as JSON")
+
     # bulk
     sp = sub.add_parser("bulk_search", help="Run bulk hyperparameter search")
     sp.add_argument("--base-config", required=True, help="Path to base configuration file")
@@ -830,8 +1141,12 @@ Examples:
     sp.add_argument("--summary-dir", default=None, help="Optional summary directory (defaults to the execution folder)")
     sp.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
     sp.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
+    sp.add_argument("--max-experiments", type=int, default=0, help="Refuse to run when the unique plan exceeds this count (0 disables limit)")
+    sp.add_argument("--cpu-threads-per-experiment", type=int, default=0, help="Limit numerical-library CPU threads per experiment")
     sp.add_argument("--legacy", action="store_true", help="Use legacy factorial expansion (WARNING: may generate many experiments)")
     sp.add_argument("--restart", action="store_true", help="Ignore resume and run all experiments from the beginning")
+    sp.add_argument("--worthy-r2-threshold", type=float, default=0.6,
+                    help="Save a reproducible model bundle only for R2 scores strictly above this gate")
 
     # dedicated resume for latest/incomplete bulk execution
     sp_resume = sub.add_parser("resume_bulk", help="Resume the latest bulk hyperparameter execution")
@@ -841,17 +1156,63 @@ Examples:
     sp_resume.add_argument("--summary-dir", default=None, help="Explicit summary directory to use")
     sp_resume.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
     sp_resume.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
+    sp_resume.add_argument("--max-experiments", type=int, default=0, help="Refuse to resume a session above this count (0 disables limit)")
+    sp_resume.add_argument("--cpu-threads-per-experiment", type=int, default=0, help="Limit numerical-library CPU threads per experiment")
+    sp_resume.add_argument("--worthy-r2-threshold", type=float, default=0.6,
+                           help="Save a reproducible model bundle only for R2 scores strictly above this gate")
 
     # smart
     sp2 = sub.add_parser("smart_search", help="Rerun top configurations from previous experiments")
     sp2.add_argument("--from-experiments", default="experiments", help="Directory with experiment summaries")
     sp2.add_argument("--top-n", type=int, default=50, help="Number of top configs to rerun")
     sp2.add_argument("--max-parallel", type=int, default=2, help="Maximum parallel experiments")
+    sp2.add_argument("--metric", default="R2", help="Metric used to rank summaries (default: R2)")
+    sp2.add_argument("--direction", choices=["auto", "min", "max"], default="auto", help="Ranking direction; auto maximizes R2 and minimizes error metrics")
 
     args = p.parse_args()
-    sem = asyncio.Semaphore(args.max_parallel)
 
-    if args.mode == "bulk_search":
+    if args.mode == "plan":
+        base_cfg = yaml_load(args.base_config)
+        sweep_cfg = yaml_load(args.param_grid)
+        plan = build_sweep_plan(
+            base_cfg,
+            sweep_cfg,
+            ram_limit_gb=args.ram_limit_gb,
+            cpu_threads=args.cpu_threads,
+            max_duration_minutes=args.max_duration_minutes,
+        )
+        if args.json:
+            print(json.dumps(plan, indent=2, default=str))
+        else:
+            print(f"Generation mode:      {plan['generation_mode']}")
+            print(f"Raw generated:        {plan['raw_generated']}")
+            print(f"Unique experiments:   {plan['unique_experiments']}")
+            print(f"Duplicates removed:   {plan['duplicates_removed']}")
+            print("Per model:")
+            for model_name, count in plan['per_model'].items():
+                print(f"  {model_name}: {count}")
+            worst = plan.get('worst_memory_estimate') or {}
+            print(f"Worst estimated RAM:  {worst.get('estimated_peak_gb', 0.0)} GB")
+            print(
+                "RAM-limited records:    "
+                f"{plan['estimated_max_records_for_worst_shape']:,} "
+                f"at {plan['ram_limit_gb']:.1f} GB"
+            )
+            duration = plan.get('worst_duration_estimate') or {}
+            print(
+                f"Worst estimated time: {duration.get('estimated_minutes', 0.0)} minutes "
+                f"({duration.get('signature', 'n/a')})"
+            )
+            print(
+                "Duration-limited rows: "
+                f"{plan['estimated_max_records_for_duration']:,} "
+                f"at {plan['max_duration_minutes']:.0f} minutes"
+            )
+            for warning in plan.get('warnings') or []:
+                print(f"WARNING: {warning}")
+
+    elif args.mode == "bulk_search":
+        sem = asyncio.Semaphore(args.max_parallel)
         base_cfg = yaml_load(args.base_config)
         sweep_cfg = yaml_load(args.param_grid)
 
@@ -868,6 +1229,22 @@ Examples:
         else:
             sweep_cfg['smart_generation'] = True
             print("Using smart experiment generation (recommended)")
+
+        plan = build_sweep_plan(
+            base_cfg,
+            sweep_cfg,
+            ram_limit_gb=20.0,
+            cpu_threads=(args.cpu_threads_per_experiment or 6),
+        )
+        print(
+            f"Preflight: {plan['unique_experiments']} unique experiments; "
+            f"worst estimated RAM={plan.get('worst_memory_estimate', {}).get('estimated_peak_gb', 0.0)} GB"
+        )
+        if args.max_experiments and plan['unique_experiments'] > args.max_experiments:
+            raise SystemExit(
+                f"[bulk_search] Plan has {plan['unique_experiments']} unique experiments, "
+                f"above --max-experiments {args.max_experiments}."
+            )
         
         engine = BulkSearchEngine(
             base_cfg,
@@ -876,11 +1253,15 @@ Examples:
             sem,
             summary_dir=summary_dir,
             restart=args.restart,
-            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+            experiment_timeout_sec=(args.experiment_timeout_sec or None),
+            max_experiments=(args.max_experiments or None),
+            cpu_threads_per_experiment=(args.cpu_threads_per_experiment or None),
+            worthy_r2_threshold=args.worthy_r2_threshold,
         )
         asyncio.run(engine.launch_all())
 
     elif args.mode == "resume_bulk":
+        sem = asyncio.Semaphore(args.max_parallel)
         resume_cfg_dir = Path(args.config_dir) if args.config_dir else _find_latest_execution_dir(Path(args.configs_root))
         if resume_cfg_dir is None:
             raise SystemExit("[resume_bulk] No execution folder with cfg_*.yaml found.")
@@ -902,12 +1283,22 @@ Examples:
             sem,
             summary_dir=resume_summary_dir,
             restart=False,
-            experiment_timeout_sec=(args.experiment_timeout_sec or None)
+            experiment_timeout_sec=(args.experiment_timeout_sec or None),
+            max_experiments=(args.max_experiments or None),
+            cpu_threads_per_experiment=(args.cpu_threads_per_experiment or None),
+            worthy_r2_threshold=args.worthy_r2_threshold,
         )
         asyncio.run(engine.launch_all())
 
     elif args.mode == "smart_search":
-        engine = SmartSearchEngine(args.from_experiments, args.top_n, sem)
+        sem = asyncio.Semaphore(args.max_parallel)
+        engine = SmartSearchEngine(
+            args.from_experiments,
+            args.top_n,
+            sem,
+            metric_name=args.metric,
+            direction=args.direction,
+        )
         asyncio.run(engine.launch_top())
 
 

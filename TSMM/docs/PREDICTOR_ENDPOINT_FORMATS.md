@@ -82,7 +82,7 @@ Use a `.pkl` output name for the bundle because the eDep UI file picker already 
 
 Found in the repo:
 
-1. [config/high10mResults/nbeats/top1_08098.yaml](config/high10mResults/nbeats/top1_08098.yaml)
+1. [config/high10mResults/nbeats/top1_06000.yaml](config/high10mResults/nbeats/top1_06000.yaml)
 2. [config/high10mResults/ulr/top1_04212.yaml](config/high10mResults/ulr/top1_04212.yaml)
 3. [config/high30mResults/nbeats/top1_08745.yaml](config/high30mResults/nbeats/top1_08745.yaml)
 4. [config/high1hResults/nbeats/top1_06725.yaml](config/high1hResults/nbeats/top1_06725.yaml)
@@ -108,7 +108,7 @@ Matrix-style is clearer and safer.
 
 | Timeframe | Model | n_steps | n_features | Preferred Object Field Shape | Flattened Object Field Shape |
 |---|---|---:|---:|---|---|
-| 10m | nbeats | 72 | 4 | `window: (72, 4)` | `vector: (288,)` |
+| 10m | nbeats | 6 | 4 | `window: (6, 4)` | `vector: (24,)` |
 | 10m | ulr | 72 | 3 | `window: (72, 3)` | `vector: (216,)` |
 | 30m | nbeats | 42 | 5 | `window: (42, 5)` | `vector: (210,)` |
 | 1h | nbeats | 3 | 5 | `window: (3, 5)` | `vector: (15,)` |
@@ -178,8 +178,8 @@ Example for `10m / nbeats`:
         "minItems": 4,
         "maxItems": 4
       },
-      "minItems": 72,
-      "maxItems": 72
+      "minItems": 6,
+      "maxItems": 6
     }
   },
   "required": ["window"]
@@ -212,8 +212,8 @@ Use this only if you want the client to flatten before sending.
       "items": {
         "type": "number"
       },
-      "minItems": 288,
-      "maxItems": 288
+      "minItems": 24,
+      "maxItems": 24
     }
   },
   "required": ["vector"]
@@ -234,13 +234,13 @@ The POST body then becomes:
 
 ### 1. 10m NBEATS
 
-Source: [config/high10mResults/nbeats/top1_08098.yaml](config/high10mResults/nbeats/top1_08098.yaml)
+Source: [config/high10mResults/nbeats/top1_06000.yaml](config/high10mResults/nbeats/top1_06000.yaml)
 
-1. `n_steps = 72`
+1. `n_steps = 6`
 2. `n_features = 4`
 3. feature order = `[HIGH, y_diff, Low_return, Price_return]`
-4. preferred object payload = `{"window": [[... 72 rows ...]]}`
-5. flat object payload = `{"vector": [... 288 values ...]}`
+4. preferred object payload = `{"window": [[... 6 rows ...]]}`
+5. flat object payload = `{"vector": [... 24 values ...]}`
 
 Matrix schema:
 
@@ -256,8 +256,8 @@ Matrix schema:
         "minItems": 4,
         "maxItems": 4
       },
-      "minItems": 72,
-      "maxItems": 72
+      "minItems": 6,
+      "maxItems": 6
     }
   },
   "required": ["window"]

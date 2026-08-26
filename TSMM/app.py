@@ -54,12 +54,20 @@ def _resolve_app_path(path_value: str) -> str:
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="TSMM Forecasting and Trading Job CLI")
-    parser.add_argument("command", nargs="?", default="forecast", choices=["forecast", "trading-job"])
+    parser.add_argument("command", nargs="?", default="forecast", choices=["forecast", "trading-job", "backtest"])
     parser.add_argument("action", nargs="?", default="start", choices=["start", "resume", "stop", "kill"])
     parser.add_argument("--plan-model", default=None, help="Optional model name to force for Agent A plan")
     parser.add_argument("--job-id", default=None, help="Optional trading job id for start/resume/stop/kill")
     parser.add_argument("--submission-mode", default=None, choices=["programmed", "market"], help="Optional order submission mode override for trading-job start")
     parser.add_argument("--autonomous-trigger", default=None, choices=["mandatory_session", "autonomous_followup", "opposing_countertrade"], help="Internal autonomous launcher context for trading-job start")
+    parser.add_argument("--previous-month", action="store_true", help="Backtest the previous local calendar month")
+    parser.add_argument("--start-date", default=None, help="Backtest start date or timestamp in the trading timezone")
+    parser.add_argument("--end-date", default=None, help="Backtest end date or timestamp in the trading timezone")
+    parser.add_argument("--market-source", default=None, help="Backtest one-minute SQLite/CSV source")
+    parser.add_argument("--backtest-output-dir", default=None, help="Backtest output directory")
+    parser.add_argument("--initial-balance", type=float, default=100000.0, help="Backtest starting balance")
+    parser.add_argument("--contract-size", type=float, default=100.0, help="Backtest currency P/L multiplier")
+    parser.add_argument("--poll-minutes", type=int, default=None, help="Backtest Agent B interval override")
     return parser.parse_args()
 
 
@@ -581,6 +589,56 @@ def main():
     logger = setup_logger(log_file)
     
     try:
+        # Historical strategy replay is deliberately isolated from startup data
+        # refresh and MT5. It must never mutate or depend on live broker state.
+        if args.command == "backtest":
+            from utils.strategy_backtest import ConsoleProgressBar, run_historical_strategy_backtest
+
+            trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
+            trading_cfg = load_trading_config(trading_cfg_path)
+            market_source = str(
+                args.market_source
+                or ((trading_cfg.get("dashboard") or {}).get("master_table_path"))
+                or "data/market_data.sqlite"
+            )
+            market_source = _resolve_app_path(market_source)
+            backtest_dir = _resolve_app_path(
+                args.backtest_output_dir
+                or os.path.join("reports", "backtests", f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            )
+
+            print("Preparing historical market data and loading current forecasting models...", flush=True)
+            progress = ConsoleProgressBar()
+
+            backtest_result = run_historical_strategy_backtest(
+                market_source=market_source,
+                trading_cfg=trading_cfg,
+                output_dir=backtest_dir,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                previous_month=bool(args.previous_month or not args.start_date),
+                initial_balance=float(args.initial_balance),
+                contract_size=float(args.contract_size),
+                poll_minutes=args.poll_minutes,
+                tick_progress_cb=progress,
+            )
+            if not bool(backtest_result.get("ok", False)):
+                raise RuntimeError(str(backtest_result.get("error") or "Backtest failed"))
+            overall = (backtest_result.get("summary") or {}).get("overall") or {}
+            print(json.dumps({
+                "ok": True,
+                "result_grade": (((backtest_result.get("summary") or {}).get("validity") or {}).get("result_grade")),
+                "trades": overall.get("n_trades"),
+                "win_rate": overall.get("win_rate"),
+                "net_pnl": overall.get("net_pnl"),
+                "return_pct": overall.get("total_return_pct"),
+                "max_drawdown_pct": overall.get("max_drawdown_pct"),
+                "report": backtest_result.get("report_path"),
+                "summary": backtest_result.get("summary_path"),
+            }, indent=2, ensure_ascii=True))
+            logger.info("Historical strategy backtest completed: %s", backtest_result.get("summary_path"))
+            return
+
         # Trading job manual stop command does not require a forecast run.
         if args.command == "trading-job" and args.action in {"stop", "kill"}:
             trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')

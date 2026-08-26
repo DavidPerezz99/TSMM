@@ -1,4 +1,4 @@
-default_provider: local_ollama
+default_provider: local_transformers
 providers:
   github_models:
     enabled: false

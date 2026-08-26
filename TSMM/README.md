@@ -1,5 +1,7 @@
 # TSMM
 
+Model recalibration, champion/challenger promotion, shadow evaluation, and small-account risk sizing are documented in [docs/MODEL_GOVERNANCE_AND_SMALL_ACCOUNT.md](docs/MODEL_GOVERNANCE_AND_SMALL_ACCOUNT.md).
+
 TSMM is a time-series forecasting and managed-trading system with model
 training, signal generation, MT5 execution, operational feedback, autonomous
 trade supervision, and validation dashboards.
@@ -34,6 +36,10 @@ source code and mostly ignored by Git.
 python app.py
 python app.py trading-job start
 
+# Model-backed historical strategy evaluation (no MT5 connection)
+python app.py backtest --previous-month
+python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31
+
 # User interfaces
 python scripts/start_all_uis.py
 
@@ -45,6 +51,14 @@ python -m unittest discover -s tests
 
 # Hyperparameter search
 python tools/hypersearch.py --help
+python tools/hypersearch.py plan --base-config config_templates/univariate.yaml --param-grid config/sweeps/sweep_30m_high_return.yaml --ram-limit-gb 20
+
+# Manual, resumable overnight experiment session
+python tools/experiment_session.py plan --config config/experiment_sessions/xauusd_nightly.yaml
+python tools/experiment_session.py prepare-data --config config/experiment_sessions/xauusd_nightly.yaml
+python tools/experiment_session.py capacity --config config/experiment_sessions/xauusd_nightly.yaml
+python tools/experiment_session.py run --config config/experiment_sessions/xauusd_nightly.yaml
+python tools/experiment_session.py status --config config/experiment_sessions/xauusd_nightly.yaml
 ```
 
 ## Documentation
