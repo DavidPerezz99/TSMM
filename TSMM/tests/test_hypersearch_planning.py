@@ -23,6 +23,7 @@ from hypersearch import (  # noqa: E402
     unique_experiments,
 )
 from utils.tracking import write_run_summary  # noqa: E402
+from utils.experiment_artifacts import best_r2_model, export_worthy_experiment_bundle  # noqa: E402
 
 
 class HypersearchPlanningTests(unittest.TestCase):
@@ -141,6 +142,60 @@ class HypersearchPlanningTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 capped.materialize_configs()
             self.assertEqual(list((root / "capped").glob("cfg_*.yaml")), [])
+
+    def test_best_r2_model_uses_primary_metrics(self):
+        name, score = best_r2_model(
+            {
+                "ulr": {"metrics": {"R2": 0.61}},
+                "nbeats": {"metrics": {"R2": 0.73}},
+                "broken": {"metrics": {"R2": "nan"}},
+            }
+        )
+        self.assertEqual(name, "nbeats")
+        self.assertEqual(score, 0.73)
+
+    @patch("utils.experiment_artifacts.save_best_model")
+    def test_worthy_bundle_is_strictly_gated_and_self_contained(self, save_model):
+        def fake_save(models, evaluation, model_dir, logger):
+            path = Path(model_dir) / "nbeats_20260825_010203.joblib"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"model")
+            return str(path)
+
+        save_model.side_effect = fake_save
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cfg_path = root / "cfg_00001.yaml"
+            cfg_path.write_text("data_path: missing.csv\n", encoding="utf-8")
+            common = {
+                "models": {"nbeats": {"model": object()}},
+                "future_forecasts": {"nbeats": {"future": [1.0]}},
+                "config": {"data_path": "missing.csv", "records": 4000},
+                "config_path": str(cfg_path),
+                "artifact_root": str(root / "worthy"),
+                "r2_threshold": 0.6,
+                "logger": object(),
+            }
+            rejected = export_worthy_experiment_bundle(
+                evaluation={"nbeats": {"metrics": {"MAE": 1.0, "R2": 0.6}}},
+                **common,
+            )
+            self.assertIsNone(rejected)
+            self.assertFalse((root / "worthy").exists())
+
+            accepted = export_worthy_experiment_bundle(
+                evaluation={"nbeats": {"metrics": {"MAE": 1.0, "R2": 0.600001}}},
+                **common,
+            )
+            self.assertIsNotNone(accepted)
+            self.assertTrue((accepted / "manifest.json").exists())
+            self.assertTrue((accepted / "experiment_config.yaml").exists())
+            self.assertTrue((accepted / "evaluation.json").exists())
+            self.assertTrue((accepted / "forecasts.json").exists())
+            self.assertEqual(len(list((accepted / "model_files").glob("*.joblib"))), 1)
+            manifest = json.loads((accepted / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["qualification"]["operator"], ">")
+            self.assertEqual(manifest["qualification"]["threshold"], 0.6)
 
 
 if __name__ == "__main__":

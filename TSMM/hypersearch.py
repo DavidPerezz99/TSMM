@@ -604,6 +604,7 @@ class BulkSearchEngine:
         restart=False,
         experiment_timeout_sec=None,
         max_experiments=None,
+        worthy_r2_threshold=0.6,
     ):
         self.base_cfg = base_cfg
         self.sweep_cfg = sweep_cfg
@@ -613,10 +614,12 @@ class BulkSearchEngine:
         self.restart = bool(restart)
         self.experiment_timeout_sec = experiment_timeout_sec
         self.max_experiments = int(max_experiments or 0)
+        self.worthy_r2_threshold = float(worthy_r2_threshold)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.failure_log_dir = self.out_dir / "failed_logs"
         self.failure_log_dir.mkdir(parents=True, exist_ok=True)
+        self.worthy_artifact_dir = self.out_dir / "worthy_artifacts"
         self.summary_dirs = [self.summary_dir]
         if self.out_dir.resolve() != self.summary_dir.resolve():
             self.summary_dirs.append(self.out_dir)
@@ -781,7 +784,11 @@ class BulkSearchEngine:
             str(cfg_path),
             "--summary-dir",
             str(self.summary_dir),
-            "--bulk-search"
+            "--bulk-search",
+            "--worthy-artifact-dir",
+            str(self.worthy_artifact_dir),
+            "--worthy-r2-threshold",
+            str(self.worthy_r2_threshold),
         ]
         async with self.sem:
             try:
@@ -1011,6 +1018,7 @@ Examples:
     sp.add_argument("--max-experiments", type=int, default=0, help="Refuse to run above this exact unique count")
     sp.add_argument("--legacy", action="store_true", help="Use legacy factorial expansion (WARNING: may generate many experiments)")
     sp.add_argument("--restart", action="store_true", help="Ignore resume and run all experiments from the beginning")
+    sp.add_argument("--worthy-r2-threshold", type=float, default=0.6, help="Save a reproducible model bundle only for R2 scores strictly above this gate")
 
     # dedicated resume for latest/incomplete bulk execution
     sp_resume = sub.add_parser("resume_bulk", help="Resume the latest bulk hyperparameter execution")
@@ -1021,6 +1029,7 @@ Examples:
     sp_resume.add_argument("--max-parallel", type=int, default=4, help="Maximum parallel experiments")
     sp_resume.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
     sp_resume.add_argument("--max-experiments", type=int, default=0, help="Refuse to resume a session above this count")
+    sp_resume.add_argument("--worthy-r2-threshold", type=float, default=0.6, help="Save a reproducible model bundle only for R2 scores strictly above this gate")
 
     # smart
     sp2 = sub.add_parser("smart_search", help="Rerun top configurations from previous experiments")
@@ -1086,6 +1095,7 @@ Examples:
             restart=args.restart,
             experiment_timeout_sec=(args.experiment_timeout_sec or None),
             max_experiments=(args.max_experiments or None),
+            worthy_r2_threshold=args.worthy_r2_threshold,
         )
         asyncio.run(engine.launch_all())
 
@@ -1114,6 +1124,7 @@ Examples:
             restart=False,
             experiment_timeout_sec=(args.experiment_timeout_sec or None),
             max_experiments=(args.max_experiments or None),
+            worthy_r2_threshold=args.worthy_r2_threshold,
         )
         asyncio.run(engine.launch_all())
 

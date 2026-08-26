@@ -22,6 +22,7 @@ from utils.data_loader import load_data_cached
 from models.univariate_models import train_univariate_models
 from models.multivariate_models import train_multivariate_models
 from utils.evaluator import evaluate_models, save_best_model
+from utils.experiment_artifacts import export_worthy_experiment_bundle
 from utils.tracking import write_run_summary
 
 
@@ -39,6 +40,17 @@ def parse_cli():
         "--bulk-search",
         action="store_true",
         help="Run in bulk-search mode (skip model artifact persistence)"
+    )
+    p.add_argument(
+        "--worthy-artifact-dir",
+        default=None,
+        help="Bulk-search directory for reproducible bundles above the R2 gate",
+    )
+    p.add_argument(
+        "--worthy-r2-threshold",
+        type=float,
+        default=0.6,
+        help="Persist a bulk-search bundle only when primary-target R2 is strictly above this value",
     )
     return p.parse_args()
 
@@ -227,10 +239,38 @@ def main():
         traceback.print_exc()
         sys.exit(14)
     
-    # Save best model (disabled for bulk hypersearch experiment runs)
+    # Bulk experiments persist only exceptional, reproducible bundles.
     if is_bulk_search:
-        print("[search_mode] Bulk-search mode: skipping model persistence")
-        logger.info("Bulk-search mode enabled; skipping save_best_model")
+        if args.worthy_artifact_dir:
+            try:
+                bundle_path = export_worthy_experiment_bundle(
+                    models=all_model_results,
+                    evaluation=evaluation,
+                    future_forecasts=future_forecasts,
+                    config=config,
+                    config_path=config_path,
+                    artifact_root=args.worthy_artifact_dir,
+                    r2_threshold=args.worthy_r2_threshold,
+                    logger=logger,
+                    dataframe=df,
+                )
+                if bundle_path is None:
+                    print(
+                        "[search_mode] R2 gate not met; no model artifacts persisted "
+                        f"(requires R2 > {args.worthy_r2_threshold})"
+                    )
+                else:
+                    print(f"[search_mode] Worthy artifact bundle saved: {bundle_path}")
+                    logger.info(f"Worthy artifact bundle saved: {bundle_path}")
+            except Exception as e:
+                print(f"[search_mode] ERROR exporting worthy artifact bundle: {e}")
+                logger.error(f"Error exporting worthy artifact bundle: {e}")
+                try:
+                    _write_failure_summary(config_path, "artifact_export", e, summary_dir)
+                finally:
+                    sys.exit(15)
+        else:
+            print("[search_mode] Bulk-search mode: worthy artifact export is not configured")
     else:
         try:
             save_best_model(all_model_results, evaluation, "model_files", logger)
