@@ -296,7 +296,10 @@ def train_univariate_models(df, config, logger, input_features, target_features,
                 patience_rlr=nbeats_config.get('patience_rlr', 10),
                 stacks_config=nbeats_config.get('stacks_config'),
                 blackbox_config=nbeats_config.get('blackbox_config'),
-                device=nbeats_config.get('device', 'cpu')
+                device=nbeats_config.get('device', 'cpu'),
+                test_size=config.get('test_size'),
+                validation_size=nbeats_config.get('validation_size'),
+                random_seed=nbeats_config.get('random_seed', config.get('random_seed', 42)),
             )
             models['nbeats'] = nbeats_result
             logger.info("N-BEATS model training completed")
