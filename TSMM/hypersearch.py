@@ -605,6 +605,7 @@ class BulkSearchEngine:
         experiment_timeout_sec=None,
         max_experiments=None,
         worthy_r2_threshold=0.6,
+        device="cpu",
     ):
         self.base_cfg = base_cfg
         self.sweep_cfg = sweep_cfg
@@ -615,6 +616,7 @@ class BulkSearchEngine:
         self.experiment_timeout_sec = experiment_timeout_sec
         self.max_experiments = int(max_experiments or 0)
         self.worthy_r2_threshold = float(worthy_r2_threshold)
+        self.device = str(device or "cpu").strip().lower()
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.failure_log_dir = self.out_dir / "failed_logs"
@@ -775,7 +777,8 @@ class BulkSearchEngine:
     async def _run_one(self, cfg_path):
         """Run a single experiment."""
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "-1"
+        if self.device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = "-1"
         
         cmd = [
             sys.executable,
@@ -789,6 +792,8 @@ class BulkSearchEngine:
             str(self.worthy_artifact_dir),
             "--worthy-r2-threshold",
             str(self.worthy_r2_threshold),
+            "--device",
+            self.device,
         ]
         async with self.sem:
             try:
@@ -1019,6 +1024,7 @@ Examples:
     sp.add_argument("--legacy", action="store_true", help="Use legacy factorial expansion (WARNING: may generate many experiments)")
     sp.add_argument("--restart", action="store_true", help="Ignore resume and run all experiments from the beginning")
     sp.add_argument("--worthy-r2-threshold", type=float, default=0.6, help="Save a reproducible model bundle only for R2 scores strictly above this gate")
+    sp.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu", help="N-BEATS training device; cuda fails fast when unavailable")
 
     # dedicated resume for latest/incomplete bulk execution
     sp_resume = sub.add_parser("resume_bulk", help="Resume the latest bulk hyperparameter execution")
@@ -1030,6 +1036,7 @@ Examples:
     sp_resume.add_argument("--experiment-timeout-sec", type=int, default=0, help="Kill a single experiment if it runs longer than this (0 disables timeout)")
     sp_resume.add_argument("--max-experiments", type=int, default=0, help="Refuse to resume a session above this count")
     sp_resume.add_argument("--worthy-r2-threshold", type=float, default=0.6, help="Save a reproducible model bundle only for R2 scores strictly above this gate")
+    sp_resume.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu", help="N-BEATS training device; cuda fails fast when unavailable")
 
     # smart
     sp2 = sub.add_parser("smart_search", help="Rerun top configurations from previous experiments")
@@ -1096,6 +1103,7 @@ Examples:
             experiment_timeout_sec=(args.experiment_timeout_sec or None),
             max_experiments=(args.max_experiments or None),
             worthy_r2_threshold=args.worthy_r2_threshold,
+            device=args.device,
         )
         asyncio.run(engine.launch_all())
 
@@ -1125,6 +1133,7 @@ Examples:
             experiment_timeout_sec=(args.experiment_timeout_sec or None),
             max_experiments=(args.max_experiments or None),
             worthy_r2_threshold=args.worthy_r2_threshold,
+            device=args.device,
         )
         asyncio.run(engine.launch_all())
 

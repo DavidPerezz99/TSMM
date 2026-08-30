@@ -747,7 +747,13 @@ def train_nbeats_model(
         loader_generator.manual_seed(random_seed)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=loader_generator)
 
-        device = torch.device(device if torch.cuda.is_available() else "cpu")
+        requested_device = str(device or "cpu").strip().lower()
+        if requested_device == "auto":
+            requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+        if requested_device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("N-BEATS requested CUDA, but torch.cuda.is_available() is false")
+        device = torch.device(requested_device)
+        logger.info(f"N-BEATS training device: {device}")
 
         input_size = n_steps * n_input_features
         forecast_size = m_steps * n_target_features

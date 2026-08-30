@@ -52,6 +52,12 @@ def parse_cli():
         default=0.6,
         help="Persist a bulk-search bundle only when primary-target R2 is strictly above this value",
     )
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="cpu",
+        help="N-BEATS training device; cuda fails fast when unavailable",
+    )
     return p.parse_args()
 
 
@@ -95,6 +101,21 @@ def main():
     
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    requested_device = args.device
+    if requested_device in {"auto", "cuda"}:
+        import torch
+        cuda_available = bool(torch.cuda.is_available())
+        if requested_device == "cuda" and not cuda_available:
+            raise RuntimeError(
+                "CUDA was requested but PyTorch cannot access a GPU. "
+                "Enable a Kaggle GPU accelerator and use a CUDA-enabled PyTorch build."
+            )
+        resolved_device = "cuda" if cuda_available else "cpu"
+    else:
+        resolved_device = "cpu"
+    config.setdefault("nbeats", {})["device"] = resolved_device
+    print(f"[search_mode] N-BEATS device: requested={requested_device}, resolved={resolved_device}")
     
     # Setup logging (respect config log_dir when provided)
     log_dir = config.get('log_dir', 'logs')
