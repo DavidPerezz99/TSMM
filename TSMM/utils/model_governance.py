@@ -113,7 +113,7 @@ def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def promote(registry_path: Path, endpoint: str, bundle: str, metrics: Dict[str, Any],
-            assessment: Dict[str, Any]) -> Dict[str, Any]:
+            assessment: Dict[str, Any], deployment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not assessment.get("approved"):
         raise ValueError("Challenger did not pass promotion gates")
     registry = load_registry(registry_path)
@@ -126,6 +126,8 @@ def promote(registry_path: Path, endpoint: str, bundle: str, metrics: Dict[str, 
         "metrics": metrics,
         "promoted_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    if deployment is not None:
+        record["champion"]["deployment"] = deployment
     record["last_assessment"] = assessment
     _atomic_json(registry_path, registry)
     return record["champion"]

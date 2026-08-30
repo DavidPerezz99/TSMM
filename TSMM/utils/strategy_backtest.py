@@ -425,10 +425,20 @@ class FrozenModelSignalProvider:
         model_name = str(spec.get("model") or "").strip().lower()
         family = str(spec.get("family") or "high").strip().lower()
         timeframe = str(spec.get("timeframe") or "").strip().lower()
-        model_path = self._latest(f"{model_name}_{family}_{timeframe}_*.joblib")
-        artifacts_path = self._latest(f"{model_name}_artifacts_{family}_{timeframe}_*.joblib")
+        explicit_model = str(spec.get("model_path") or "").strip()
+        explicit_artifacts = str(spec.get("artifacts_path") or "").strip()
+        model_path = Path(explicit_model) if explicit_model else self._latest(
+            f"{model_name}_{family}_{timeframe}_*.joblib"
+        )
+        artifacts_path = Path(explicit_artifacts) if explicit_artifacts else self._latest(
+            f"{model_name}_artifacts_{family}_{timeframe}_*.joblib"
+        )
         if model_path is None:
             raise FileNotFoundError(f"model artifact not found for {family}:{timeframe}:{model_name}")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"activated model artifact is missing: {model_path}")
+        if artifacts_path is not None and not artifacts_path.is_file():
+            raise FileNotFoundError(f"activated scaler artifact is missing: {artifacts_path}")
         if model_name == "nbeats" and self._torch is None:
             raise RuntimeError(f"torch unavailable: {self._torch_error}")
         model = joblib.load(model_path)
@@ -524,6 +534,9 @@ class FrozenModelSignalProvider:
                     "model_path": str(loaded.model_path),
                     "model_modified_at_utc": datetime.fromtimestamp(loaded.model_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "artifacts_path": str(loaded.artifacts_path) if loaded.artifacts_path else None,
+                    "deployment_id": loaded.spec.get("deployment_id"),
+                    "training_data_first_index": loaded.spec.get("training_data_first_index"),
+                    "training_data_last_index": loaded.spec.get("training_data_last_index"),
                 }
             )
         for key, error in sorted(self.errors.items()):
@@ -1416,22 +1429,32 @@ def run_historical_strategy_backtest(
         )
     engine.close()
 
-    artifact_times = []
+    point_in_time_checks: List[bool] = []
     for item in provider_manifest:
-        raw = item.get("model_modified_at_utc")
-        if raw:
-            artifact_times.append(pd.Timestamp(raw))
-    point_in_time_safe = bool(artifact_times) and all(timestamp <= start for timestamp in artifact_times)
+        training_end = item.get("training_data_last_index")
+        fallback_modified = item.get("model_modified_at_utc")
+        raw = training_end or fallback_modified
+        if not raw:
+            point_in_time_checks.append(False)
+            continue
+        try:
+            timestamp = pd.Timestamp(raw)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+            point_in_time_checks.append(timestamp < start)
+        except Exception:
+            point_in_time_checks.append(False)
+    point_in_time_safe = bool(point_in_time_checks) and all(point_in_time_checks)
     if point_in_time_safe:
         result_grade = "point-in-time market replay with pre-period frozen models"
         warning = (
-            "All loaded model artifacts predate the evaluated period. Market-data lookahead was prevented, but current config selection "
+            "Every packaged model's training-data cutoff (or legacy artifact timestamp when no cutoff exists) predates the evaluated period. Market-data lookahead was prevented, but current config selection "
             "and omitted live-only behavior still mean this is not a perfect historical reconstruction."
         )
     else:
         result_grade = "exploratory retrospective current-model replay"
         warning = (
-            "One or more fitted model artifacts were created after the evaluated period began. Those models may have learned from this "
+            "One or more models have no pre-period training cutoff, or their training data reaches into the evaluated period. They may have learned from this "
             "same market history, so the result must not be treated as unbiased evidence of future strategy strength."
         )
 

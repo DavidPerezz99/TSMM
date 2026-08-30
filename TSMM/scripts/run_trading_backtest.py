@@ -15,7 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.strategy_backtest import ConsoleProgressBar, run_historical_strategy_backtest
+from utils.model_deployment import deployment_model_spec, install_bundle
+from utils.strategy_backtest import (
+    ConsoleProgressBar,
+    discover_replay_model_specs,
+    run_historical_strategy_backtest,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-balance", type=float, default=100000.0)
     parser.add_argument("--contract-size", type=float, default=100.0, help="Currency P/L multiplier per 1.0 lot and 1.0 price move")
     parser.add_argument("--poll-minutes", type=int, default=None, help="Override Agent B replay interval")
+    parser.add_argument("--candidate-bundle", help="Bundle directory or .zip to replay without activating it")
+    parser.add_argument("--candidate-endpoint", help="Endpoint replaced by the candidate, for example 10m_high")
     parser.add_argument("--max-ticks", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -63,6 +70,23 @@ def main() -> int:
 
     print("Preparing historical market data and loading current forecasting models...", flush=True)
     progress = ConsoleProgressBar()
+    replay_specs = None
+    if bool(args.candidate_bundle) != bool(args.candidate_endpoint):
+        raise ValueError("--candidate-bundle and --candidate-endpoint must be supplied together")
+    if args.candidate_bundle:
+        deployment = install_bundle(_resolve(args.candidate_bundle), args.candidate_endpoint)
+        candidate_spec = deployment_model_spec(deployment)
+        replay_specs = discover_replay_model_specs(trading_cfg)
+        candidate_key = (candidate_spec["timeframe"], candidate_spec["family"])
+        replay_specs = [
+            spec for spec in replay_specs
+            if (str(spec.get("timeframe")), str(spec.get("family")).lower()) != candidate_key
+        ]
+        replay_specs.append(candidate_spec)
+        print(
+            f"Candidate package loaded for {args.candidate_endpoint}: {deployment['deployment_id']}",
+            flush=True,
+        )
 
     result = run_historical_strategy_backtest(
         market_source=str(market_source_path),
@@ -76,6 +100,7 @@ def main() -> int:
         poll_minutes=args.poll_minutes,
         tick_progress_cb=progress,
         max_ticks=args.max_ticks,
+        specs=replay_specs,
     )
     if not result.get("ok"):
         print(json.dumps(result, indent=2, ensure_ascii=True))

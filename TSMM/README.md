@@ -39,6 +39,7 @@ python app.py trading-job start
 # Model-backed historical strategy evaluation (no MT5 connection)
 python app.py backtest --previous-month
 python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31
+python scripts/run_trading_backtest.py --start 2026-07-01 --end 2026-07-31 --candidate-endpoint 10m_high --candidate-bundle model_files/bundles/inbox/BUNDLE
 
 # User interfaces
 python scripts/start_all_uis.py

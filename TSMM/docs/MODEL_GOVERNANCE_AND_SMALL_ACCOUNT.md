@@ -22,6 +22,34 @@ Bulk search and resume commands accept `--worthy-r2-threshold` (default `0.6`). 
 
 The forecasting-only `main` branch implements the same behavior without importing any trading modules.
 
+### Moving a Domino package to the trading machine
+
+Download the complete qualifying bundle directory, or a ZIP containing that directory. Do not extract individual files or rename files inside it. The recommended landing location on the trading machine is:
+
+```text
+model_files/bundles/inbox/<complete-bundle-directory-or-zip>
+```
+
+The inbox is only a transfer location. Installation verifies every SHA-256 checksum, verifies that the bundle timeframe and OHLC target match the requested endpoint, deserializes the model and scaler artifacts, and copies the intact package to:
+
+```text
+model_files/deployments/<timeframe>_<family>/<immutable-deployment-id>/
+```
+
+Validate and install without changing the active trading model:
+
+```powershell
+.venv\Scripts\python.exe tools\model_registry.py validate-bundle `
+  --endpoint 10m_high `
+  --bundle model_files\bundles\inbox\BUNDLE
+
+.venv\Scripts\python.exe tools\model_registry.py install `
+  --endpoint 10m_high `
+  --bundle model_files\bundles\inbox\BUNDLE
+```
+
+The active serving pointer is `model_files/deployments/active.json`. Do not edit it manually. Promotion and rollback update it atomically. When an endpoint has no active package, the existing Results YAML plus newest matching files in `model_files/` remain the backward-compatible fallback.
+
 ## Leakage-safe validation
 
 N-BEATS preprocessing is fitted only on its training period. Early stopping uses a later chronological validation block, and reported evaluation uses a separate untouched holdout of at least 20 observations. Training uses a fixed seed and restores the best validation checkpoint.
@@ -49,7 +77,19 @@ The session remains manual-start-only, respects the local 05:00 deadline and RAM
 
 ## Champion/challenger promotion
 
-First run the model-backed backtest with costs. Then combine its summary with the walk-forward evidence and the bundle's untouched holdout:
+First run the model-backed backtest with costs. A candidate can replace one endpoint during replay without becoming active:
+
+```powershell
+.venv\Scripts\python.exe scripts\run_trading_backtest.py `
+  --start 2026-08-15 `
+  --end 2026-08-29 `
+  --candidate-endpoint 10m_high `
+  --candidate-bundle model_files\bundles\inbox\BUNDLE
+```
+
+For an unbiased two-week evaluation, the bundle's `data_manifest.json` must show a `last_index` earlier than the backtest start. If the model was trained using any part of those two weeks, the replay is intentionally labeled exploratory rather than point-in-time evidence.
+
+Then combine its summary with the walk-forward evidence and the bundle's untouched holdout:
 
 ```powershell
 .venv\Scripts\python.exe tools\build_candidate_metrics.py `
@@ -68,6 +108,8 @@ First run the model-backed backtest with costs. Then combine its summary with th
 ```
 
 Promotion fails closed unless all evidence exists. Defaults require non-negative holdout and median fold R2, no fold below `-0.25`, directional accuracy of at least `0.52`, profit factor of at least `1.10`, positive expectancy, drawdown no higher than `15%`, at least 30 trades, and an R2 improvement over the incumbent.
+
+Successful promotion installs and activates the exact bundle. The local signal endpoint, Agent A enrichment, recurring full-horizon report, and historical strategy backtester all prefer the activated package's YAML, fitted model, and scaler files as one inseparable version. Restarting the endpoint is still recommended after an operational promotion so its health report immediately reflects the new default generation; per-request resolution also detects the atomic pointer change.
 
 Rollback is atomic:
 

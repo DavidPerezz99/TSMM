@@ -27,6 +27,7 @@ import yaml
 
 from .backtester import run_backtest_from_validation
 from .market_db import query_ohlc
+from .model_deployment import resolve_active_deployment
 from .trading_reporter import generate_trading_plan_report
 from .trading_quality import apply_hybrid_trade_gate, model_quality_weight
 from .iqoption_adapter import IQOptionAdapter
@@ -1431,6 +1432,28 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
         if not tf_label:
             continue
         for family in target_families:
+            active_deployment = resolve_active_deployment(f"{tf_label}_{family}")
+            if active_deployment is not None:
+                metrics = active_deployment.get("metrics") or {}
+                qualification = active_deployment.get("qualification") or {}
+                deployed_r2 = metrics.get("holdout_r2", qualification.get("score", 0.0))
+                discovered.append(
+                    {
+                        "family": family,
+                        "timeframe": tf_label,
+                        "model": str(active_deployment.get("model") or "").lower(),
+                        "config_path": str(active_deployment.get("config_path") or ""),
+                        "model_path": str(active_deployment.get("model_path") or ""),
+                        "artifacts_path": active_deployment.get("artifacts_path"),
+                        "deployment_id": active_deployment.get("deployment_id"),
+                        "training_data_first_index": active_deployment.get("training_data_first_index"),
+                        "training_data_last_index": active_deployment.get("training_data_last_index"),
+                        "r2": float(deployed_r2 or 0.0),
+                        "refreshed_r2": float(deployed_r2) if deployed_r2 is not None else None,
+                        "validation_status": "activated_bundle",
+                    }
+                )
+                continue
             tf_dir = config_root / f"{family}{tf_label}Results"
             if not tf_dir.exists() or not tf_dir.is_dir():
                 continue
@@ -2068,6 +2091,25 @@ def _discover_endpoint_specs(
         try:
             with open(best["config_path"], "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
+            family = str(cfg.get("target_col") or "HIGH").strip().lower()
+            active_deployment = resolve_active_deployment(f"{tf_label}_{family}")
+            if active_deployment is not None:
+                best.update(
+                    {
+                        "model": str(active_deployment.get("model") or best.get("model") or "").lower(),
+                        "config_path": str(active_deployment.get("config_path") or best["config_path"]),
+                        "model_path": str(active_deployment.get("model_path") or ""),
+                        "artifacts_path": active_deployment.get("artifacts_path"),
+                        "deployment_id": active_deployment.get("deployment_id"),
+                        "training_data_first_index": active_deployment.get("training_data_first_index"),
+                        "training_data_last_index": active_deployment.get("training_data_last_index"),
+                    }
+                )
+                with open(best["config_path"], "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                metrics = active_deployment.get("metrics") or {}
+                qualification = active_deployment.get("qualification") or {}
+                best["r2"] = float(metrics.get("holdout_r2", qualification.get("score", best.get("r2", 0.0))) or 0.0)
             best.update(
                 {
                     "n_steps": int(cfg.get("n_steps", 1) or 1),

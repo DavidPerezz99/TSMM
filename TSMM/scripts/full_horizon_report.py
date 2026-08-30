@@ -44,6 +44,7 @@ from utils.market_db import query_ohlc
 from utils.investing_agent import _enrich_endpoint_features, _latest_inference_window, _tf_to_minutes
 from utils.inference_performance import InferencePerformanceStore
 from utils.live_data import bootstrap_master_on_backend_start, resolve_tiingo_token_candidates
+from utils.model_deployment import resolve_active_deployment
 from utils.recursive_inference import recursive_forecast_matrix
 
 
@@ -204,7 +205,8 @@ def _load_training_r2_map() -> dict:
 
 
 def _load_model_and_predict(
-    cfg_path: Path, family: str, timeframe: str, model_name: str
+    cfg_path: Path, family: str, timeframe: str, model_name: str,
+    deployment: dict | None = None,
 ) -> tuple[list[float] | None, float | None, dict, str | None]:
     """Return the latest horizon, dynamic confidence, inference metadata, and error."""
     with open(cfg_path) as f:
@@ -240,21 +242,29 @@ def _load_model_and_predict(
 
     # Find model file (newest matching)
     model_file: Path | None = None
-    for pat in [f"{model_name}_{family.lower()}_{timeframe}_*.joblib"]:
-        cands = [Path(path) for path in glob.glob(str(ROOT / "model_files" / pat))]
-        if cands:
-            model_file = max(cands, key=lambda path: path.stat().st_mtime)
-            break
+    deployed_model_path = str((deployment or {}).get("model_path") or "").strip()
+    if deployed_model_path:
+        model_file = Path(deployed_model_path)
+    else:
+        for pat in [f"{model_name}_{family.lower()}_{timeframe}_*.joblib"]:
+            cands = [Path(path) for path in glob.glob(str(ROOT / "model_files" / pat))]
+            if cands:
+                model_file = max(cands, key=lambda path: path.stat().st_mtime)
+                break
     if not model_file or not model_file.exists():
         return None, None, {}, "model_file_not_found"
 
     # Load artifacts for scalers
-    arts = [
-        Path(path)
-        for path in glob.glob(
-            str(ROOT / "model_files" / f"{model_name}_artifacts_{family.lower()}_{timeframe}_*.joblib")
-        )
-    ]
+    deployed_artifacts_path = str((deployment or {}).get("artifacts_path") or "").strip()
+    if deployment is not None:
+        arts = [Path(deployed_artifacts_path)] if deployed_artifacts_path else []
+    else:
+        arts = [
+            Path(path)
+            for path in glob.glob(
+                str(ROOT / "model_files" / f"{model_name}_artifacts_{family.lower()}_{timeframe}_*.joblib")
+            )
+        ]
     scaler_x, scaler_y = None, None
     if arts:
         try:
@@ -331,6 +341,8 @@ def _load_model_and_predict(
             "model_path": str(model_file),
             "model_updated_at_utc": _utc_iso(model_file.stat().st_mtime),
             "config_path": str(cfg_path),
+            "deployment_id": (deployment or {}).get("deployment_id"),
+            "deployment_endpoint": (deployment or {}).get("endpoint"),
             "target_feature": primary_target,
             "feature_horizons": feature_horizons,
             "configured_horizon_steps": forecast_steps,
@@ -397,34 +409,47 @@ def main() -> int:
         results[tf] = {}
 
         for family in families:
-            model_name = selected_model(tf, family)
-            cfg_dir = ROOT / "config" / f"{family}{tf}Results" / model_name
-            if not cfg_dir.exists():
-                results[tf][family] = {"error": "config_dir_not_found"}
-                continue
+            deployment = resolve_active_deployment(f"{tf}_{family}")
+            model_name = str((deployment or {}).get("model") or selected_model(tf, family)).lower()
+            if deployment is not None:
+                cfg_path = Path(str(deployment["config_path"]))
+            else:
+                cfg_dir = ROOT / "config" / f"{family}{tf}Results" / model_name
+                if not cfg_dir.exists():
+                    results[tf][family] = {"error": "config_dir_not_found"}
+                    continue
 
-            cands = sorted(
-                list(cfg_dir.glob("top1*.yaml")) + list(cfg_dir.glob("top1*.yml"))
-            )
-            if not cands:
                 cands = sorted(
-                    list(cfg_dir.glob("top*.yaml")) + list(cfg_dir.glob("top*.yml"))
+                    list(cfg_dir.glob("top1*.yaml")) + list(cfg_dir.glob("top1*.yml"))
                 )
-            if not cands:
-                results[tf][family] = {"error": "no_config"}
-                continue
+                if not cands:
+                    cands = sorted(
+                        list(cfg_dir.glob("top*.yaml")) + list(cfg_dir.glob("top*.yml"))
+                    )
+                if not cands:
+                    results[tf][family] = {"error": "no_config"}
+                    continue
 
-            # Pick best config by R² from filename
-            cands.sort(key=_parse_r2_from_name, reverse=True)
-            cfg_path = cands[0]
+                # Pick best config by R² from filename only for the legacy fallback.
+                cands.sort(key=_parse_r2_from_name, reverse=True)
+                cfg_path = cands[0]
 
-            pred, confidence, inference_meta, err = _load_model_and_predict(cfg_path, family, tf, model_name)
+            pred, confidence, inference_meta, err = _load_model_and_predict(
+                cfg_path, family, tf, model_name, deployment=deployment
+            )
             if err:
                 results[tf][family] = {"error": err}
                 errors.append(f"{tf}/{family}/{model_name}: {err}")
             else:
                 # Get actual training R² from forecast logs
-                training_metric = training_r2.get((tf, family, model_name)) or {}
+                deployment_metrics = (deployment or {}).get("metrics") or {}
+                qualification = (deployment or {}).get("qualification") or {}
+                deployed_r2 = deployment_metrics.get("holdout_r2", qualification.get("score"))
+                training_metric = (
+                    {"value": deployed_r2, "source_log": str((deployment or {}).get("deployment_dir") or ""),
+                     "evaluated_at_utc": (deployment or {}).get("activated_at_utc")}
+                    if deployed_r2 is not None else (training_r2.get((tf, family, model_name)) or {})
+                )
                 train_r2 = training_metric.get("value") if isinstance(training_metric, dict) else training_metric
                 results[tf][family] = {
                     "model": model_name,
@@ -459,7 +484,7 @@ def main() -> int:
                                 "timeframe": tf,
                                 "timeframe_minutes": _tf_to_minutes(tf),
                                 "family": family,
-                                "model": selected_model(tf, family),
+                                "model": result.get("model") or selected_model(tf, family),
                                 "model_path": result.get("model_path"),
                                 "model_updated_at_utc": result.get("model_updated_at_utc"),
                                 "target_feature": result.get("target_feature") or "y_diff",
@@ -486,14 +511,14 @@ def main() -> int:
                     metrics = store.rolling_metrics(
                         timeframe=tf,
                         family=family,
-                        model=selected_model(tf, family),
+                        model=str(result.get("model") or selected_model(tf, family)),
                         window_samples=window_samples,
                         min_samples=min_samples,
                     )
                     current_model_metrics = store.rolling_metrics(
                         timeframe=tf,
                         family=family,
-                        model=selected_model(tf, family),
+                        model=str(result.get("model") or selected_model(tf, family)),
                         model_path=str(result.get("model_path") or ""),
                         window_samples=window_samples,
                         min_samples=min_samples,
@@ -502,7 +527,7 @@ def main() -> int:
                         generated_at_utc=report_started_at,
                         timeframe=tf,
                         family=family,
-                        model=selected_model(tf, family),
+                        model=str(result.get("model") or selected_model(tf, family)),
                         model_path=str(result.get("model_path") or ""),
                         metrics=metrics,
                     )
@@ -542,7 +567,7 @@ def main() -> int:
         for family in families:
             r = results[tf].get(family, {})
             if "error" in r:
-                print(f"{tf:<8} {family:<8} {selected_model(tf, family):<10} {'ERR':<6} {'':<10} {'':<8} {'':<8} {r['error'][:95]}")
+                print(f"{tf:<8} {family:<8} {str(r.get('model') or selected_model(tf, family)):<10} {'ERR':<6} {'':<10} {'':<8} {'':<8} {r['error'][:95]}")
             else:
                 h = r.get("horizon", [])
                 n = len(h)
@@ -553,7 +578,7 @@ def main() -> int:
                 live_r2_str = f"{r.get('r2_live_rolling', 0):.4f}" if r.get("r2_live_rolling") is not None else "N/A"
                 live_delta_str = f"{r.get('r2_live_delta', 0):+.4f}" if r.get("r2_live_delta") is not None else "N/A"
                 live_n = int(r.get("r2_live_samples") or 0)
-                print(f"{tf:<8} {family:<8} {selected_model(tf, family):<10} {n:<6} {r2_str:<10} {strength_str:<10} {live_r2_str:<10} {live_delta_str:<10} {live_n:<5} {sig:<8} [{h_str}]")
+                print(f"{tf:<8} {family:<8} {str(r.get('model') or selected_model(tf, family)):<10} {n:<6} {r2_str:<10} {strength_str:<10} {live_r2_str:<10} {live_delta_str:<10} {live_n:<5} {sig:<8} [{h_str}]")
 
     print(f"\n{'=' * 202}")
     print("\nR²: evaluación del último retrain, tomada del manifiesto de producción o del log más reciente.")

@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.investing_agent import _discover_endpoint_specs, _latest_inference_window
+from utils.model_deployment import resolve_active_deployment
 from utils.recursive_inference import recursive_forecast_matrix
 
 TRADING_CFG_PATH = Path(os.environ.get("TRADING_CONFIG_PATH", str(ROOT / "config" / "trading_agent.yaml")))
@@ -105,6 +106,14 @@ def _resolve_target_slug(spec: Dict[str, Any]) -> str:
 
 
 def _resolve_model_paths(spec: Dict[str, Any]) -> Tuple[Path | None, Path | None]:
+    deployed_model = str(spec.get("model_path") or "").strip()
+    deployed_artifacts = str(spec.get("artifacts_path") or "").strip()
+    if deployed_model:
+        model_path = Path(deployed_model)
+        artifacts_path = Path(deployed_artifacts) if deployed_artifacts else None
+        if model_path.is_file() and (artifacts_path is None or artifacts_path.is_file()):
+            return model_path, artifacts_path
+
     timeframe = str(spec.get("timeframe") or "").strip()
     model_name = str(spec.get("model") or "").strip().lower()
     target_slug = _resolve_target_slug(spec)
@@ -165,8 +174,40 @@ def _spec_cache_key(spec: Dict[str, Any]) -> str:
             str(spec.get("model") or "").lower(),
             target_slug,
             config_path,
+            str(spec.get("deployment_id") or ""),
+            str(spec.get("model_path") or ""),
         ]
     )
+
+
+def _apply_active_deployment(spec: Dict[str, Any]) -> Dict[str, Any]:
+    timeframe = str(spec.get("timeframe") or "").strip().lower()
+    family = _resolve_target_slug(spec)
+    if not timeframe:
+        return spec
+    deployment = resolve_active_deployment(f"{timeframe}_{family}")
+    if deployment is None:
+        return spec
+    deployed = _load_spec_from_config(
+        timeframe,
+        str(deployment.get("config_path") or ""),
+        fallback=spec,
+    )
+    deployed.update(
+        {
+            "model": str(deployment.get("model") or deployed.get("model") or "").lower(),
+            "model_path": str(deployment.get("model_path") or ""),
+            "artifacts_path": deployment.get("artifacts_path"),
+            "deployment_id": deployment.get("deployment_id"),
+            "deployment_endpoint": deployment.get("endpoint"),
+            "training_data_first_index": deployment.get("training_data_first_index"),
+            "training_data_last_index": deployment.get("training_data_last_index"),
+        }
+    )
+    metrics = deployment.get("metrics") or {}
+    qualification = deployment.get("qualification") or {}
+    deployed["r2"] = metrics.get("holdout_r2", qualification.get("score", deployed.get("r2")))
+    return deployed
 
 
 def _resolve_request_spec(timeframe: str, payload: PredictPayload) -> Dict[str, Any]:
@@ -183,7 +224,7 @@ def _resolve_request_spec(timeframe: str, payload: PredictPayload) -> Dict[str, 
         base["n_steps"] = int(payload.n_steps)
     if config_path:
         base["config_path"] = config_path
-    return base
+    return _apply_active_deployment(base)
 
 
 def _get_loaded_model(timeframe: str, payload: PredictPayload) -> LoadedModel | None:
@@ -346,6 +387,9 @@ def health() -> Dict[str, Any]:
                 "config_path": lm.spec.get("config_path"),
                 "model_path": str(lm.model_path),
                 "artifacts_path": str(lm.artifacts_path) if lm.artifacts_path else None,
+                "deployment_id": lm.spec.get("deployment_id"),
+                "deployment_endpoint": lm.spec.get("deployment_endpoint"),
+                "training_data_last_index": lm.spec.get("training_data_last_index"),
             }
             for tf, lm in DEFAULT_LOADED.items()
         },

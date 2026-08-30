@@ -39,6 +39,20 @@ class ModelGovernanceTests(unittest.TestCase):
             self.assertTrue(restored["bundle"].endswith("bundle-a"))
             self.assertTrue(load_registry(path)["endpoints"]["10m_high"]["champion"]["bundle"].endswith("bundle-a"))
 
+    def test_promotion_records_serving_deployment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "registry.json"
+            deployment = {"endpoint": "10m_high", "deployment_id": "qualified-model-v1"}
+            champion = promote(
+                path,
+                "10m_high",
+                "bundle-a",
+                dict(GOOD),
+                assess_challenger(GOOD),
+                deployment=deployment,
+            )
+            self.assertEqual(champion["deployment"]["deployment_id"], "qualified-model-v1")
+
 
 if __name__ == "__main__":
     unittest.main()
