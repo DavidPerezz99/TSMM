@@ -753,7 +753,7 @@ def train_nbeats_model(
         if requested_device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("N-BEATS requested CUDA, but torch.cuda.is_available() is false")
         device = torch.device(requested_device)
-        logger.info(f"N-BEATS training device: {device}")
+        logging.info(f"N-BEATS training device: {device}")
 
         input_size = n_steps * n_input_features
         forecast_size = m_steps * n_target_features
