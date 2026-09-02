@@ -16,7 +16,7 @@ m_steps: [1]
 horizon: [6]
 split_ratio: [0.82]
 test_size: [120]
-records: [4000, 8000, 12000]
+records: [4000, 8000, 10000]
 
 nbeats.model_type: [interpretable, blackbox]
 nbeats.hidden_size: [128, 256]

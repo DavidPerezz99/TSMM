@@ -1060,7 +1060,9 @@ def multiVrecurrent_SVR(df, input_features, target_features, n_steps, m_steps, s
     return results
 
 
-def multiVrecurrent_LR(df, input_features, target_features, n_steps, m_steps, split_ratio):
+def multiVrecurrent_LR(
+        df, input_features, target_features, n_steps, m_steps, split_ratio,
+        test_size=None):
     """Multivariate Linear Regression with all 4 required plots."""
     results = {
         'model': None,
@@ -1085,25 +1087,44 @@ def multiVrecurrent_LR(df, input_features, target_features, n_steps, m_steps, sp
         X_shape = X.shape
         y_shape = y.shape
      
-        scaler_X = StandardScaler()
-        scaler_y = StandardScaler()
-        
-        X_flat = X.reshape(-1, len(input_features))
-        y_flat = y.reshape(-1, len(target_features))
-        
-        X_scaled_flat = scaler_X.fit_transform(X_flat)
-        y_scaled_flat = scaler_y.fit_transform(y_flat)
-        
-        X_scaled = X_scaled_flat.reshape(X_shape)
-        y_scaled = y_scaled_flat.reshape(y_shape)
+        holdout_count = (
+            int(test_size)
+            if test_size is not None
+            else max(20, len(X) - int(len(X) * split_ratio))
+        )
+        holdout_count = max(20, holdout_count)
+        split_idx = len(X) - holdout_count
+        if split_idx < max(20, n_steps):
+            raise ValueError(
+                "Not enough chronological sequences for the requested ULR holdout: "
+                f"total={len(X)}, holdout={holdout_count}."
+            )
+
+        # Fit preprocessing on training rows only.  The previous implementation
+        # fitted both scalers before the chronological split, leaking holdout
+        # distribution information into every reported score.
+        scaler_X = StandardScaler().fit(
+            X[:split_idx].reshape(-1, len(input_features))
+        )
+        scaler_y = StandardScaler().fit(
+            y[:split_idx].reshape(-1, len(target_features))
+        )
+
+        X_scaled = scaler_X.transform(
+            X.reshape(-1, len(input_features))
+        ).reshape(X_shape)
+        y_scaled = scaler_y.transform(
+            y.reshape(-1, len(target_features))
+        ).reshape(y_shape)
         
         results['scalers']['X'] = scaler_X
         results['scalers']['y'] = scaler_y
         
-        split_idx = int(len(X_scaled) * split_ratio)
         X_train, X_test = X_scaled[:split_idx], X_scaled[split_idx:]
         y_train, y_test = y_scaled[:split_idx], y_scaled[split_idx:]
         logging.info(f"Train/test shapes - X_train: {X_train.shape}, y_train: {y_train.shape}")
+        results['parameters']['test_size'] = holdout_count
+        results['parameters']['validation_policy'] = 'chronological_train_only_scaling'
         
         X_train_2d = X_train.reshape(X_train.shape[0], -1)
         X_test_2d = X_test.reshape(X_test.shape[0], -1)

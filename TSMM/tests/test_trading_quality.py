@@ -10,6 +10,15 @@ class TradingQualityTests(unittest.TestCase):
         self.assertEqual(result["source"], "refreshed_r2")
         self.assertEqual(result["weight"], 0.0)
 
+    def test_legacy_static_r2_is_discounted_until_revalidated(self):
+        legacy = model_quality_weight(0.80, None, minimum_r2=0.0, legacy_static_discount=0.25)
+        refreshed = model_quality_weight(0.80, 0.80, minimum_r2=0.0, legacy_static_discount=0.25)
+        self.assertTrue(legacy["qualified"])
+        self.assertAlmostEqual(legacy["weight"], 0.20)
+        self.assertEqual(legacy["reliability_factor"], 0.25)
+        self.assertAlmostEqual(refreshed["weight"], 0.80)
+        self.assertEqual(refreshed["reliability_factor"], 1.0)
+
     def test_hybrid_gate_abstains_on_negative_after_cost_expected_value(self):
         plan = {
             "decision": "buy", "entry": 100.0, "stop_loss": 99.0,

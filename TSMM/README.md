@@ -39,6 +39,8 @@ python app.py trading-job start
 # Model-backed historical strategy evaluation (no MT5 connection)
 python app.py backtest --previous-month
 python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31
+python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31 --require-point-in-time-models
+python app.py backtest --start-date 2026-07-01 --end-date 2026-07-31 --walk-forward-deployments model_files/deployments
 python scripts/run_trading_backtest.py --start 2026-07-01 --end 2026-07-31 --candidate-endpoint 10m_high --candidate-bundle model_files/bundles/inbox/BUNDLE
 
 # User interfaces
@@ -70,6 +72,8 @@ python tools/experiment_session.py status --config config/experiment_sessions/xa
 - [Testing guide](docs/TESTING_GUIDE.md)
 - [Predictor endpoint formats](docs/PREDICTOR_ENDPOINT_FORMATS.md)
 - [Trading-analysis enhancement handoff](docs/TRADING_ANALYSIS_ENHANCEMENTS_HANDOFF.md)
+- [Joint OHLC trading signal policy](docs/TRADING_SIGNAL_POLICY.md)
+- [Model reliability and bounded recalibration](docs/MODEL_RELIABILITY_AND_RECALIBRATION.md)
 
 Delayed stop-loss protection introduced by the trading-analysis branch remains
 disabled by default. Review the enhancement handoff before changing that

@@ -15,8 +15,13 @@ def finite_float(value: Any) -> Optional[float]:
     return number
 
 
-def model_quality_weight(static_r2: Any, refreshed_r2: Any, minimum_r2: float = 0.0) -> Dict[str, Any]:
-    """Prefer refreshed R2 and assign zero voting power below the configured floor."""
+def model_quality_weight(
+    static_r2: Any,
+    refreshed_r2: Any,
+    minimum_r2: float = 0.0,
+    legacy_static_discount: float = 0.35,
+) -> Dict[str, Any]:
+    """Prefer refreshed R2 and discount legacy scores without reliable validation."""
     refreshed = finite_float(refreshed_r2)
     static = finite_float(static_r2)
     score = refreshed if refreshed is not None else static
@@ -24,7 +29,17 @@ def model_quality_weight(static_r2: Any, refreshed_r2: Any, minimum_r2: float = 
     if score is None or score < float(minimum_r2):
         return {"qualified": False, "score": score, "source": source, "weight": 0.0}
     weight = min(max((score - float(minimum_r2)) / max(1.0 - float(minimum_r2), 1e-9), 0.0), 1.0)
-    return {"qualified": True, "score": score, "source": source, "weight": weight}
+    reliability = 1.0
+    if refreshed is None:
+        reliability = min(max(float(legacy_static_discount), 0.0), 1.0)
+        weight *= reliability
+    return {
+        "qualified": weight > 0.0,
+        "score": score,
+        "source": source,
+        "weight": weight,
+        "reliability_factor": reliability,
+    }
 
 
 def apply_hybrid_trade_gate(plan: Dict[str, Any], trading_cfg: Dict[str, Any]) -> Dict[str, Any]:

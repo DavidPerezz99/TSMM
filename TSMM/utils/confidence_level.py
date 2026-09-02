@@ -493,6 +493,14 @@ def resolve_timeframe_key(config: Dict[str, Any]) -> str:
     if tf:
         return tf
 
+    timeframe_minutes = int(config.get('data_timeframe_minutes', 0) or 0)
+    if timeframe_minutes > 0:
+        if timeframe_minutes % 10080 == 0:
+            return f"{timeframe_minutes // 10080}w"
+        if timeframe_minutes % 60 == 0:
+            return f"{timeframe_minutes // 60}h"
+        return f"{timeframe_minutes}m"
+
     data_path = str(config.get('data_path', '') or '').lower()
     # Patterns like xauusd_7h_2009.csv, _10m_, _1w_, etc.
     m = re.search(r'(?<!\d)(\d+\s*[mhdw])(?!\w)', data_path)

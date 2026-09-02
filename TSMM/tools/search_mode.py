@@ -90,6 +90,7 @@ def main():
     
     with open(config_path) as f:
         config = yaml.safe_load(f)
+    config['_bulk_search'] = is_bulk_search
     
     # Setup logging (respect config log_dir when provided)
     log_dir = config.get('log_dir', 'logs')

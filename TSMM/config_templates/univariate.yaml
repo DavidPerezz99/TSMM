@@ -14,6 +14,11 @@ end_date: ""  # End date for filtering (empty for all)
 target_col: "LOW"  # Primary target column
 problem_type: "univariate"  # ["univariate", "multivariate"]
 test_size: 30  # Number of samples for testing
+evaluation_protocol: "rolling_origin_one_step"  # Match live endpoint refresh behavior
+artifact_qualification:
+  minimum_test_samples: 60
+  required_evaluation_protocol: "rolling_origin_one_step"
+  minimum_mae_skill_vs_zero_change: 0.0
 model_dir: "models"  # Directory to save models
 log_dir: "logs"  # Directory for logs
 n_steps: 60  # Lookback window size

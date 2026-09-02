@@ -150,7 +150,9 @@ class HypersearchPlanningTests(unittest.TestCase):
         plan = build_session_plan(session)
         self.assertTrue(plan["manual_start_only"])
         self.assertEqual(plan["deadline_local"], "05:00")
-        self.assertEqual(plan["total_experiments"], 10476)
+        self.assertEqual(plan["total_experiments"], 8748)
+        self.assertEqual(plan["max_records_per_experiment"], 10000)
+        self.assertEqual(plan["max_experiments_per_endpoint"], 400)
         self.assertEqual(len(plan["entries"]), 28)
         self.assertEqual(
             [entry["name"] for entry in plan["entries"][:4]],
@@ -177,7 +179,7 @@ class HypersearchPlanningTests(unittest.TestCase):
         )
         _, _, base, sweep = _entry_source(close_entry, session)
         configs = list(unique_experiments(generate_smart_experiments(base, sweep, verbose=False)))
-        self.assertEqual(len(configs), 432)
+        self.assertEqual(len(configs), 324)
         self.assertTrue(all(config["target_col"] == "CLOSE" for config in configs))
         self.assertTrue(
             all(config["input_features"][0] == "CLOSE" for config in configs)

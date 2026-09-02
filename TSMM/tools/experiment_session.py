@@ -159,6 +159,12 @@ def build_session_plan(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
         resources.get("max_estimated_experiment_minutes", 90.0) or 90.0
     )
     entries = list(session_cfg.get("experiments") or [])
+    max_records_per_experiment = int(
+        session_cfg.get("max_records_per_experiment", 10000) or 10000
+    )
+    max_experiments_per_endpoint = int(
+        session_cfg.get("max_experiments_per_endpoint", 400) or 400
+    )
     if not entries:
         raise ValueError("Session config must contain a non-empty 'experiments' list")
 
@@ -177,6 +183,17 @@ def build_session_plan(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
         )
         limit = int(entry.get("max_experiments", 0) or 0)
         count = int(sweep_plan["unique_experiments"])
+        configured_records = [int(value) for value in (sweep_cfg.get("records") or [])]
+        if configured_records and max(configured_records) > max_records_per_experiment:
+            raise ValueError(
+                f"Entry '{entry.get('name') or order}' requests {max(configured_records):,} "
+                f"records, above the session cap of {max_records_per_experiment:,}"
+            )
+        if count > max_experiments_per_endpoint:
+            raise ValueError(
+                f"Entry '{entry.get('name') or order}' has {count} experiments, above "
+                f"the session endpoint cap of {max_experiments_per_endpoint}"
+            )
         if limit and count > limit:
             raise ValueError(
                 f"Entry '{entry.get('name') or order}' has {count} experiments, above its limit of {limit}"
@@ -219,6 +236,8 @@ def build_session_plan(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "manual_start_only": bool(session_cfg.get("manual_start_only", True)),
         "deadline_local": str(session_cfg.get("deadline_local") or "05:00"),
         "total_experiments": total,
+        "max_records_per_experiment": max_records_per_experiment,
+        "max_experiments_per_endpoint": max_experiments_per_endpoint,
         "resources": {
             "max_process_ram_gb": ram_limit_gb,
             "min_free_ram_before_start_gb": float(
@@ -270,6 +289,17 @@ def _materialize_session(
         _, _, base_cfg, sweep_cfg = _entry_source(source_entry, session_cfg)
         count = 0
         for count, experiment in enumerate(_iter_entry_configs(base_cfg, sweep_cfg), 1):
+            records = int(experiment.get("records", 0) or 0)
+            if records > int(plan["max_records_per_experiment"]):
+                raise ValueError(
+                    f"Materialized config for {planned['name']} requests {records:,} records, "
+                    f"above the session cap of {int(plan['max_records_per_experiment']):,}"
+                )
+            if count > int(plan["max_experiments_per_endpoint"]):
+                raise ValueError(
+                    f"Materialized more than {int(plan['max_experiments_per_endpoint'])} "
+                    f"experiments for {planned['name']}"
+                )
             cfg_path = configs_dir / f"cfg_{count:05d}.yaml"
             with cfg_path.open("w", encoding="utf-8") as stream:
                 yaml.safe_dump(experiment, stream, sort_keys=False)
@@ -299,6 +329,8 @@ def _materialize_session(
         "worthy_r2_threshold": float(session_cfg.get("worthy_r2_threshold", 0.6)),
         "resources": plan["resources"],
         "total_experiments": plan["total_experiments"],
+        "max_records_per_experiment": plan["max_records_per_experiment"],
+        "max_experiments_per_endpoint": plan["max_experiments_per_endpoint"],
         "entries": manifest_entries,
     }
     _atomic_json(manifest_path, manifest)

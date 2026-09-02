@@ -210,7 +210,8 @@ def train_univariate_models(df, config, logger, input_features, target_features,
                 target_features,
                 n_steps,
                 m_steps,
-                split_ratio
+                split_ratio,
+                test_size=config.get('test_size'),
             )
             ulr_result['parameters'].update({
                 'model_type': 'Univariate Linear Regression',

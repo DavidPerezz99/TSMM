@@ -6,6 +6,8 @@ deadline_local: "05:00"
 worthy_r2_threshold: 0.6
 stop_entry_on_worthy_artifact: true
 minimum_start_window_minutes: 30
+max_records_per_experiment: 10000
+max_experiments_per_endpoint: 400
 
 # Zero continues until the deadline. The CLI can override this with
 # --max-experiments 1 (single experiment) or another manual batch size.
@@ -72,43 +74,43 @@ experiments:
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
     target_profile: OPEN
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_10m_high
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
     target_profile: HIGH
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_10m_low
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
     target_profile: LOW
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_10m_close
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml
     target_profile: CLOSE
-    max_experiments: 432
+    max_experiments: 400
 
   - name: xauusd_30m_open
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
     target_profile: OPEN
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_30m_high
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
     target_profile: HIGH
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_30m_low
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
     target_profile: LOW
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_30m_close
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml
     target_profile: CLOSE
-    max_experiments: 432
+    max_experiments: 400
 
   - name: xauusd_1h_open
     base_config: config_templates/univariate.yaml
@@ -135,43 +137,43 @@ experiments:
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
     target_profile: OPEN
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_3h_high
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
     target_profile: HIGH
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_3h_low
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
     target_profile: LOW
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_3h_close
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml
     target_profile: CLOSE
-    max_experiments: 432
+    max_experiments: 400
 
   - name: xauusd_7h_open
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
     target_profile: OPEN
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_7h_high
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
     target_profile: HIGH
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_7h_low
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
     target_profile: LOW
-    max_experiments: 432
+    max_experiments: 400
   - name: xauusd_7h_close
     base_config: config_templates/univariate.yaml
     sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml
     target_profile: CLOSE
-    max_experiments: 432
+    max_experiments: 400
 
   - name: xauusd_12h_open
     base_config: config_templates/univariate.yaml

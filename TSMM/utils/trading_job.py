@@ -41,6 +41,7 @@ from .operation_feedback_store import (
     log_state_transition_feedback,
 )
 from .runtime_scope import resolve_job_id_prefix, resolve_runtime_dir, resolve_runtime_file
+from .trading_signal_policy import evaluate_joint_ohlc_policy
 
 
 def _now_utc() -> datetime:
@@ -3023,6 +3024,137 @@ def _wait_fill_and_get_position(
     return {"filled": False, "position": None, "reason": f"Order not filled within {max_wait_sec}s"}
 
 
+def _try_programmed_market_fallback(
+    *,
+    adapter: MT5Adapter,
+    app_config: Dict[str, Any],
+    trading_cfg: Dict[str, Any],
+    state: Dict[str, Any],
+    order_ticket: int,
+) -> Dict[str, Any]:
+    """Convert an expiring programmed order only while the joint signal is valid."""
+    trading_job_cfg = dict(trading_cfg.get("trading_job") or {})
+    cfg = dict(trading_job_cfg.get("market_fallback") or {})
+    if not bool(cfg.get("enabled", False)):
+        return {"ok": False, "skipped": True, "reason": "market_fallback_disabled"}
+
+    request_context = dict(state.get("request_context") or {})
+    trigger = str(request_context.get("autonomous_trigger") or "").strip().lower()
+    allowed = {
+        str(value).strip().lower()
+        for value in (cfg.get("allowed_triggers") or ["mandatory_session"])
+        if str(value).strip()
+    }
+    if trigger not in allowed:
+        return {"ok": False, "skipped": True, "reason": f"trigger_not_allowed:{trigger or 'manual'}"}
+
+    plan = dict(state.get("plan") or {})
+    side = str(plan.get("decision") or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        return {"ok": False, "skipped": True, "reason": "plan_side_not_directional"}
+
+    timeout = max(float(cfg.get("assessment_timeout_seconds", 5.0) or 5.0), 0.5)
+    assessment = _collect_all_model_assessment_signals(trading_cfg, timeout_sec=timeout)
+    current_price = _symbol_mid_price(
+        adapter,
+        str(((trading_cfg.get("execution") or {}).get("symbol") or app_config.get("symbol") or "XAUUSD")),
+    )
+    policy = evaluate_joint_ohlc_policy(assessment, trading_cfg, market_price=current_price)
+    minimum_score = abs(_safe_float(cfg.get("min_direction_score", 0.12), 0.12))
+    if str(policy.get("decision") or "hold") != side:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "market_fallback_signal_no_longer_matches",
+            "assessment": assessment,
+            "signal_policy": policy,
+        }
+    if abs(_safe_float(policy.get("score"), 0.0)) < minimum_score:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "market_fallback_signal_below_threshold",
+            "assessment": assessment,
+            "signal_policy": policy,
+        }
+    if current_price is None or current_price <= 0.0:
+        return {"ok": False, "skipped": True, "reason": "market_fallback_live_price_unavailable"}
+
+    cancel_result = adapter.cancel_pending_order(order_ticket)
+    if not bool(cancel_result.get("ok", False)) or bool(cancel_result.get("skipped", False)):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "pending_order_not_confirmed_cancelled",
+            "cancel_result": cancel_result,
+        }
+
+    old_entry = _safe_float(plan.get("entry"), current_price)
+    old_stop = plan.get("stop_loss")
+    old_take = plan.get("take_profit")
+    stop_distance = abs(old_entry - _safe_float(old_stop, old_entry))
+    target_distance = abs(_safe_float(old_take, old_entry) - old_entry)
+    fallback_plan = dict(plan)
+    fallback_plan["entry"] = float(current_price)
+    fallback_plan["order_submission_mode"] = "market"
+    fallback_plan["market_fallback"] = {
+        "enabled": True,
+        "source_order_ticket": int(order_ticket),
+        "signal_policy": policy,
+        "assessment_scope": assessment.get("assessment_scope"),
+    }
+    if side == "buy":
+        fallback_plan["stop_loss"] = current_price - stop_distance if old_stop is not None else None
+        fallback_plan["take_profit"] = current_price + target_distance
+    else:
+        fallback_plan["stop_loss"] = current_price + stop_distance if old_stop is not None else None
+        fallback_plan["take_profit"] = current_price - target_distance
+
+    symbol = str(((trading_cfg.get("execution") or {}).get("symbol") or app_config.get("symbol") or "XAUUSD"))
+    stop_loss, take_profit, risk_meta = _order_risk_levels_for_plan(fallback_plan, trading_cfg)
+    volume = _order_volume_for_plan(fallback_plan, trading_cfg)
+    guard = _prop_firm_guard_preflight(
+        adapter=adapter,
+        trading_cfg=trading_cfg,
+        symbol=symbol,
+        side=side,
+        volume=volume,
+        entry=float(current_price),
+        stop_loss=stop_loss,
+    )
+    if not bool(guard.get("ok", False)):
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": f"market_fallback_risk_guard_blocked:{guard.get('reason', 'unknown')}",
+            "cancel_result": cancel_result,
+            "guard": guard,
+            "signal_policy": policy,
+        }
+
+    effective_volume = _safe_float(guard.get("sized_volume"), volume)
+    fallback_plan["volume"] = effective_volume
+    order_result = adapter.place_market_order(
+        symbol=symbol,
+        side=side,
+        volume=effective_volume,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+    return {
+        "ok": bool(order_result.get("ok", False)),
+        "skipped": False,
+        "reason": "market_fallback_submitted" if order_result.get("ok") else "market_fallback_order_failed",
+        "cancel_result": cancel_result,
+        "guard": guard,
+        "risk": risk_meta,
+        "signal_policy": policy,
+        "assessment": assessment,
+        "plan": fallback_plan,
+        "order": order_result,
+    }
+
+
 def _finalize_agent_a_order_submission(
     adapter: MT5Adapter,
     app_config: Dict[str, Any],
@@ -3130,17 +3262,69 @@ def _finalize_agent_a_order_submission(
         _save_job_state(output_dir, trading_cfg, state_file, state)
 
     order_ticket = int(normalized_order_res.get("order_ticket", 0) or 0)
+    fallback_wait_cfg = dict(((trading_cfg.get("trading_job") or {}).get("market_fallback") or {}))
+    effective_wait_minutes = max_wait_fill_minutes
+    if bool(fallback_wait_cfg.get("enabled", False)):
+        effective_wait_minutes = max(
+            max_wait_fill_minutes - max(int(fallback_wait_cfg.get("minutes_before_expiry", 15) or 15), 0),
+            1,
+        )
     filled = _wait_fill_and_get_position(
         adapter=adapter,
         order_ticket=order_ticket,
         side=decision,
-        max_wait_sec=max_wait_fill_minutes * 60,
+        max_wait_sec=effective_wait_minutes * 60,
         poll_sec=wait_fill_sec,
     )
 
     if not filled.get("filled"):
-        cancel_res = adapter.cancel_pending_order(order_ticket) if order_ticket else {"ok": False, "skipped": True, "reason": "missing_order_ticket"}
+        fallback = _try_programmed_market_fallback(
+            adapter=adapter,
+            app_config=app_config,
+            trading_cfg=trading_cfg,
+            state=state,
+            order_ticket=order_ticket,
+        ) if order_ticket else {"ok": False, "skipped": True, "reason": "missing_order_ticket"}
+        state["market_fallback"] = fallback
+        if bool(fallback.get("ok", False)):
+            state["plan"] = dict(fallback.get("plan") or plan)
+            state["order_submission_mode"] = "market_fallback"
+            state.pop("programmed_order_expiration_utc", None)
+            state.setdefault("notifications", []).append(
+                _notify(
+                    output_dir=output_dir,
+                    trading_cfg=trading_cfg,
+                    channel="agent_a",
+                    kind="market_fallback_submitted",
+                    message=(
+                        "The programmed entry was still supported near expiry, so TSMM cancelled it and "
+                        "submitted a guarded market entry after rechecking the joint OHLC signal."
+                    ),
+                    requires_approval=False,
+                    emergency=False,
+                    approval_deadline_utc=None,
+                    metadata={"signal_json_path": signal_json_path, "market_fallback": fallback},
+                    force_telegram=True,
+                    job_id=resolved_job_id,
+                )
+            )
+            _save_job_state(output_dir, trading_cfg, state_file, state)
+            return _finalize_agent_a_market_order_submission(
+                adapter=adapter,
+                app_config=app_config,
+                trading_cfg=trading_cfg,
+                output_dir=output_dir,
+                logger=logger,
+                state=state,
+                state_file=state_file,
+                order_res=dict(fallback.get("order") or {}),
+            )
+
+        cancel_res = dict(fallback.get("cancel_result") or {})
+        if not cancel_res:
+            cancel_res = adapter.cancel_pending_order(order_ticket) if order_ticket else {"ok": False, "skipped": True, "reason": "missing_order_ticket"}
         filled["cancel_result"] = cancel_res
+        filled["market_fallback"] = fallback
         state.setdefault("notifications", []).append(
             _notify(
                 output_dir=output_dir,
@@ -3705,12 +3889,32 @@ def _agent_b_risk_adjustment(
     sl_pct = float(risk_cfg.get("stop_loss_pct", 0.8) or 0.8) / 100.0
     tp_pct = float(risk_cfg.get("take_profit_pct", 1.6) or 1.6) / 100.0
     min_delta = float(mb_cfg.get("min_sltp_adjust_abs", 0.05) or 0.05)
-    trail_gap = max(entry * (float(trailing_cfg.get("trail_pct_base", 0.5) or 0.5) / 100.0), min_delta)
+    trailing_enabled = bool(trailing_cfg.get("enabled", True))
+    trail_gap_candidates = [
+        entry * (float(trailing_cfg.get("trail_pct_base", 0.5) or 0.5) / 100.0),
+        min_delta,
+    ]
+    volatility_meta = dict(base_plan.get("volatility_protection") or {})
+    atr = _safe_float(volatility_meta.get("atr"), 0.0)
+    if atr > 0.0:
+        trail_gap_candidates.append(
+            atr * max(_safe_float(trailing_cfg.get("trail_atr_multiplier", 1.0), 1.0), 0.1)
+        )
+    trail_gap = max(trail_gap_candidates)
     base_sl_distance = abs(entry - base_sl) if base_sl is not None else entry * sl_pct
     base_tp_distance = abs(base_tp - entry) if base_tp is not None else entry * tp_pct
     breakeven_activation_ratio = float(trailing_cfg.get("breakeven_activation_ratio", 0.75) or 0.75)
     breakeven_activation_move = max(base_sl_distance * breakeven_activation_ratio, trail_gap)
     favorable_move = current_price - entry if side == "buy" else entry - current_price
+    execution_cfg = dict(trading_cfg.get("execution") or {})
+    round_trip_bps = 2.0 * (
+        _safe_float(execution_cfg.get("spread_bps"), 0.0)
+        + _safe_float(execution_cfg.get("slippage_bps"), 0.0)
+    )
+    cost_buffer = (
+        entry * round_trip_bps / 10000.0
+        * max(_safe_float(trailing_cfg.get("breakeven_cost_buffer_multiple", 1.0), 1.0), 0.0)
+    )
 
     recommendation = str(current_plan.get("recommendation") or "").lower()
     risk_recommendation = recommendation
@@ -3781,7 +3985,7 @@ def _agent_b_risk_adjustment(
 
     if risk_recommendation in {"monitor_closely", "prepare_defensive_exit"}:
         if favorable_move >= breakeven_activation_move:
-            breakeven_sl = entry
+            breakeven_sl = entry + cost_buffer if side == "buy" else entry - cost_buffer
             if side == "buy":
                 candidate_sl = max(desired_sl if desired_sl is not None else breakeven_sl, breakeven_sl)
                 if current_sl is None or candidate_sl - current_sl >= min_delta:
@@ -3794,7 +3998,7 @@ def _agent_b_risk_adjustment(
                     desired_sl = candidate_sl
                     actions.append("tighten_stop_loss")
                     reasons.append("moved stop loss to break-even after a meaningful favorable move while supervision turned defensive")
-    elif risk_recommendation == "maintain_position":
+    elif risk_recommendation == "maintain_position" and trailing_enabled:
         if side == "buy":
             candidate_floor = entry if favorable_move >= breakeven_activation_move else (desired_sl if desired_sl is not None else base_sl if base_sl is not None else entry - base_sl_distance)
             candidate_sl = max(desired_sl if desired_sl is not None else candidate_floor, candidate_floor, current_price - trail_gap)
@@ -3810,7 +4014,20 @@ def _agent_b_risk_adjustment(
                 actions.append("trail_stop_loss")
                 reasons.append("locked in profit under aligned bearish supervision")
 
-        if bool(trailing_cfg.get("enabled", True)) and consensus_score >= max(close_threshold, 0.4):
+        current_confidence = _safe_float(
+            current_plan.get(
+                "success_probability",
+                current_plan.get("average_confidence", consensus_score),
+            ),
+            0.0,
+        )
+        minimum_extension_confidence = _safe_float(
+            trailing_cfg.get("min_confidence_to_extend", 0.0), 0.0
+        )
+        if (
+            consensus_score >= max(close_threshold, 0.4)
+            and current_confidence >= minimum_extension_confidence
+        ):
             extension_distance = max(base_tp_distance * 0.5, trail_gap)
             if side == "buy":
                 candidate_tp = max(desired_tp if desired_tp is not None else current_price, current_price + extension_distance)
@@ -3856,6 +4073,8 @@ def _agent_b_risk_adjustment(
         "rationale": "; ".join(reasons),
         "favorable_move": round(float(favorable_move), 6),
         "breakeven_activation_move": round(float(breakeven_activation_move), 6),
+        "estimated_round_trip_cost_buffer": round(float(cost_buffer), 6),
+        "trail_gap": round(float(trail_gap), 6),
         "previous_stop_loss": current_sl,
         "previous_take_profit": current_tp,
     }
@@ -5235,6 +5454,17 @@ def start_trading_job(
     fallback_cfg = (trading_cfg.get("agent_a_fallback") or {})
     fallback_max_attempts = max(int(fallback_cfg.get("max_attempts", 24) or 24), 1)
     fallback_log = []
+    signal_policy_enabled = bool((trading_cfg.get("signal_policy") or {}).get("enabled", False))
+    if signal_policy_enabled and not bool(fallback_cfg.get("allow_signal_policy_bypass", False)):
+        # A single endpoint must not resurrect a trade rejected by the joint
+        # quality, range, probability, and cost gates.
+        fallback_attempts = []
+        fallback_log.append(
+            {
+                "skipped": True,
+                "reason": "joint_signal_policy_rejection_is_authoritative",
+            }
+        )
     initial_decision = str(plan.get("decision", "hold")).lower()
     if initial_decision not in {"buy", "sell"} and fallback_attempts:
         endpoints_cfg = dict(trading_cfg.get("model_endpoints") or {})

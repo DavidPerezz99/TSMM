@@ -1,5 +1,9 @@
 # TSMM Trading Analysis Enhancements Handoff
 
+For the 2026-09-02 R2 evaluation correction, bounded 28-endpoint recalibration
+campaign, initial controlled scores, and the decision not to mix stale US500
+rows into XAUUSD, see `docs/MODEL_RELIABILITY_AND_RECALIBRATION.md`.
+
 ## Scope
 
 This document describes the work performed on branch
@@ -446,6 +450,26 @@ broker, and delayed stop protection remains disabled.
    broker stop independently of Agent B's main process.
 6. Run delayed protection only in paper/demo mode, then compare expectancy,
    tail loss, drawdown, and stop-out recovery against the standard policy.
+
+## Joint OHLC Entry Upgrade (2026-08-30)
+
+The live Agent A path and model-backed replay now share an optional
+`signal_policy` configured in all three tracked trading profiles. It replaces
+the former single-HIGH entry side with a weighted 7h OPEN/HIGH/LOW/CLOSE vote,
+requires two of 10m/30m/1h to confirm timing, uses the predicted HIGH/LOW range
+for programmed entry placement, and derives bounded SL/TP distances from 10m
+ATR and realized volatility.
+
+Programmed-order market fallback is restricted to configured triggers. Before
+conversion it reassesses the joint policy, requires the same side and minimum
+score, confirms pending-order cancellation, and re-runs the normal account and
+prop-firm guard. No service was restarted and no broker position or order was
+modified while this code was implemented.
+
+Historical reports now include MAE/MFE timing and aggregate path diagnostics.
+`--require-point-in-time-models` rejects an evaluation unless every package has
+an explicit training cutoff before the period; artifact modification time is no
+longer accepted as training lineage. See `docs/TRADING_SIGNAL_POLICY.md`.
 
 The detailed logic assessment and research notes are in
 `reports/analysis/trading_logic_state_upgrade_plan_20260710.md` on this

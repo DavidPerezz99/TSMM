@@ -229,6 +229,40 @@ class AgentBRiskManagementTests(unittest.TestCase):
         self.assertGreater(out["stop_loss"], 100.0)
         self.assertGreater(out["take_profit"], 102.0)
 
+    def test_disabled_trailing_does_not_modify_aligned_position(self):
+        state = {
+            "plan": {
+                "decision": "buy",
+                "entry": 100.0,
+                "stop_loss": 99.0,
+                "take_profit": 102.0,
+            }
+        }
+        position = {
+            "price_open": 100.0,
+            "price_current": 101.5,
+            "sl": 99.0,
+            "tp": 102.0,
+        }
+        current_plan = {
+            "position_side": "buy",
+            "recommendation": "maintain_position",
+            "consensus_score": 0.8,
+            "close_threshold": 0.25,
+        }
+        trading_cfg = {
+            "mode_b": {"manage_existing_positions": True},
+            "risk": {
+                "stop_loss_pct": 1.0,
+                "take_profit_pct": 2.0,
+                "trailing": {"enabled": False, "trail_pct_base": 0.5},
+            },
+        }
+
+        self.assertIsNone(
+            _agent_b_risk_adjustment(state, position, current_plan, trading_cfg)
+        )
+
     def test_request_extension_position_still_trails_stop_when_consensus_aligned(self):
         state = {
             "plan": {

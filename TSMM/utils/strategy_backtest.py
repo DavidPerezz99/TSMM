@@ -33,6 +33,14 @@ import yaml
 
 from utils.investing_agent import _discover_agent_a_enrichment_candidates
 from utils.market_db import master_table_name
+from utils.model_deployment import deployment_model_spec
+from utils.trading_quality import apply_hybrid_trade_gate, model_quality_weight
+from utils.trading_signal_policy import (
+    all_training_cutoffs_precede,
+    apply_volatility_protection,
+    evaluate_joint_ohlc_policy,
+    signal_policy_config,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -544,6 +552,107 @@ class FrozenModelSignalProvider:
         return rows
 
 
+class WalkForwardModelSignalProvider:
+    """Select the newest endpoint package whose training cutoff is before each tick."""
+
+    def __init__(self, version_specs: List[Dict[str, Any]], model_dir: Optional[Path] = None):
+        self.model_dir = model_dir
+        self.versions: Dict[str, List[Dict[str, Any]]] = {}
+        self._loaders: Dict[str, FrozenModelSignalProvider] = {}
+        for raw in version_specs:
+            spec = dict(raw)
+            cutoff = spec.get("training_data_last_index")
+            if not cutoff:
+                continue
+            try:
+                cutoff_ts = pd.Timestamp(cutoff)
+                if cutoff_ts.tzinfo is not None:
+                    cutoff_ts = cutoff_ts.tz_convert("UTC").tz_localize(None)
+            except Exception:
+                continue
+            spec["_training_cutoff"] = cutoff_ts
+            key = FrozenModelSignalProvider.key(spec)
+            self.versions.setdefault(key, []).append(spec)
+        for values in self.versions.values():
+            values.sort(key=lambda item: pd.Timestamp(item["_training_cutoff"]))
+        self.base_specs = [dict(values[0]) for _, values in sorted(self.versions.items()) if values]
+
+    def spec_for(self, base_spec: Dict[str, Any], as_of: pd.Timestamp) -> Dict[str, Any]:
+        key = FrozenModelSignalProvider.key(base_spec)
+        timestamp = pd.Timestamp(as_of)
+        eligible = [spec for spec in self.versions.get(key, []) if pd.Timestamp(spec["_training_cutoff"]) < timestamp]
+        if not eligible:
+            unavailable = dict(base_spec)
+            unavailable["_walk_forward_unavailable"] = True
+            return unavailable
+        return dict(eligible[-1])
+
+    @staticmethod
+    def _identity(spec: Dict[str, Any]) -> str:
+        return str(spec.get("deployment_id") or spec.get("model_path") or spec.get("config_path") or "")
+
+    def predict(self, spec: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if bool(spec.get("_walk_forward_unavailable", False)):
+            raise RuntimeError("no_walk_forward_model_with_pre_tick_training_cutoff")
+        identity = self._identity(spec)
+        if identity not in self._loaders:
+            self._loaders[identity] = FrozenModelSignalProvider([spec], model_dir=self.model_dir)
+        return self._loaders[identity].predict(spec, rows)
+
+    def point_in_time_safe(self, period_start: pd.Timestamp) -> bool:
+        start = pd.Timestamp(period_start)
+        return bool(self.versions) and all(
+            any(pd.Timestamp(spec["_training_cutoff"]) < start for spec in values)
+            for values in self.versions.values()
+        )
+
+    def manifest(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for key, values in sorted(self.versions.items()):
+            for spec in values:
+                rows.append(
+                    {
+                        "key": key,
+                        "family": spec.get("family"),
+                        "timeframe": spec.get("timeframe"),
+                        "model": spec.get("model"),
+                        "config_path": spec.get("config_path"),
+                        "model_path": spec.get("model_path"),
+                        "artifacts_path": spec.get("artifacts_path"),
+                        "deployment_id": spec.get("deployment_id"),
+                        "training_data_first_index": spec.get("training_data_first_index"),
+                        "training_data_last_index": spec.get("training_data_last_index"),
+                        "walk_forward_version": True,
+                    }
+                )
+        return rows
+
+
+def discover_walk_forward_model_specs(
+    trading_cfg: Dict[str, Any],
+    deployment_root: Path,
+) -> List[Dict[str, Any]]:
+    """Load immutable installed package records for configured OHLC endpoints."""
+    required = {
+        (str(spec.get("timeframe") or ""), str(spec.get("family") or "").lower())
+        for spec in discover_replay_model_specs(trading_cfg)
+    }
+    versions: List[Dict[str, Any]] = []
+    root = Path(deployment_root).resolve()
+    if not root.is_dir():
+        return versions
+    for record_path in sorted(root.glob("*/*/deployment.json")):
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            spec = deployment_model_spec(record)
+        except Exception:
+            continue
+        key = (str(spec.get("timeframe") or ""), str(spec.get("family") or "").lower())
+        if key in required and spec.get("training_data_last_index"):
+            versions.append(spec)
+    return versions
+
+
 class ReplaySignalEngine:
     def __init__(
         self,
@@ -569,6 +678,8 @@ class ReplaySignalEngine:
         by_family_frame: Dict[tuple[str, str], pd.DataFrame] = {}
         prepared: List[tuple[Dict[str, Any], str, str, str, List[Dict[str, Any]]]] = []
         for spec in self.specs:
+            if hasattr(self.provider, "spec_for"):
+                spec = self.provider.spec_for(spec, as_of)
             timeframe = str(spec.get("timeframe") or "")
             family = str(spec.get("family") or "").lower()
             key = f"{family}:{timeframe}"
@@ -619,6 +730,10 @@ class ReplaySignalEngine:
 
         weighted = 0.0
         total_weight = 0.0
+        qualified_count = 0
+        quality_cfg = dict(self.trading_cfg.get("model_quality") or {})
+        minimum_r2 = float(quality_cfg.get("minimum_r2_for_vote", 0.0) or 0.0)
+        legacy_static_discount = float(quality_cfg.get("legacy_static_score_discount", 0.35) or 0.0)
         for spec, key, family, timeframe, prediction, prediction_error in self._executor.map(_predict, prepared):
             if prediction_error:
                 signals[key] = {
@@ -635,7 +750,14 @@ class ReplaySignalEngine:
                 raw_signal = int(prediction.get("raw_signal", 0) or 0)
                 signal = -raw_signal if self.interpretation in {"contrarian", "mean_reversion", "mean-reversion", "fade"} else raw_signal
                 confidence = float(prediction.get("confidence", 0.5) or 0.5)
-                vote_weight = max(confidence, 0.01) * float(TIMEFRAME_WEIGHTS.get(timeframe, 1.0))
+                quality = model_quality_weight(
+                    spec.get("r2"), spec.get("refreshed_r2"), minimum_r2, legacy_static_discount
+                )
+                vote_weight = (
+                    max(confidence, 0.01)
+                    * float(TIMEFRAME_WEIGHTS.get(timeframe, 1.0))
+                    * float(quality.get("weight", 0.0) or 0.0)
+                )
                 signals[key] = {
                     "family": family,
                     "timeframe": timeframe,
@@ -645,13 +767,28 @@ class ReplaySignalEngine:
                     "raw_signal": raw_signal,
                     "confidence": confidence,
                     "vote_weight": vote_weight,
+                    "quality": quality,
                     "forecast_sign": prediction.get("forecast_sign"),
+                    "reference_price": (
+                        float(by_family_frame[(timeframe, family)].iloc[-1][str(spec.get("target_col") or family).upper()])
+                        if not by_family_frame[(timeframe, family)].empty
+                        else None
+                    ),
+                    "forecast_price": (
+                        float(by_family_frame[(timeframe, family)].iloc[-1][str(spec.get("target_col") or family).upper()])
+                        + float(prediction.get("forecast_sign", 0.0) or 0.0)
+                        if not by_family_frame[(timeframe, family)].empty
+                        else None
+                    ),
                     "feature_horizons": prediction.get("feature_horizons") or {},
                     "input_window_start": prediction.get("input_window_start"),
                     "input_window_end": prediction.get("input_window_end"),
                 }
-                weighted += vote_weight * signal
-                total_weight += vote_weight
+                if bool(quality.get("qualified", False)):
+                    if signal != 0:
+                        qualified_count += 1
+                    weighted += vote_weight * signal
+                    total_weight += vote_weight
             except Exception as exc:
                 signals[key] = {
                     "family": family,
@@ -673,6 +810,7 @@ class ReplaySignalEngine:
             "avg_confidence": float(np.mean([float(value.get("confidence", 0.5)) for value in usable])) if usable else 0.0,
             "n_signals": len(signals),
             "n_usable": len(usable),
+            "n_qualified_signals": qualified_count,
             "coverage": float(len(usable) / max(len(signals), 1)),
             "signals": signals,
         }
@@ -705,19 +843,37 @@ def _build_plan(
     trading_cfg: Dict[str, Any],
     account_equity: float,
     contract_size: float,
+    volatility_frame: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     signals = bundle.get("signals") or {}
     primary = dict(signals.get(primary_key) or {})
-    if primary.get("error") or int(primary.get("signal", 0) or 0) == 0:
-        return {"decision": "hold", "reason": f"primary_signal_unavailable:{primary_key}", "entry": float(entry)}
     if float(bundle.get("coverage", 0.0) or 0.0) < 0.70:
         return {"decision": "hold", "reason": "model_coverage_below_70pct", "entry": float(entry)}
 
-    decision = "buy" if int(primary.get("signal", 0)) > 0 else "sell"
+    policy = evaluate_joint_ohlc_policy(bundle, trading_cfg, market_price=entry)
+    if bool(policy.get("enabled", False)):
+        if str(policy.get("decision")) not in {"buy", "sell"}:
+            return {
+                "decision": "hold",
+                "reason": str(policy.get("reason") or "signal_policy_blocked"),
+                "entry": float(entry),
+                "signal_policy": policy,
+            }
+        decision = str(policy["decision"])
+        if policy.get("entry") is not None:
+            entry = float(policy["entry"])
+        primary = {
+            "confidence": policy.get("confidence", bundle.get("avg_confidence", 0.5)),
+            "signal": 1 if decision == "buy" else -1,
+        }
+    else:
+        if primary.get("error") or int(primary.get("signal", 0) or 0) == 0:
+            return {"decision": "hold", "reason": f"primary_signal_unavailable:{primary_key}", "entry": float(entry)}
+        decision = "buy" if int(primary.get("signal", 0)) > 0 else "sell"
     consensus = str(bundle.get("consensus") or "hold")
     consensus_score = float(bundle.get("consensus_score", 0.0) or 0.0)
     alignment = "aligned" if consensus == decision else ("opposed" if consensus in {"buy", "sell"} else "neutral")
-    if alignment == "opposed" and abs(consensus_score) >= 0.2:
+    if not bool(policy.get("enabled", False)) and alignment == "opposed" and abs(consensus_score) >= 0.2:
         decision = consensus
         alignment = "overridden"
 
@@ -750,17 +906,20 @@ def _build_plan(
     breadth = max(0.0, min(0.10, int(bundle.get("n_usable", 0) or 0) / 240.0))
     conviction = min(1.0, signal_factor + enrich_factor + breadth)
 
-    thresholds = [
-        ("standard", float(conviction_cfg.get("min_conviction_for_no_sl", 0.80) or 0.80), 1.0, 1.0, 1.0),
-        ("standard", float(conviction_cfg.get("min_conviction_for_wide", 0.65) or 0.65), 1.0, 1.0, 0.75),
-        ("standard", float(conviction_cfg.get("min_conviction_for_standard", 0.45) or 0.45), 1.0, 1.0, 0.5),
-        ("tight", float(conviction_cfg.get("min_conviction_for_tight", 0.30) or 0.30), 1.0, 1.0, 0.25),
-    ]
-    risk_mode, sl_multiplier, tp_multiplier, volume_multiplier = "skip", 0.0, 0.0, 0.0
-    for candidate, threshold, sl_mult, tp_mult, vol_mult in thresholds:
-        if conviction >= threshold:
-            risk_mode, sl_multiplier, tp_multiplier, volume_multiplier = candidate, sl_mult, tp_mult, vol_mult
-            break
+    if not bool(conviction_cfg.get("enabled", True)):
+        risk_mode, sl_multiplier, tp_multiplier, volume_multiplier = "standard", 1.0, 1.0, 1.0
+    else:
+        thresholds = [
+            ("standard", float(conviction_cfg.get("min_conviction_for_no_sl", 0.80) or 0.80), 1.0, 1.0, 1.0),
+            ("standard", float(conviction_cfg.get("min_conviction_for_wide", 0.65) or 0.65), 1.0, 1.0, 0.75),
+            ("standard", float(conviction_cfg.get("min_conviction_for_standard", 0.45) or 0.45), 1.0, 1.0, 0.5),
+            ("tight", float(conviction_cfg.get("min_conviction_for_tight", 0.30) or 0.30), 1.0, 1.0, 0.25),
+        ]
+        risk_mode, sl_multiplier, tp_multiplier, volume_multiplier = "skip", 0.0, 0.0, 0.0
+        for candidate, threshold, sl_mult, tp_mult, vol_mult in thresholds:
+            if conviction >= threshold:
+                risk_mode, sl_multiplier, tp_multiplier, volume_multiplier = candidate, sl_mult, tp_mult, vol_mult
+                break
     if risk_mode == "skip":
         return {
             "decision": "hold",
@@ -777,6 +936,18 @@ def _build_plan(
     else:
         stop_loss = entry * (1.0 + sl_pct * sl_multiplier)
         take_profit = entry * (1.0 - tp_pct * tp_multiplier)
+    volatility_plan = apply_volatility_protection(
+        {
+            "decision": decision,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        },
+        trading_cfg,
+        volatility_frame,
+    )
+    stop_loss = float(volatility_plan.get("stop_loss", stop_loss))
+    take_profit = float(volatility_plan.get("take_profit", take_profit))
     base_volume = float(((trading_cfg.get("execution") or {}).get("default_volume", 0.01)) or 0.01)
     requested_volume = max(round(base_volume * volume_multiplier, 6), 0.0)
     sizing_cfg = dict(risk.get("account_sizing") or {})
@@ -796,7 +967,7 @@ def _build_plan(
             }
     else:
         volume = requested_volume
-    return {
+    final_plan = {
         "decision": decision,
         "entry": float(entry),
         "stop_loss": float(stop_loss) if stop_loss is not None else None,
@@ -810,7 +981,18 @@ def _build_plan(
         "risk_mode": risk_mode,
         "primary_key": primary_key,
         "account_equity": float(account_equity),
+        "signal_policy": policy,
+        "volatility_protection": volatility_plan.get("volatility_protection"),
+        "enrichment": {
+            **dict(bundle or {}),
+            "n_qualified_signals": int(bundle.get("n_qualified_signals", 0) or 0),
+        },
     }
+    empirical_neutral = 0.5
+    final_plan["success_probability"] = float(
+        np.clip(0.4 * confidence + 0.3 * cm_proxy + 0.3 * empirical_neutral, 0.01, 0.99)
+    )
+    return apply_hybrid_trade_gate(final_plan, trading_cfg)
 
 
 def _adverse_fill(price: float, side: str, entry: bool, cost_rate: float) -> float:
@@ -860,6 +1042,7 @@ def _max_drawdown_pct(equity_points: List[Dict[str, Any]]) -> float:
 def _report_markdown(summary: Dict[str, Any]) -> str:
     overall = summary.get("overall") or {}
     validity = summary.get("validity") or {}
+    diagnostics = summary.get("path_diagnostics") or {}
     lines = [
         "# TSMM Trading Strategy Evaluation",
         "",
@@ -916,9 +1099,29 @@ def _report_markdown(summary: Dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## Entry-path diagnostics",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| Average MAE, all trades | {float(diagnostics.get('average_mae_all', 0.0)):.2f} |",
+            f"| Average MFE, all trades | {float(diagnostics.get('average_mfe_all', 0.0)):.2f} |",
+            f"| Average MAE, winners | {float(diagnostics.get('average_mae_winners', 0.0)):.2f} |",
+            f"| Average MFE, winners | {float(diagnostics.get('average_mfe_winners', 0.0)):.2f} |",
+            f"| Average MAE, losers | {float(diagnostics.get('average_mae_losers', 0.0)):.2f} |",
+            f"| Average MFE, losers | {float(diagnostics.get('average_mfe_losers', 0.0)):.2f} |",
+            f"| Average MFE captured | {100.0 * float(diagnostics.get('average_mfe_capture_ratio', 0.0)):.2f}% |",
+            f"| Trades with MAE before MFE | {int(diagnostics.get('trades_with_mae_before_mfe', 0))} |",
+            f"| Losing trades with negligible MFE | {int(diagnostics.get('losers_with_negligible_mfe', 0))} |",
+        ]
+    )
+    lines.extend(
+        [
+            "",
             "## Execution assumptions",
             "",
-            "- Latest model artifacts are frozen for the entire replay.",
+            "- Model artifacts are frozen for the entire replay; strict mode requires explicit pre-period training cutoffs.",
+            "- Direction comes from the configured joint OHLC family vote and shorter-timeframe confirmations when signal_policy is enabled.",
+            "- HIGH and LOW forecasts define the programmed entry range; ATR and realized volatility define bounded SL/TP distances.",
             "- Agent B forecasts and pending-order maintenance run at the configured poll interval.",
             "- Programmed entries fill when a later one-minute candle crosses the requested price.",
             "- Spread and slippage are charged adversely on entry and exit.",
@@ -976,6 +1179,7 @@ def run_historical_strategy_backtest(
     provider: Any = None,
     market_frame: Optional[pd.DataFrame] = None,
     max_ticks: Optional[int] = None,
+    require_point_in_time_models: bool = False,
 ) -> Dict[str, Any]:
     """Run accelerated TSMM strategy replay and write audit-friendly reports."""
     autonomy = trading_cfg.get("autonomous_trading") or {}
@@ -996,11 +1200,34 @@ def run_historical_strategy_backtest(
     if period_minutes.empty:
         return {"ok": False, "error": f"No market rows in requested period {start} through {end}"}
 
-    timeframes = sorted(set(str(spec.get("timeframe") or "") for spec in replay_specs))
+    policy_cfg = signal_policy_config(trading_cfg)
+    volatility_timeframe = str((policy_cfg.get("volatility") or {}).get("timeframe") or "10m")
+    timeframes = sorted(set([str(spec.get("timeframe") or "") for spec in replay_specs] + [volatility_timeframe]))
     tape = AsOfMarketTape(minutes, timeframes)
     signal_provider = provider or FrozenModelSignalProvider(replay_specs)
     engine = ReplaySignalEngine(tape, replay_specs, signal_provider, trading_cfg)
     provider_manifest = signal_provider.manifest() if hasattr(signal_provider, "manifest") else []
+    explicit_point_in_time_safe = (
+        bool(signal_provider.point_in_time_safe(start))
+        if hasattr(signal_provider, "point_in_time_safe")
+        else all_training_cutoffs_precede(provider_manifest, start)
+    )
+    model_policy = (
+        "walk_forward_latest_pre_tick_training_cutoff"
+        if isinstance(signal_provider, WalkForwardModelSignalProvider)
+        else "latest_current_artifacts_frozen_for_replay"
+    )
+    if require_point_in_time_models and not explicit_point_in_time_safe:
+        engine.close()
+        return {
+            "ok": False,
+            "error": (
+                "Strict point-in-time evaluation requires every model package to declare a "
+                "training_data_last_index earlier than the requested period."
+            ),
+            "period_start_utc": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "model_manifest": provider_manifest,
+        }
 
     configured_poll = max(int(((trading_cfg.get("mode_b") or {}).get("poll_seconds", 300) or 300) / 60), 1)
     tick_minutes = max(int(poll_minutes or configured_poll), 1)
@@ -1011,6 +1238,15 @@ def run_historical_strategy_backtest(
     cost_rate = (float(execution.get("spread_bps", 2.0) or 2.0) + float(execution.get("slippage_bps", 2.0) or 2.0)) / 10000.0
     commission = float(execution.get("commission_per_trade", 0.0) or 0.0)
     expiration_minutes = int(trading_job.get("programmed_order_expiration_minutes", 420) or 420)
+    fallback_cfg = dict(trading_job.get("market_fallback") or {})
+    fallback_enabled = bool(fallback_cfg.get("enabled", False))
+    fallback_lead_minutes = max(int(fallback_cfg.get("minutes_before_expiry", 15) or 15), 0)
+    fallback_min_score = abs(float(fallback_cfg.get("min_direction_score", 0.12) or 0.12))
+    fallback_allowed_triggers = {
+        str(value).strip().lower()
+        for value in (fallback_cfg.get("allowed_triggers") or ["mandatory_session"])
+        if str(value).strip()
+    }
     max_positions = int(risk.get("max_open_positions", 5) or 5)
     daily_loss_limit = float(risk.get("daily_max_loss_pct", 2.0) or 2.0)
     weekly_loss_limit = float(risk.get("weekly_max_loss_pct", 5.0) or 5.0)
@@ -1088,6 +1324,14 @@ def run_historical_strategy_backtest(
             "duration_minutes": int((pd.Timestamp(timestamp) - pd.Timestamp(position["_entry_ts"])).total_seconds() / 60),
             "mae_abs": float(position.get("_mae_abs", 0.0)),
             "mfe_abs": float(position.get("_mfe_abs", 0.0)),
+            "time_to_mae_minutes": (
+                int((pd.Timestamp(position["_mae_ts"]) - pd.Timestamp(position["_entry_ts"])).total_seconds() / 60)
+                if position.get("_mae_ts") is not None else None
+            ),
+            "time_to_mfe_minutes": (
+                int((pd.Timestamp(position["_mfe_ts"]) - pd.Timestamp(position["_entry_ts"])).total_seconds() / 60)
+                if position.get("_mfe_ts") is not None else None
+            ),
             "balance_after": float(balance),
         }
         operations.append(operation)
@@ -1128,8 +1372,57 @@ def run_historical_strategy_backtest(
             "_deadline": pd.Timestamp(order["deadline"]),
             "_mae_abs": 0.0,
             "_mfe_abs": 0.0,
+            "_mae_ts": None,
+            "_mfe_ts": None,
         }
         positions.append(position)
+
+    def try_market_fallback(
+        order: Dict[str, Any],
+        timestamp: pd.Timestamp,
+        close_price: float,
+        bundle: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not fallback_enabled or not bundle or len(positions) >= max_positions:
+            return False
+        if str(order.get("trigger") or "").strip().lower() not in fallback_allowed_triggers:
+            return False
+        policy = evaluate_joint_ohlc_policy(bundle, trading_cfg, market_price=close_price)
+        side = str(order.get("side") or "")
+        if str(policy.get("decision")) != side or abs(float(policy.get("score", 0.0) or 0.0)) < fallback_min_score:
+            return False
+
+        fallback_order = dict(order)
+        old_entry = float(order.get("planned_entry", close_price))
+        sl_distance = abs(old_entry - float(order.get("stop_loss") or old_entry))
+        tp_distance = abs(old_entry - float(order.get("take_profit") or old_entry))
+        fallback_order["submission_mode"] = "market_fallback"
+        fallback_order["trigger"] = "mandatory_market_fallback"
+        fallback_order["planned_entry"] = float(close_price)
+        fallback_order["signal_policy"] = policy
+        if side == "buy":
+            fallback_order["stop_loss"] = float(close_price - sl_distance) if order.get("stop_loss") is not None else None
+            fallback_order["take_profit"] = float(close_price + tp_distance)
+        else:
+            fallback_order["stop_loss"] = float(close_price + sl_distance) if order.get("stop_loss") is not None else None
+            fallback_order["take_profit"] = float(close_price - tp_distance)
+        attempts.append(
+            {
+                "timestamp_utc": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "date_local": local_label(timestamp),
+                "session_id": order.get("session_id"),
+                "session_name": order.get("session_name"),
+                "trigger": "market_fallback",
+                "submission_mode": "market",
+                "primary_key": "joint_ohlc",
+                "decision": side,
+                "reason": "programmed_entry_near_expiry_signal_still_valid",
+                "planned_entry": close_price,
+                "signal_policy": policy,
+            }
+        )
+        open_position(fallback_order, timestamp, close_price)
+        return True
 
     def create_entry(
         timestamp: pd.Timestamp,
@@ -1155,12 +1448,25 @@ def run_historical_strategy_backtest(
         elif drawdown >= max_drawdown_guard:
             blocked_reason = "max_drawdown_guard"
 
+        policy_cfg = signal_policy_config(trading_cfg)
         entry_anchor = float(close_price)
-        tf_label = primary_key.split(":", 1)[1]
-        tf_frame = tape.timeframe_as_of(tf_label, timestamp, max_rows=2)
-        if not tf_frame.empty:
-            entry_anchor = float(tf_frame.iloc[-1]["HIGH"])
-        plan = _build_plan(bundle, primary_key, entry_anchor, trading_cfg, balance, contract_size)
+        if not bool(policy_cfg.get("enabled", False)):
+            tf_label = primary_key.split(":", 1)[1]
+            tf_frame = tape.timeframe_as_of(tf_label, timestamp, max_rows=2)
+            if not tf_frame.empty:
+                entry_anchor = float(tf_frame.iloc[-1]["HIGH"])
+        volatility_cfg = dict(policy_cfg.get("volatility") or {})
+        volatility_timeframe = str(volatility_cfg.get("timeframe") or "10m")
+        volatility_frame = tape.timeframe_as_of(volatility_timeframe, timestamp, max_rows=80)
+        plan = _build_plan(
+            bundle,
+            primary_key,
+            entry_anchor,
+            trading_cfg,
+            balance,
+            contract_size,
+            volatility_frame=volatility_frame,
+        )
         if blocked_reason:
             plan = {**plan, "decision": "hold", "reason": blocked_reason}
         attempt = {
@@ -1180,6 +1486,8 @@ def run_historical_strategy_backtest(
             "conviction": plan.get("conviction"),
             "risk_mode": plan.get("risk_mode"),
             "model_coverage": bundle.get("coverage"),
+            "signal_policy": plan.get("signal_policy"),
+            "volatility_protection": plan.get("volatility_protection"),
         }
         attempts.append(attempt)
         session_state["launches"] += 1
@@ -1207,6 +1515,8 @@ def run_historical_strategy_backtest(
             "consensus_score": float(plan.get("consensus_score", 0.0)),
             "conviction": float(plan.get("conviction", 0.0)),
             "risk_mode": plan.get("risk_mode"),
+            "signal_policy": plan.get("signal_policy"),
+            "volatility_protection": plan.get("volatility_protection"),
             "deadline": timestamp + pd.Timedelta(hours=session_hours),
         }
         if submission_mode == "market":
@@ -1250,6 +1560,8 @@ def run_historical_strategy_backtest(
                 continue
             if timestamp >= pd.Timestamp(order["expires_at"]):
                 pending.remove(order)
+                if try_market_fallback(order, timestamp, float(minute_bar["CLOSE"]), last_bundle):
+                    continue
                 state = sessions.get(str(order.get("session_id")))
                 if state is not None:
                     state["last_terminal_ts"] = timestamp
@@ -1282,8 +1594,14 @@ def run_historical_strategy_backtest(
                 adverse = max(float(minute_bar["HIGH"]) - entry_price, 0.0)
                 favorable = max(entry_price - float(minute_bar["LOW"]), 0.0)
             multiplier = float(position["volume"]) * float(contract_size)
-            position["_mae_abs"] = max(float(position.get("_mae_abs", 0.0)), adverse * multiplier)
-            position["_mfe_abs"] = max(float(position.get("_mfe_abs", 0.0)), favorable * multiplier)
+            adverse_abs = adverse * multiplier
+            favorable_abs = favorable * multiplier
+            if adverse_abs > float(position.get("_mae_abs", 0.0)):
+                position["_mae_abs"] = adverse_abs
+                position["_mae_ts"] = timestamp
+            if favorable_abs > float(position.get("_mfe_abs", 0.0)):
+                position["_mfe_abs"] = favorable_abs
+                position["_mfe_ts"] = timestamp
             exit_hit = _intrabar_exit(position, minute_bar)
             if exit_hit:
                 positions.remove(position)
@@ -1341,6 +1659,13 @@ def run_historical_strategy_backtest(
                         "consensus_score": score,
                     }
                 )
+                continue
+            remaining_minutes = (pd.Timestamp(order["expires_at"]) - timestamp).total_seconds() / 60.0
+            if remaining_minutes <= fallback_lead_minutes:
+                pending.remove(order)
+                if try_market_fallback(order, timestamp, float(minute_bar["CLOSE"]), bundle):
+                    continue
+                pending.append(order)
 
         for position in list(positions):
             side = str(position["side"])
@@ -1429,28 +1754,20 @@ def run_historical_strategy_backtest(
         )
     engine.close()
 
-    point_in_time_checks: List[bool] = []
-    for item in provider_manifest:
-        training_end = item.get("training_data_last_index")
-        fallback_modified = item.get("model_modified_at_utc")
-        raw = training_end or fallback_modified
-        if not raw:
-            point_in_time_checks.append(False)
-            continue
-        try:
-            timestamp = pd.Timestamp(raw)
-            if timestamp.tzinfo is not None:
-                timestamp = timestamp.tz_convert("UTC").tz_localize(None)
-            point_in_time_checks.append(timestamp < start)
-        except Exception:
-            point_in_time_checks.append(False)
-    point_in_time_safe = bool(point_in_time_checks) and all(point_in_time_checks)
+    point_in_time_safe = explicit_point_in_time_safe
     if point_in_time_safe:
-        result_grade = "point-in-time market replay with pre-period frozen models"
-        warning = (
-            "Every packaged model's training-data cutoff (or legacy artifact timestamp when no cutoff exists) predates the evaluated period. Market-data lookahead was prevented, but current config selection "
-            "and omitted live-only behavior still mean this is not a perfect historical reconstruction."
-        )
+        if model_policy == "walk_forward_latest_pre_tick_training_cutoff":
+            result_grade = "point-in-time walk-forward model-package replay"
+            warning = (
+                "At each simulated timestamp, every endpoint used the newest available package whose explicit training cutoff was already in the past. "
+                "Market-data and model lookahead were prevented, although omitted live-only behavior still means this is not a perfect broker reconstruction."
+            )
+        else:
+            result_grade = "point-in-time market replay with pre-period frozen models"
+            warning = (
+                "Every packaged model's explicit training-data cutoff predates the evaluated period. Market-data lookahead was prevented, but current config selection "
+                "and omitted live-only behavior still mean this is not a perfect historical reconstruction."
+            )
     else:
         result_grade = "exploratory retrospective current-model replay"
         warning = (
@@ -1467,6 +1784,37 @@ def run_historical_strategy_backtest(
     elif winners.size:
         profit_factor = "infinite"
     coverage = float(np.mean([float(row.get("coverage", 0.0)) for row in signal_rows])) if signal_rows else 0.0
+    winner_ops = [operation for operation in operations if float(operation.get("net_pnl", 0.0)) > 0.0]
+    loser_ops = [operation for operation in operations if float(operation.get("net_pnl", 0.0)) <= 0.0]
+
+    def _average(items: List[Dict[str, Any]], key: str) -> float:
+        values = [float(item.get(key, 0.0) or 0.0) for item in items]
+        return float(np.mean(values)) if values else 0.0
+
+    mfe_capture_values = [
+        max(float(operation.get("gross_pnl", 0.0) or 0.0), 0.0) / float(operation.get("mfe_abs", 0.0))
+        for operation in operations
+        if float(operation.get("mfe_abs", 0.0) or 0.0) > 1e-12
+    ]
+    path_diagnostics = {
+        "average_mae_all": _average(operations, "mae_abs"),
+        "average_mfe_all": _average(operations, "mfe_abs"),
+        "average_mae_winners": _average(winner_ops, "mae_abs"),
+        "average_mfe_winners": _average(winner_ops, "mfe_abs"),
+        "average_mae_losers": _average(loser_ops, "mae_abs"),
+        "average_mfe_losers": _average(loser_ops, "mfe_abs"),
+        "average_mfe_capture_ratio": float(np.mean(mfe_capture_values)) if mfe_capture_values else 0.0,
+        "trades_with_mae_before_mfe": sum(
+            1 for operation in operations
+            if operation.get("time_to_mae_minutes") is not None
+            and operation.get("time_to_mfe_minutes") is not None
+            and int(operation["time_to_mae_minutes"]) < int(operation["time_to_mfe_minutes"])
+        ),
+        "losers_with_negligible_mfe": sum(
+            1 for operation in loser_ops
+            if float(operation.get("mfe_abs", 0.0) or 0.0) <= max(float(operation.get("mae_abs", 0.0) or 0.0) * 0.10, 1e-9)
+        ),
+    }
 
     all_local_days = sorted(set(local_label(value) for value in period_minutes["DATE"]))
     daily: List[Dict[str, Any]] = []
@@ -1507,7 +1855,8 @@ def run_historical_strategy_backtest(
             "point_in_time_market_data": True,
             "unfinished_candles_use_only_available_minutes": True,
             "point_in_time_model_artifacts": point_in_time_safe,
-            "model_policy": "latest_current_artifacts_frozen_for_replay",
+            "strict_point_in_time_required": bool(require_point_in_time_models),
+            "model_policy": model_policy,
             "plain_language_warning": warning,
             "excluded_live_behaviors": [
                 "LLM commentary and sentiment",
@@ -1523,6 +1872,12 @@ def run_historical_strategy_backtest(
             "signal_forecast_scope": "first_model_output_only; identical to the first step of the configured recursive horizon",
             "session_hours": session_hours,
             "programmed_order_expiration_minutes": expiration_minutes,
+            "market_fallback": {
+                "enabled": fallback_enabled,
+                "minutes_before_expiry": fallback_lead_minutes,
+                "allowed_triggers": sorted(fallback_allowed_triggers),
+            },
+            "signal_policy": policy_cfg,
             "spread_bps": float(execution.get("spread_bps", 2.0) or 2.0),
             "slippage_bps": float(execution.get("slippage_bps", 2.0) or 2.0),
             "commission_per_trade": commission,
@@ -1549,6 +1904,7 @@ def run_historical_strategy_backtest(
             "entry_attempts": sum(1 for attempt in attempts if attempt.get("trigger") in {"mandatory_session", "followup"}),
         },
         "daily": daily,
+        "path_diagnostics": path_diagnostics,
         "operations": operations,
         "model_manifest": provider_manifest,
         "signal_errors_last_tick": {

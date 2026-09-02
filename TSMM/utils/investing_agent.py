@@ -32,6 +32,11 @@ from .trading_reporter import generate_trading_plan_report
 from .trading_quality import apply_hybrid_trade_gate, model_quality_weight
 from .iqoption_adapter import IQOptionAdapter
 from .runtime_scope import resolve_runtime_file
+from .trading_signal_policy import (
+    apply_volatility_protection,
+    evaluate_joint_ohlc_policy,
+    signal_policy_config,
+)
 
 
 _LAST_ENDPOINT_START_TS: float = 0.0
@@ -1526,6 +1531,7 @@ def _collect_agent_a_enrichment_signals(
     qualified_count = 0
     quality_cfg = dict(trading_cfg.get("model_quality") or {})
     minimum_r2 = float(quality_cfg.get("minimum_r2_for_vote", 0.0) or 0.0)
+    legacy_static_discount = float(quality_cfg.get("legacy_static_score_discount", 0.35) or 0.0)
 
     for item in candidates:
         tf = str(item.get("timeframe") or "").strip()
@@ -1544,7 +1550,9 @@ def _collect_agent_a_enrichment_signals(
             conf = float(tf_sig.get("confidence", 0.5) or 0.5)
             signal = int(tf_sig.get("signal", 0) or 0)
             tf_weight = float(timeframe_weights.get(tf, 1.0))
-            quality = model_quality_weight(item.get("r2"), item.get("refreshed_r2"), minimum_r2)
+            quality = model_quality_weight(
+                item.get("r2"), item.get("refreshed_r2"), minimum_r2, legacy_static_discount
+            )
             vote_weight = max(conf, 0.01) * tf_weight * float(quality["weight"])
             if quality["qualified"] and signal != 0:
                 qualified_count += 1
@@ -1563,6 +1571,9 @@ def _collect_agent_a_enrichment_signals(
                 "confidence": conf,
                 "vote_weight": vote_weight,
                 "raw": tf_sig.get("raw"),
+                "forecast_delta": tf_sig.get("forecast_delta"),
+                "reference_price": tf_sig.get("reference_price"),
+                "forecast_price": tf_sig.get("forecast_price"),
                 "error": tf_sig.get("error"),
             }
 
@@ -1629,6 +1640,7 @@ def _collect_all_model_assessment_signals(
 def _apply_agent_a_enrichment_to_plan(
     plan: Dict[str, Any],
     enrichment: Dict[str, Any],
+    trading_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     def _recompute_risk_levels(payload: Dict[str, Any], side: str) -> None:
         entry = payload.get("entry")
@@ -1653,6 +1665,51 @@ def _apply_agent_a_enrichment_to_plan(
     out = dict(plan or {})
     if not bool((enrichment or {}).get("enabled")):
         out["enrichment"] = enrichment or {"enabled": False}
+        return out
+
+    policy = evaluate_joint_ohlc_policy(
+        enrichment,
+        trading_cfg or {},
+        market_price=out.get("entry"),
+    )
+    if bool(policy.get("enabled", False)):
+        old_entry = float(out.get("entry", 0.0) or 0.0)
+        old_stop = out.get("stop_loss")
+        old_take = out.get("take_profit")
+        stop_distance = abs(old_entry - float(old_stop)) if old_stop is not None else 0.0
+        target_distance = abs(float(old_take) - old_entry) if old_take is not None else 0.0
+        out["signal_policy"] = policy
+        out["enrichment"] = {
+            **dict(enrichment or {}),
+            "joint_ohlc_policy": policy,
+        }
+        decision = str(policy.get("decision") or "hold")
+        if decision not in {"buy", "sell"}:
+            out["decision"] = "hold"
+            out["signal_policy_block_reason"] = str(policy.get("reason") or "signal_policy_blocked")
+            out.setdefault("risk_notes", []).append(
+                f"Joint OHLC/short-timeframe policy blocked entry: {out['signal_policy_block_reason']}."
+            )
+            return out
+        out["decision"] = decision
+        if policy.get("entry") is not None:
+            out["entry"] = round(float(policy["entry"]), 6)
+        out["confidence"] = round(float(policy.get("confidence", out.get("confidence", 0.5)) or 0.5), 4)
+        out["signal_score"] = round(float(policy.get("score", 0.0) or 0.0), 4)
+        entry = float(out.get("entry", old_entry) or old_entry)
+        if decision == "buy":
+            out["stop_loss"] = round(entry - stop_distance, 6) if old_stop is not None else None
+            out["take_profit"] = round(entry + target_distance, 6)
+        else:
+            out["stop_loss"] = round(entry + stop_distance, 6) if old_stop is not None else None
+            out["take_profit"] = round(entry - target_distance, 6)
+        out.setdefault("risk_notes", []).append(
+            "Direction selected from the strongest qualified HIGH/LOW timeframe and confirmed by the configured supporting timeframes."
+        )
+        out["rationale"] = str(out.get("rationale") or "") + (
+            f" | joint_ohlc={decision}, score={float(policy.get('score', 0.0)):.3f}, "
+            f"confirmations={policy.get('confirmations')}/{policy.get('required_confirmations')}"
+        )
         return out
 
     consensus = str(enrichment.get("consensus") or "hold").lower()
@@ -2264,6 +2321,8 @@ def _build_endpoint_payloads(
             "config_path": spec.get("config_path"),
             "input_features": list(spec.get("input_features") or []),
             "n_steps": n_steps,
+            "target_col": str(spec.get("target_col") or "HIGH"),
+            "reference_price": float(enriched.iloc[-1][str(spec.get("target_col") or "HIGH")]),
         }
 
     return payloads
@@ -2414,12 +2473,19 @@ def _extract_endpoint_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         confidence = 0.5
 
+    forecast_delta = None
+    for candidate in (payload.get("forecast_sign"), payload.get("prediction")):
+        if isinstance(candidate, (int, float)):
+            forecast_delta = float(candidate)
+            break
+
     interpreted_signal = _apply_signal_interpretation(float(signal), payload.get("_trading_cfg") or {})
     signal = 1 if interpreted_signal > 0 else (-1 if interpreted_signal < 0 else 0)
 
     return {
         "signal": signal,
         "confidence": float(np.clip(confidence, 0.0, 1.0)),
+        "forecast_delta": forecast_delta,
         "raw": payload,
     }
 
@@ -2458,7 +2524,12 @@ def _collect_mode_b_signals(
                 "url": str(endpoint_cfg.get("url") or ""),
                 "payload_rows": len(payload.get("rows") or []),
                 "model": payload.get("model"),
+                "target_col": payload.get("target_col"),
+                "reference_price": payload.get("reference_price"),
             }
+            sig["reference_price"] = payload.get("reference_price")
+            if sig.get("forecast_delta") is not None and payload.get("reference_price") is not None:
+                sig["forecast_price"] = float(payload["reference_price"]) + float(sig["forecast_delta"])
             out[tf] = sig
             votes.append(sig["signal"])
             w = max(sig["confidence"], 0.01)
@@ -2526,14 +2597,30 @@ def run_investing_agent(
     mode_a_cfg = (trading_cfg.get("mode_a") or {})
     if bool(mode_a_cfg.get("use_pretrained_consensus", True)):
         enrichment = _collect_agent_a_enrichment_signals(trading_cfg=trading_cfg, timeout_sec=3.0)
-        plan = _apply_agent_a_enrichment_to_plan(plan, enrichment)
+        plan = _apply_agent_a_enrichment_to_plan(plan, enrichment, trading_cfg)
     else:
         enrichment = {"enabled": False, "reason": "Disabled in mode_a config"}
 
     # Conviction assessment — modulates SL/TP/sizing based on signal strength
     plan = _apply_conviction_to_plan(plan, enrichment, trading_cfg)
-    plan = apply_hybrid_trade_gate(plan, trading_cfg)
-
+    policy_cfg = signal_policy_config(trading_cfg)
+    volatility_cfg = dict(policy_cfg.get("volatility") or {})
+    volatility_frame = None
+    if bool(volatility_cfg.get("enabled", False)):
+        dashboard_cfg = trading_cfg.get("dashboard") or {}
+        master_path = str(dashboard_cfg.get("master_table_path") or "data/market_data.sqlite")
+        if not os.path.isabs(master_path):
+            master_path = str((Path(__file__).resolve().parents[1] / master_path).resolve())
+        try:
+            volatility_frame = _load_endpoint_market_frame(
+                master_path=master_path,
+                timeframe_label=str(volatility_cfg.get("timeframe") or "10m"),
+                latest_records=max(int(volatility_cfg.get("atr_period", 14) or 14) + 5, 30),
+                symbol=str(dashboard_cfg.get("sql_symbol") or ((trading_cfg.get("execution") or {}).get("symbol") or "XAUUSD")),
+            )
+        except Exception:
+            volatility_frame = None
+    plan = apply_volatility_protection(plan, trading_cfg, volatility_frame)
     backtest = run_backtest_from_validation(
         results.get("df"),
         app_config,
@@ -2545,6 +2632,9 @@ def run_investing_agent(
 
     success_probability = _estimate_signal_success_probability(plan, backtest)
     plan["success_probability"] = round(success_probability, 4)
+    # The admission gate must consume the calibrated/backtested probability.
+    # Previously it ran first and silently substituted raw confidence instead.
+    plan = apply_hybrid_trade_gate(plan, trading_cfg)
 
     pm_cfg = trading_cfg.get("probability_maps", {}) or {}
     if bool(pm_cfg.get("enabled", True)):

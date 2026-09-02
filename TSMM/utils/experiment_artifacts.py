@@ -102,6 +102,22 @@ def export_worthy_experiment_bundle(
     if model_name is None or r2_score is None or r2_score <= float(r2_threshold):
         return None
 
+    metrics = dict(((evaluation or {}).get(model_name) or {}).get("metrics") or {})
+    qualification_cfg = dict(config.get("artifact_qualification") or {})
+    minimum_samples = int(qualification_cfg.get("minimum_test_samples", 0) or 0)
+    required_protocol = str(
+        qualification_cfg.get("required_evaluation_protocol") or ""
+    ).strip()
+    minimum_skill = float(
+        qualification_cfg.get("minimum_mae_skill_vs_zero_change", float("-inf"))
+    )
+    if minimum_samples and int(metrics.get("sample_count", 0) or 0) < minimum_samples:
+        return None
+    if required_protocol and str(metrics.get("evaluation_protocol") or "") != required_protocol:
+        return None
+    if float(metrics.get("MAE_skill_vs_zero_change", float("-inf"))) < minimum_skill:
+        return None
+
     root = Path(artifact_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     created_at = datetime.now(timezone.utc)
@@ -110,11 +126,14 @@ def export_worthy_experiment_bundle(
         f"{Path(config_path).stem}__{model_name}__r2_{score_slug}__"
         f"{created_at.strftime('%Y%m%dT%H%M%SZ')}"
     )
-    staging = root / f".staging_{bundle_name}_{uuid.uuid4().hex}"
+    # Keep the temporary path short enough for Windows runtimes that still
+    # enforce MAX_PATH when joblib opens the model file.
+    staging = root / f".tmp_{uuid.uuid4().hex[:12]}"
     destination = root / bundle_name
     staging.mkdir(parents=True, exist_ok=False)
     try:
         model_dir = staging / "model_files"
+        model_dir.mkdir(parents=True, exist_ok=True)
         selected_models = {model_name: models[model_name]}
         selected_evaluation = {model_name: evaluation[model_name]}
         saved_path = save_best_model(
@@ -164,8 +183,14 @@ def export_worthy_experiment_bundle(
             "schema_version": 1, "created_at_utc": created_at.isoformat(),
             "experiment_id": Path(config_path).stem,
             "source_config_path": str(Path(config_path).resolve()),
-            "qualification": {"metric": "R2", "model": model_name, "score": r2_score,
-                              "operator": ">", "threshold": float(r2_threshold)},
+            "qualification": {
+                "metric": "R2", "model": model_name, "score": r2_score,
+                "operator": ">", "threshold": float(r2_threshold),
+                "sample_count": metrics.get("sample_count"),
+                "evaluation_protocol": metrics.get("evaluation_protocol"),
+                "mae_skill_vs_zero_change": metrics.get("MAE_skill_vs_zero_change"),
+                "requirements": qualification_cfg,
+            },
             "code": {"git_commit": _git_revision(project_root), "python": sys.version,
                      "platform": platform.platform()},
             "random_seed": config.get("random_seed", config.get("seed")),

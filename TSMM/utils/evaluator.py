@@ -541,9 +541,11 @@ def _prepare_discriminator_validation_slice(
     n_steps: int,
     validation_rows: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    val_start = -(validation_rows + n_steps)
-    val_end = -validation_rows
-    X_val = df[input_features].iloc[val_start:val_end].values
+    start = len(df) - int(validation_rows)
+    X_val = np.stack([
+        df[input_features].iloc[index - n_steps:index].to_numpy(dtype=float)
+        for index in range(start, len(df))
+    ])
     y_val_true = df[target_features].iloc[-validation_rows:].values
     return X_val, y_val_true
 
@@ -645,6 +647,94 @@ def save_training_fit_plot(y_train_true, y_train_pred,
     return fig, tmp.name
 
 
+def _rolling_origin_predictions(
+        model, scalers, df, input_features, target_features, n_steps,
+        m_steps, test_size, model_name, device="cpu"):
+    """Predict each holdout row from the actual observations available before it.
+
+    TSMM endpoints are refreshed with observed candles between calls.  A
+    120-step free-running forecast therefore does not represent their live
+    one-step task and compounds errors into a misleading R2.  This evaluator
+    uses a chronological untouched holdout while providing only the actual
+    history that would have existed at each prediction time.
+    """
+    start = len(df) - int(test_size)
+    if start < int(n_steps):
+        raise ValueError(
+            f"Not enough rows for rolling-origin evaluation: rows={len(df)}, "
+            f"n_steps={n_steps}, test_size={test_size}."
+        )
+    windows = np.stack([
+        df[input_features].iloc[index - n_steps:index].to_numpy(dtype=float)
+        for index in range(start, len(df))
+    ])
+    n_features = len(input_features)
+    scaler_feature_count = int(
+        getattr(scalers['X'], 'n_features_in_', n_features) or n_features
+    )
+    if scaler_feature_count == n_steps * n_features:
+        # N-BEATS scales complete flattened windows.
+        scaled = scalers['X'].transform(windows.reshape(len(windows), -1)).reshape(
+            len(windows), n_steps, n_features
+        )
+    elif scaler_feature_count == n_features:
+        # Linear/SVR sequence models scale each observed feature consistently
+        # across the lookback rows.
+        scaled = scalers['X'].transform(
+            windows.reshape(-1, n_features)
+        ).reshape(len(windows), n_steps, n_features)
+    else:
+        raise ValueError(
+            f"Unsupported input scaler width {scaler_feature_count}; expected "
+            f"{n_features} or {n_steps * n_features}."
+        )
+
+    if model_name == 'nbeats':
+        import torch
+        model_device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        model.eval()
+        with torch.no_grad():
+            raw = model(
+                torch.as_tensor(
+                    scaled.reshape(len(scaled), -1), dtype=torch.float32,
+                    device=model_device,
+                )
+            ).detach().cpu().numpy()
+    else:
+        raw = model.predict(scaled.reshape(len(scaled), -1))
+
+    raw = np.asarray(raw).reshape(len(windows), int(m_steps), len(target_features))
+    unscaled = scalers['y'].inverse_transform(
+        raw.reshape(-1, len(target_features))
+    ).reshape(len(windows), int(m_steps), len(target_features))
+    return unscaled[:, 0, :]
+
+
+def _forecast_metrics(y_true, y_pred, *, protocol="rolling_origin_one_step"):
+    """Return R2 plus sample-size and trading-relevant stability diagnostics."""
+    truth = np.asarray(y_true, dtype=float).reshape(-1)
+    pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    sample_count = int(min(len(truth), len(pred)))
+    truth, pred = truth[:sample_count], pred[:sample_count]
+    baseline = np.zeros_like(truth)
+    mae = mean_absolute_error(truth, pred)
+    baseline_mae = mean_absolute_error(truth, baseline)
+    direction_accuracy = float(np.mean(np.sign(truth) == np.sign(pred))) if sample_count else 0.0
+    return {
+        'MAE': mae,
+        'RMSE': np.sqrt(mean_squared_error(truth, pred)),
+        'R2': r2_score(truth, pred),
+        'MAPE': np.mean(np.abs((truth - pred) / np.maximum(np.abs(truth), 1))) * 100,
+        'sample_count': sample_count,
+        'evaluation_protocol': protocol,
+        'direction_accuracy': direction_accuracy,
+        'zero_change_baseline_MAE': baseline_mae,
+        'MAE_skill_vs_zero_change': (
+            1.0 - (mae / baseline_mae) if baseline_mae > 0.0 else 0.0
+        ),
+    }
+
+
 def evaluate_models(models, df, config):
     """
     Evaluate all trained models and generate comprehensive metrics including
@@ -725,10 +815,19 @@ def evaluate_models(models, df, config):
                     )
 
                 # Get predictions using recursive engine
-                y_val_pred = recursive_forecast(
-                    model, scalers, X_val, test_size,
-                    model_name, n_steps, n_features, config, max_window, input_features, target_features, m_steps
-                )
+                evaluation_protocol = str(
+                    config.get('evaluation_protocol', 'rolling_origin_one_step')
+                ).strip().lower()
+                if evaluation_protocol == 'rolling_origin_one_step':
+                    y_val_pred = _rolling_origin_predictions(
+                        model, scalers, df, input_features, target_features,
+                        n_steps, m_steps, test_size, model_name,
+                    )
+                else:
+                    y_val_pred = recursive_forecast(
+                        model, scalers, X_val, test_size,
+                        model_name, n_steps, n_features, config, max_window, input_features, target_features, m_steps
+                    )
 
                 future_pred = recursive_forecast(
                     model, scalers, X_last, horizon,
@@ -752,13 +851,10 @@ def evaluate_models(models, df, config):
                     y_true_feat = y_val_true[:min_val_length, i]
                     y_pred_feat = y_val_pred[:min_val_length, i]
 
-                    metrics = {
-                        'MAE': mean_absolute_error(y_true_feat, y_pred_feat),
-                        'RMSE': np.sqrt(mean_squared_error(y_true_feat, y_pred_feat)),
-                        'R2': r2_score(y_true_feat, y_pred_feat),
-                        'MAPE': np.mean(np.abs((y_true_feat - y_pred_feat) /
-                                            np.maximum(np.abs(y_true_feat), 1))) * 100
-                    }
+                    metrics = _forecast_metrics(
+                        y_true_feat, y_pred_feat,
+                        protocol=evaluation_protocol,
+                    )
 
                     # Classify metrics
                     if feat == 'y_diff' or feat == target_col:
@@ -832,75 +928,51 @@ def evaluate_models(models, df, config):
                 X_disc, y_disc_true = _prepare_discriminator_validation_slice(
                     df, input_features, target_features, n_steps, discriminator_validation_rows
                 )
-                y_disc_pred = recursive_forecast(
-                    model, scalers, X_disc, discriminator_validation_rows,
-                    model_name, n_steps, n_features, config, max_window, input_features, target_features, m_steps
-                )
+                if evaluation_protocol == 'rolling_origin_one_step':
+                    y_disc_pred = _rolling_origin_predictions(
+                        model, scalers, df, input_features, target_features,
+                        n_steps, m_steps, discriminator_validation_rows, model_name,
+                    )
+                else:
+                    y_disc_pred = recursive_forecast(
+                        model, scalers, X_disc[0], discriminator_validation_rows,
+                        model_name, n_steps, n_features, config, max_window, input_features, target_features, m_steps
+                    )
                 discriminator = train_confidence_discriminator(
                     model_data, X_disc, y_disc_true, y_disc_pred, config
                 )
                 if discriminator:
                     confidence_discriminators[model_name] = discriminator
+                    model_data['confidence_discriminator'] = discriminator
                     future_windows = np.array([X_last] * min(horizon, 10))
                     conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
                     model_eval['confidence_levels'] = conf_levels
-                    try:
-                        disc_path = save_discriminator_for_context(
-                            discriminator=discriminator,
-                            config=config,
-                            model_name=model_name,
-                            timeframe_key=timeframe_key,
-                        )
+                    if bool(config.get('_bulk_search', False)):
                         model_eval['discriminator'] = {
                             'timeframe': timeframe_key,
                             'model': model_name,
-                            'path': disc_path,
+                            'persisted_globally': False,
+                            'reason': 'bulk_search_bundle_isolation',
                         }
-                    except Exception as disc_save_err:
-                        model_eval['discriminator'] = {
-                            'timeframe': timeframe_key,
-                            'model': model_name,
-                            'error': str(disc_save_err),
-                        }
-
-                    try:
-                        model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
-                            discriminator=discriminator,
-                            latest_window=X_last,
-                        )
-                    except Exception as risk_err:
-                        model_eval['input_fooling_risk'] = {
-                            'error': str(risk_err)
-                        }
-
-                # Train confidence discriminator
-                discriminator = train_confidence_discriminator(
-                    model_data, X_val, y_val_true, y_val_pred, config
-                )
-                if discriminator:
-                    confidence_discriminators[model_name] = discriminator
-                    # Get confidence levels for future forecasts
-                    future_windows = np.array([X_last] * min(horizon, 10))  # Simplified
-                    conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
-                    model_eval['confidence_levels'] = conf_levels
-                    try:
-                        disc_path = save_discriminator_for_context(
-                            discriminator=discriminator,
-                            config=config,
-                            model_name=model_name,
-                            timeframe_key=timeframe_key,
-                        )
-                        model_eval['discriminator'] = {
-                            'timeframe': timeframe_key,
-                            'model': model_name,
-                            'path': disc_path,
-                        }
-                    except Exception as disc_save_err:
-                        model_eval['discriminator'] = {
-                            'timeframe': timeframe_key,
-                            'model': model_name,
-                            'error': str(disc_save_err),
-                        }
+                    else:
+                        try:
+                            disc_path = save_discriminator_for_context(
+                                discriminator=discriminator,
+                                config=config,
+                                model_name=model_name,
+                                timeframe_key=timeframe_key,
+                            )
+                            model_eval['discriminator'] = {
+                                'timeframe': timeframe_key,
+                                'model': model_name,
+                                'path': disc_path,
+                            }
+                        except Exception as disc_save_err:
+                            model_eval['discriminator'] = {
+                                'timeframe': timeframe_key,
+                                'model': model_name,
+                                'error': str(disc_save_err),
+                            }
 
                     try:
                         model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
@@ -943,11 +1015,20 @@ def evaluate_models(models, df, config):
                 X_last = df[input_features].iloc[-n_steps:].values
 
                 # Get predictions
-                y_val_pred = recursive_forecast_nbeats(
-                    model, scalers, X_val, model_test_size,
-                    n_steps, n_features, config, max_window,
-                    input_features, target_features, m_steps, device
-                )
+                evaluation_protocol = str(
+                    config.get('evaluation_protocol', 'rolling_origin_one_step')
+                ).strip().lower()
+                if evaluation_protocol == 'rolling_origin_one_step':
+                    y_val_pred = _rolling_origin_predictions(
+                        model, scalers, df, input_features, target_features,
+                        n_steps, m_steps, model_test_size, model_name, device,
+                    )
+                else:
+                    y_val_pred = recursive_forecast_nbeats(
+                        model, scalers, X_val, model_test_size,
+                        n_steps, n_features, config, max_window,
+                        input_features, target_features, m_steps, device
+                    )
 
                 future_pred = recursive_forecast_nbeats(
                     model, scalers, X_last, horizon,
@@ -969,13 +1050,10 @@ def evaluate_models(models, df, config):
                     y_true_feat = y_val_true[:min_val_length, i]
                     y_pred_feat = y_val_pred[:min_val_length, i]
 
-                    metrics = {
-                        'MAE': mean_absolute_error(y_true_feat, y_pred_feat),
-                        'RMSE': np.sqrt(mean_squared_error(y_true_feat, y_pred_feat)),
-                        'R2': r2_score(y_true_feat, y_pred_feat),
-                        'MAPE': np.mean(np.abs((y_true_feat - y_pred_feat) /
-                                            np.maximum(np.abs(y_true_feat), 1))) * 100
-                    }
+                    metrics = _forecast_metrics(
+                        y_true_feat, y_pred_feat,
+                        protocol=evaluation_protocol,
+                    )
 
                     if feat == 'y_diff' or feat == target_col:
                         model_eval['metrics'] = metrics
@@ -1055,37 +1133,53 @@ def evaluate_models(models, df, config):
                 X_disc, y_disc_true = _prepare_discriminator_validation_slice(
                     df, input_features, target_features, n_steps, discriminator_validation_rows
                 )
-                y_disc_pred = recursive_forecast_nbeats(
-                    model, scalers, X_disc, discriminator_validation_rows,
-                    n_steps, n_features, config, max_window,
-                    input_features, target_features, m_steps, device
-                )
+                if evaluation_protocol == 'rolling_origin_one_step':
+                    y_disc_pred = _rolling_origin_predictions(
+                        model, scalers, df, input_features, target_features,
+                        n_steps, m_steps, discriminator_validation_rows,
+                        model_name, device,
+                    )
+                else:
+                    y_disc_pred = recursive_forecast_nbeats(
+                        model, scalers, X_disc[0], discriminator_validation_rows,
+                        n_steps, n_features, config, max_window,
+                        input_features, target_features, m_steps, device
+                    )
                 discriminator = train_confidence_discriminator(
                     model_data, X_disc, y_disc_true, y_disc_pred, config
                 )
                 if discriminator:
                     confidence_discriminators[model_name] = discriminator
+                    model_data['confidence_discriminator'] = discriminator
                     future_windows = np.array([X_last] * min(horizon, 10))
                     conf_levels = get_forecast_confidence_levels(discriminator, future_windows)
                     model_eval['confidence_levels'] = conf_levels
-                    try:
-                        disc_path = save_discriminator_for_context(
-                            discriminator=discriminator,
-                            config=config,
-                            model_name=model_name,
-                            timeframe_key=timeframe_key,
-                        )
+                    if bool(config.get('_bulk_search', False)):
                         model_eval['discriminator'] = {
                             'timeframe': timeframe_key,
                             'model': model_name,
-                            'path': disc_path,
+                            'persisted_globally': False,
+                            'reason': 'bulk_search_bundle_isolation',
                         }
-                    except Exception as disc_save_err:
-                        model_eval['discriminator'] = {
-                            'timeframe': timeframe_key,
-                            'model': model_name,
-                            'error': str(disc_save_err),
-                        }
+                    else:
+                        try:
+                            disc_path = save_discriminator_for_context(
+                                discriminator=discriminator,
+                                config=config,
+                                model_name=model_name,
+                                timeframe_key=timeframe_key,
+                            )
+                            model_eval['discriminator'] = {
+                                'timeframe': timeframe_key,
+                                'model': model_name,
+                                'path': disc_path,
+                            }
+                        except Exception as disc_save_err:
+                            model_eval['discriminator'] = {
+                                'timeframe': timeframe_key,
+                                'model': model_name,
+                                'error': str(disc_save_err),
+                            }
 
                     try:
                         model_eval['input_fooling_risk'] = estimate_input_fooling_risk(
@@ -1268,6 +1362,13 @@ def save_best_model(models, evaluation, model_dir, logger, config=None):
         tf = str(cfg.get('timeframe', '') or '').strip().lower()
         if tf:
             return tf
+        timeframe_minutes = int(cfg.get('data_timeframe_minutes', 0) or 0)
+        if timeframe_minutes > 0:
+            if timeframe_minutes % 10080 == 0:
+                return f"{timeframe_minutes // 10080}w"
+            if timeframe_minutes % 60 == 0:
+                return f"{timeframe_minutes // 60}h"
+            return f"{timeframe_minutes}m"
         dp = str(cfg.get('data_path', '') or '').strip().lower()
         m = re.search(r"(\d+[mhdw])", dp)
         if m:
@@ -1307,6 +1408,8 @@ def save_best_model(models, evaluation, model_dir, logger, config=None):
                 artifacts['scaler_X'] = scalers.get('X')
             if 'scaler_y' not in artifacts and scalers.get('y') is not None:
                 artifacts['scaler_y'] = scalers.get('y')
+        if model_data.get('confidence_discriminator') is not None:
+            artifacts['confidence_discriminator'] = model_data.get('confidence_discriminator')
         
         if artifacts:
             artifacts_path = os.path.join(model_dir, f"{best_model_name}_artifacts_{target_slug}_{timeframe_slug}_{timestamp}.joblib")

@@ -18,7 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.model_deployment import deployment_model_spec, install_bundle
 from utils.strategy_backtest import (
     ConsoleProgressBar,
+    WalkForwardModelSignalProvider,
     discover_replay_model_specs,
+    discover_walk_forward_model_specs,
     run_historical_strategy_backtest,
 )
 
@@ -40,8 +42,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-balance", type=float, default=100000.0)
     parser.add_argument("--contract-size", type=float, default=100.0, help="Currency P/L multiplier per 1.0 lot and 1.0 price move")
     parser.add_argument("--poll-minutes", type=int, default=None, help="Override Agent B replay interval")
+    parser.add_argument(
+        "--require-point-in-time-models",
+        action="store_true",
+        help="Refuse to run unless every model package has an explicit pre-period training cutoff",
+    )
     parser.add_argument("--candidate-bundle", help="Bundle directory or .zip to replay without activating it")
     parser.add_argument("--candidate-endpoint", help="Endpoint replaced by the candidate, for example 10m_high")
+    parser.add_argument(
+        "--walk-forward-deployments",
+        help="Deployment-history root; select the newest package with a pre-tick training cutoff",
+    )
     parser.add_argument("--max-ticks", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
@@ -71,8 +82,25 @@ def main() -> int:
     print("Preparing historical market data and loading current forecasting models...", flush=True)
     progress = ConsoleProgressBar()
     replay_specs = None
+    replay_provider = None
     if bool(args.candidate_bundle) != bool(args.candidate_endpoint):
         raise ValueError("--candidate-bundle and --candidate-endpoint must be supplied together")
+    if args.walk_forward_deployments and args.candidate_bundle:
+        raise ValueError("--walk-forward-deployments cannot be combined with --candidate-bundle")
+    if args.walk_forward_deployments:
+        current_specs = discover_replay_model_specs(trading_cfg)
+        version_specs = discover_walk_forward_model_specs(
+            trading_cfg,
+            _resolve(args.walk_forward_deployments),
+        )
+        required_keys = {(str(item.get("timeframe")), str(item.get("family")).lower()) for item in current_specs}
+        version_keys = {(str(item.get("timeframe")), str(item.get("family")).lower()) for item in version_specs}
+        missing = sorted(required_keys - version_keys)
+        if missing:
+            raise ValueError(f"Walk-forward deployment history is missing configured endpoints: {missing}")
+        replay_provider = WalkForwardModelSignalProvider(version_specs)
+        replay_specs = replay_provider.base_specs
+        print(f"Walk-forward history loaded: {len(version_specs)} package versions", flush=True)
     if args.candidate_bundle:
         deployment = install_bundle(_resolve(args.candidate_bundle), args.candidate_endpoint)
         candidate_spec = deployment_model_spec(deployment)
@@ -101,6 +129,8 @@ def main() -> int:
         tick_progress_cb=progress,
         max_ticks=args.max_ticks,
         specs=replay_specs,
+        provider=replay_provider,
+        require_point_in_time_models=bool(args.require_point_in_time_models or args.walk_forward_deployments),
     )
     if not result.get("ok"):
         print(json.dumps(result, indent=2, ensure_ascii=True))

@@ -19,6 +19,7 @@ mode_a:
   block_on_confidence_thresholds: true
   block_on_input_fooling_risk: true
 agent_a_fallback:
+  allow_signal_policy_bypass: false
   enabled: true
   auto_discover: true
   target_families:
@@ -45,6 +46,35 @@ agent_a_fallback:
   - config_path: config/high10mResults/nbeats/top1_06000.yaml
     timeframe: 10m
     model: nbeats
+model_quality:
+  minimum_r2_for_vote: 0.0
+  prefer_refreshed_r2: true
+  legacy_static_score_discount: 0.35
+signal_policy:
+  enabled: true
+  direction_timeframe: 7h
+  direction_timeframes: [10m, 30m, 1h, 3h, 7h, 12h, 24h]
+  select_best_direction_timeframe: true
+  confirmation_timeframes: [10m, 30m, 1h, 3h, 7h]
+  required_confirmations: 2
+  min_direction_score: 0.12
+  min_confirmation_score: 0.08
+  minimum_coverage: 0.70
+  family_weights: {high: 0.45, low: 0.45, close: 0.10, open: 0.00}
+  require_projected_range: true
+  entry_range_fraction: 0.20
+  max_entry_offset_pct: 0.40
+  volatility:
+    enabled: true
+    timeframe: 10m
+    atr_period: 14
+    stop_atr_multiplier: 1.4
+    target_atr_multiplier: 2.0
+    realized_vol_multiplier: 2.0
+    reward_risk_ratio: 1.6
+    min_stop_pct: 0.10
+    max_stop_pct: 0.45
+    max_target_pct: 0.90
 mode_b:
   enabled: true
   allow_open_new_positions: true
@@ -78,7 +108,9 @@ risk:
     enabled: true
     mode: probability
     trail_pct_base: 0.5
+    trail_atr_multiplier: 1.0
     breakeven_activation_ratio: 0.75
+    breakeven_cost_buffer_multiple: 1.0
     min_confidence_to_extend: 0.65
   min_confidence_to_trade: 0.5
   min_cm_accuracy_to_trade: 0.5
@@ -176,6 +208,12 @@ trading_job:
   fill_check_seconds: 30
   programmed_order_expiration_minutes: 420
   max_wait_fill_minutes: 420
+  market_fallback:
+    enabled: true
+    minutes_before_expiry: 15
+    assessment_timeout_seconds: 5.0
+    min_direction_score: 0.12
+    allowed_triggers: [mandatory_session]
   cleanup_closed_jobs: true
 runtime:
   root_dir: reports/runtime/ftmo

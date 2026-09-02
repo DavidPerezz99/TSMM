@@ -65,6 +65,16 @@ def parse_cli_args():
     parser.add_argument("--end-date", default=None, help="Backtest end date or timestamp in the trading timezone")
     parser.add_argument("--market-source", default=None, help="Backtest one-minute SQLite/CSV source")
     parser.add_argument("--backtest-output-dir", default=None, help="Backtest output directory")
+    parser.add_argument(
+        "--require-point-in-time-models",
+        action="store_true",
+        help="Require explicit model training cutoffs before the backtest period",
+    )
+    parser.add_argument(
+        "--walk-forward-deployments",
+        default=None,
+        help="Deployment-history root for pre-tick model package selection",
+    )
     parser.add_argument("--initial-balance", type=float, default=100000.0, help="Backtest starting balance")
     parser.add_argument("--contract-size", type=float, default=100.0, help="Backtest currency P/L multiplier")
     parser.add_argument("--poll-minutes", type=int, default=None, help="Backtest Agent B interval override")
@@ -592,7 +602,13 @@ def main():
         # Historical strategy replay is deliberately isolated from startup data
         # refresh and MT5. It must never mutate or depend on live broker state.
         if args.command == "backtest":
-            from utils.strategy_backtest import ConsoleProgressBar, run_historical_strategy_backtest
+            from utils.strategy_backtest import (
+                ConsoleProgressBar,
+                WalkForwardModelSignalProvider,
+                discover_replay_model_specs,
+                discover_walk_forward_model_specs,
+                run_historical_strategy_backtest,
+            )
 
             trading_cfg_path = os.environ.get('TRADING_CONFIG_PATH', 'config/trading_agent.yaml')
             trading_cfg = load_trading_config(trading_cfg_path)
@@ -609,6 +625,19 @@ def main():
 
             print("Preparing historical market data and loading current forecasting models...", flush=True)
             progress = ConsoleProgressBar()
+            replay_specs = None
+            replay_provider = None
+            if args.walk_forward_deployments:
+                deployment_root = Path(_resolve_app_path(args.walk_forward_deployments))
+                current_specs = discover_replay_model_specs(trading_cfg)
+                version_specs = discover_walk_forward_model_specs(trading_cfg, deployment_root)
+                required_keys = {(str(item.get("timeframe")), str(item.get("family")).lower()) for item in current_specs}
+                version_keys = {(str(item.get("timeframe")), str(item.get("family")).lower()) for item in version_specs}
+                missing = sorted(required_keys - version_keys)
+                if missing:
+                    raise RuntimeError(f"Walk-forward deployment history is missing configured endpoints: {missing}")
+                replay_provider = WalkForwardModelSignalProvider(version_specs)
+                replay_specs = replay_provider.base_specs
 
             backtest_result = run_historical_strategy_backtest(
                 market_source=market_source,
@@ -621,6 +650,9 @@ def main():
                 contract_size=float(args.contract_size),
                 poll_minutes=args.poll_minutes,
                 tick_progress_cb=progress,
+                specs=replay_specs,
+                provider=replay_provider,
+                require_point_in_time_models=bool(args.require_point_in_time_models or args.walk_forward_deployments),
             )
             if not bool(backtest_result.get("ok", False)):
                 raise RuntimeError(str(backtest_result.get("error") or "Backtest failed"))
