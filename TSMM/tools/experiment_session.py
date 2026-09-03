@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -151,6 +152,42 @@ def _single_sweep_value(sweep_cfg: Dict[str, Any], key: str, default: Any = None
     return value
 
 
+def _session_entries(session_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return explicit entries or expand a compact timeframe/family matrix."""
+    explicit = list(session_cfg.get("experiments") or [])
+    if explicit:
+        return explicit
+    matrix = session_cfg.get("experiment_matrix") or {}
+    if not isinstance(matrix, dict):
+        raise ValueError("experiment_matrix must be a mapping")
+    families = [str(value).strip().upper() for value in (matrix.get("families") or [])]
+    timeframes = matrix.get("timeframes") or {}
+    if not families or not isinstance(timeframes, dict) or not timeframes:
+        return []
+    base_config = matrix.get("base_config") or "config_templates/univariate.yaml"
+    common_overrides = matrix.get("sweep_overrides") or {}
+    entries: List[Dict[str, Any]] = []
+    for timeframe, raw in timeframes.items():
+        settings = dict(raw or {}) if isinstance(raw, dict) else {"sweep_config": raw}
+        sweep_config = settings.get("sweep_config")
+        if not sweep_config:
+            raise ValueError(f"experiment_matrix timeframe {timeframe} has no sweep_config")
+        for family in families:
+            entries.append(
+                {
+                    "name": f"{str(matrix.get('asset') or 'asset').lower()}_{timeframe}_{family.lower()}",
+                    "base_config": base_config,
+                    "sweep_config": sweep_config,
+                    "target_profile": family,
+                    "max_experiments": settings.get("max_experiments"),
+                    "sweep_overrides": _deep_merge(
+                        dict(common_overrides), dict(settings.get("sweep_overrides") or {})
+                    ),
+                }
+            )
+    return entries
+
+
 def build_session_plan(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
     resources = session_cfg.get("resources") or {}
     ram_limit_gb = float(resources.get("max_process_ram_gb", 20.0) or 20.0)
@@ -158,7 +195,7 @@ def build_session_plan(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
     max_duration_minutes = float(
         resources.get("max_estimated_experiment_minutes", 90.0) or 90.0
     )
-    entries = list(session_cfg.get("experiments") or [])
+    entries = _session_entries(session_cfg)
     max_records_per_experiment = int(
         session_cfg.get("max_records_per_experiment", 10000) or 10000
     )
@@ -276,7 +313,7 @@ def _materialize_session(
 
     session_dir.mkdir(parents=True, exist_ok=True)
     manifest_entries = []
-    source_entries = list(session_cfg.get("experiments") or [])
+    source_entries = _session_entries(session_cfg)
     for planned, source_entry in zip(plan["entries"], source_entries):
         entry_dir = session_dir / f"{planned['order']:02d}_{planned['name']}"
         configs_dir = entry_dir / "configs"
@@ -331,6 +368,12 @@ def _materialize_session(
         "total_experiments": plan["total_experiments"],
         "max_records_per_experiment": plan["max_records_per_experiment"],
         "max_experiments_per_endpoint": plan["max_experiments_per_endpoint"],
+        "best_available_after_experiments_per_endpoint": int(
+            session_cfg.get("best_available_after_experiments_per_endpoint", 0) or 0
+        ),
+        "minimum_experiments_before_early_stop_per_endpoint": int(
+            session_cfg.get("minimum_experiments_before_early_stop_per_endpoint", 0) or 0
+        ),
         "entries": manifest_entries,
     }
     _atomic_json(manifest_path, manifest)
@@ -350,7 +393,7 @@ def _data_source_settings(session_cfg: Dict[str, Any]) -> Dict[str, Any]:
     source = session_cfg.get("data_source") or {}
     timeframes = list(source.get("timeframes_minutes") or [])
     if not timeframes:
-        for entry in session_cfg.get("experiments") or []:
+        for entry in _session_entries(session_cfg):
             try:
                 _, _, _, sweep = _entry_source(entry, session_cfg)
                 value = _single_sweep_value(sweep, "data_timeframe_minutes")
@@ -575,6 +618,9 @@ def _run_guarded_experiment(
     config: Dict[str, Any],
     artifact_dir: Path,
     worthy_r2_threshold: float = 0.6,
+    artifact_selection_tier: str = "qualified_candidate",
+    force_artifact_export: bool = False,
+    artifact_selection_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     max_ram_gb = float(resources.get("max_process_ram_gb", 20.0) or 20.0)
     max_ram_bytes = int(max_ram_gb * 1024 ** 3)
@@ -605,6 +651,17 @@ def _run_guarded_experiment(
         "--worthy-r2-threshold",
         str(worthy_r2_threshold),
     ]
+    if artifact_selection_tier:
+        command.extend(["--artifact-selection-tier", str(artifact_selection_tier)])
+    if force_artifact_export:
+        command.append("--force-artifact-export")
+    if artifact_selection_metadata:
+        command.extend(
+            [
+                "--artifact-selection-metadata-json",
+                json.dumps(artifact_selection_metadata, sort_keys=True),
+            ]
+        )
     existing_bundles = set(artifact_dir.glob(f"{cfg_path.stem}__*")) if artifact_dir.exists() else set()
     started = time.monotonic()
     peak_rss = 0
@@ -668,7 +725,58 @@ def _run_guarded_experiment(
         "peak_process_ram_gb": round(peak_rss / 1024 ** 3, 2),
         "finished_at": _now_iso(),
         "worthy_bundle": str(new_bundles[-1]) if new_bundles else None,
+        "artifact_bundle": str(new_bundles[-1]) if new_bundles else None,
+        "artifact_selection_tier": artifact_selection_tier,
     }
+
+
+def _best_available_candidate(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Rank completed reliable summaries and return the best finite R2 run."""
+    summaries_dir = Path(entry["summaries_dir"])
+    configs_dir = Path(entry["configs_dir"]).resolve()
+    best: Optional[Dict[str, Any]] = None
+    for summary_path in summaries_dir.glob("cfg_*__summary.json"):
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if payload.get("status") != SUCCESS_STATUS:
+            continue
+        for model_name, metrics in dict(payload.get("metric") or {}).items():
+            if not isinstance(metrics, dict):
+                continue
+            try:
+                score = float(metrics.get("R2"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(score):
+                continue
+            if int(metrics.get("sample_count", 0) or 0) < 60:
+                continue
+            if str(metrics.get("evaluation_protocol") or "") != "rolling_origin_one_step":
+                continue
+            config_path = Path(str(payload.get("config_path") or ""))
+            if not config_path.is_absolute():
+                config_path = (ROOT / config_path).resolve()
+            try:
+                config_path.resolve().relative_to(configs_dir)
+            except ValueError:
+                continue
+            if not config_path.is_file():
+                continue
+            candidate = {
+                "config_path": config_path,
+                "summary_path": summary_path.resolve(),
+                "model": str(model_name),
+                "r2": score,
+                "sample_count": int(metrics.get("sample_count", 0) or 0),
+                "evaluation_protocol": str(metrics.get("evaluation_protocol") or ""),
+                "mae_skill_vs_zero_change": metrics.get("MAE_skill_vs_zero_change"),
+                "direction_accuracy": metrics.get("direction_accuracy"),
+            }
+            if best is None or score > float(best["r2"]):
+                best = candidate
+    return best
 
 
 def _load_state(session_dir: Path) -> Dict[str, Any]:
@@ -693,18 +801,39 @@ def _all_configs(manifest: Dict[str, Any]) -> List[tuple[Dict[str, Any], Path]]:
 def session_status(manifest: Dict[str, Any]) -> Dict[str, Any]:
     complete = 0
     per_entry = []
-    for entry in sorted(manifest.get("entries") or [], key=lambda item: int(item["order"])):
+    manifest_entries = sorted(
+        manifest.get("entries") or [], key=lambda item: int(item["order"])
+    )
+    session_state: Dict[str, Any] = {}
+    if manifest_entries:
+        session_dir = Path(manifest_entries[0]["configs_dir"]).parents[1]
+        session_state = _load_state(session_dir)
+    satisfied_entries = set(session_state.get("satisfied_entries") or [])
+    fallback_entries = set((session_state.get("fallback_entries") or {}).keys())
+    for entry in manifest_entries:
         configs = sorted(Path(entry["configs_dir"]).glob("cfg_*.yaml"))
-        entry_complete = sum(
+        evaluated = sum(
             1 for cfg in configs if _is_complete(Path(entry["summaries_dir"]), cfg)
         )
+        resolved = str(entry["name"]) in satisfied_entries or str(entry["name"]) in fallback_entries
+        entry_complete = len(configs) if resolved else evaluated
         complete += entry_complete
         per_entry.append(
             {
                 "order": entry["order"],
                 "name": entry["name"],
                 "completed": entry_complete,
+                "evaluated": evaluated,
                 "total": len(configs),
+                "selection_status": (
+                    "qualified_candidate"
+                    if str(entry["name"]) in satisfied_entries
+                    else (
+                        "fallback_best_available"
+                        if str(entry["name"]) in fallback_entries
+                        else "searching"
+                    )
+                ),
             }
         )
     total = int(manifest.get("total_experiments", 0) or 0)
@@ -785,16 +914,16 @@ def run_session(
 
     started_count = 0
     satisfied_entries = set(state.get("satisfied_entries") or [])
+    fallback_entries = dict(state.get("fallback_entries") or {})
+    qualified_entries = dict(state.get("qualified_entries") or {})
     stop_reason = "all_experiments_complete"
     for entry, cfg_path in _all_configs(manifest):
-        if str(entry["name"]) in satisfied_entries:
+        entry_name = str(entry["name"])
+        if entry_name in satisfied_entries or entry_name in fallback_entries:
             continue
         summary_dir = Path(entry["summaries_dir"])
         if _is_complete(summary_dir, cfg_path):
             continue
-        if run_limit and started_count >= run_limit:
-            stop_reason = f"manual_batch_limit_reached:{run_limit}"
-            break
 
         now = datetime.now().astimezone()
         remaining_seconds = (deadline - now).total_seconds()
@@ -804,6 +933,99 @@ def run_session(
         available_gb = psutil.virtual_memory().available / 1024 ** 3
         if available_gb < minimum_free:
             stop_reason = f"insufficient_free_ram:{available_gb:.2f}GB<{minimum_free:.2f}GB"
+            break
+
+        completed_for_entry = sum(
+            1
+            for candidate_path in Path(entry["configs_dir"]).glob("cfg_*.yaml")
+            if _is_complete(summary_dir, candidate_path)
+        )
+        minimum_before_early_stop = max(
+            int(
+                entry.get("minimum_experiments_before_early_stop")
+                or manifest.get("minimum_experiments_before_early_stop_per_endpoint")
+                or 0
+            ),
+            0,
+        )
+        if (
+            entry_name in qualified_entries
+            and completed_for_entry >= minimum_before_early_stop
+        ):
+            satisfied_entries.add(entry_name)
+            state["satisfied_entries"] = sorted(satisfied_entries)
+            state["updated_at"] = _now_iso()
+            _atomic_json(session_dir / "session_state.json", state)
+            print(
+                f"Comparison budget met for {entry_name} after "
+                f"{completed_for_entry} successful experiments; advancing with its "
+                "qualified candidate."
+            )
+            continue
+        fallback_after = int(
+            entry.get("best_available_after_experiments")
+            or manifest.get("best_available_after_experiments_per_endpoint")
+            or max(int(entry.get("config_count") or 1) - 1, 1)
+            or 0
+        )
+        if fallback_after > 0 and completed_for_entry >= min(
+            fallback_after, int(entry.get("config_count") or fallback_after)
+        ):
+            best = _best_available_candidate(entry)
+            if best is not None:
+                fallback_cfg_path = Path(best["config_path"])
+                fallback_cfg = _yaml_load(fallback_cfg_path)
+                selection_metadata = {
+                    "endpoint_entry": entry_name,
+                    "completed_experiments": completed_for_entry,
+                    "configured_budget": fallback_after,
+                    "best_summary_path": str(best["summary_path"]),
+                    "best_observed_r2": best["r2"],
+                    "direction_accuracy": best.get("direction_accuracy"),
+                    "mae_skill_vs_zero_change": best.get("mae_skill_vs_zero_change"),
+                    "automatic_activation": False,
+                }
+                print(
+                    f"R2 target was not met for {entry_name} after {completed_for_entry} "
+                    f"experiments; reproducing best available {fallback_cfg_path.name} "
+                    f"(R2={best['r2']:.6f}) as a labelled fallback package."
+                )
+                result = _run_guarded_experiment(
+                    cfg_path=fallback_cfg_path,
+                    summary_dir=summary_dir,
+                    log_dir=Path(entry["logs_dir"]),
+                    deadline=deadline,
+                    resources=resources,
+                    config=fallback_cfg,
+                    artifact_dir=Path(entry["configs_dir"]).parent / "best_available_artifacts",
+                    worthy_r2_threshold=float(manifest.get("worthy_r2_threshold", 0.6)),
+                    artifact_selection_tier="fallback_best_available",
+                    force_artifact_export=True,
+                    artifact_selection_metadata=selection_metadata,
+                )
+                started_count += 1
+                state.setdefault("runs", []).append(result)
+                if result.get("artifact_bundle"):
+                    fallback_entries[entry_name] = {
+                        **selection_metadata,
+                        "artifact_bundle": result["artifact_bundle"],
+                        "created_at": _now_iso(),
+                    }
+                    state["fallback_entries"] = fallback_entries
+                    state["updated_at"] = _now_iso()
+                    _atomic_json(session_dir / "session_state.json", state)
+                    print(
+                        f"Best-available package preserved for {entry_name}; advancing "
+                        "without treating it as a qualified candidate."
+                    )
+                    continue
+                stop_reason = f"best_available_export_failed:{entry_name}:{result.get('reason')}"
+                state["updated_at"] = _now_iso()
+                _atomic_json(session_dir / "session_state.json", state)
+                break
+
+        if run_limit and started_count >= run_limit:
+            stop_reason = f"manual_batch_limit_reached:{run_limit}"
             break
 
         cfg = _yaml_load(cfg_path)
@@ -848,13 +1070,38 @@ def run_session(
         )
         started_count += 1
         state.setdefault("runs", []).append(result)
-        if result.get("worthy_bundle") and bool(session_cfg.get("stop_entry_on_worthy_artifact", True)):
-            satisfied_entries.add(str(entry["name"]))
-            state["satisfied_entries"] = sorted(satisfied_entries)
-            print(
-                f"R2 target met for {entry['name']}; preserving {result['worthy_bundle']} "
-                "and advancing to the next endpoint."
+        if result.get("worthy_bundle"):
+            entry_qualified = list(qualified_entries.get(entry_name) or [])
+            entry_qualified.append(
+                {
+                    "config": str(cfg_path),
+                    "artifact_bundle": str(result["worthy_bundle"]),
+                    "created_at": _now_iso(),
+                }
             )
+            qualified_entries[entry_name] = entry_qualified[-20:]
+            state["qualified_entries"] = qualified_entries
+            completed_after_result = completed_for_entry + int(
+                result["status"] == SUCCESS_STATUS
+            )
+            if (
+                bool(session_cfg.get("stop_entry_on_worthy_artifact", True))
+                and completed_after_result >= minimum_before_early_stop
+            ):
+                satisfied_entries.add(entry_name)
+                state["satisfied_entries"] = sorted(satisfied_entries)
+                print(
+                    f"R2 target met for {entry_name}; preserving "
+                    f"{result['worthy_bundle']} and advancing after "
+                    f"{completed_after_result} comparison experiments."
+                )
+            else:
+                print(
+                    f"R2 target met for {entry_name}; preserving "
+                    f"{result['worthy_bundle']} but continuing until its minimum "
+                    f"comparison budget of {minimum_before_early_stop} successful "
+                    "experiments is reached."
+                )
         if result["status"] == SUCCESS_STATUS:
             durations.append(float(result["duration_seconds"]))
             state["durations_seconds"] = durations[-100:]

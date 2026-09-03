@@ -59,10 +59,14 @@ hybrid_strategy:
 signal_policy:
   enabled: true
   direction_timeframe: 7h
-  direction_timeframes: [10m, 30m, 1h, 3h, 7h, 12h, 24h]
-  select_best_direction_timeframe: true
-  confirmation_timeframes: [10m, 30m, 1h, 3h, 7h]
-  required_confirmations: 2
+  direction_timeframes: [3h, 7h, 12h, 24h]
+  select_best_direction_timeframe: false
+  direction_aggregation: weighted_ensemble
+  direction_timeframe_weights: {3h: 1.0, 7h: 1.4, 12h: 1.2, 24h: 1.0}
+  minimum_direction_timeframes: 1
+  confirmation_timeframes: [10m, 30m, 1h]
+  required_confirmations: 1
+  maximum_opposing_confirmations: 1
   min_direction_score: 0.12
   min_confirmation_score: 0.08
   minimum_coverage: 0.70
@@ -88,6 +92,8 @@ mode_b:
   poll_seconds: 300
   allow_endpoint_signals: true
   close_consensus_threshold: 0.25
+  management_consensus_threshold: 0.20
+  management_timeframe_weights: {10m: 2.4, 30m: 2.0, 1h: 1.5, 3h: 0.8, 7h: 0.4, 12h: 0.2, 24h: 0.1}
   interrupt_flag_path: reports/runtime/mode_b_interrupt.flag
   operation_limits:
     per_timeframe:
@@ -230,6 +236,7 @@ trading_job:
     minutes_before_expiry: 15
     assessment_timeout_seconds: 5.0
     min_direction_score: 0.12
+    require_entry_zone: true
     allowed_triggers: [mandatory_session]
   cleanup_closed_jobs: true
   stop_flag_path: reports/runtime/trading_job_stop.flag
@@ -258,7 +265,9 @@ autonomous_trading:
     cancel_opposed_consensus_threshold: 0.25
     entry_cross_tolerance_abs: 0.05
   followup_enabled: true
-  followup_submission_mode: market
+  followup_submission_mode: programmed
+  opportunity_scan_interval_minutes: 60
+  opportunity_order_expiration_minutes: 90
   mandatory_session_cooldown_seconds: 600
   followup_cooldown_seconds: 600
   max_followup_launches_per_session: 3

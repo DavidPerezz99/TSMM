@@ -1,0 +1,83 @@
+# Separate comparison session for XAUUSD with/without lag-safe US500 inputs.
+# It has a new session name so it cannot alter the manifest of an in-progress
+# XAUUSD baseline search.
+session_name: xauusd_us500_exogenous_all_ohlc_v3
+manual_start_only: true
+deadline_local: "05:00"
+worthy_r2_threshold: 0.6
+stop_entry_on_worthy_artifact: true
+minimum_start_window_minutes: 30
+max_records_per_experiment: 10000
+max_experiments_per_endpoint: 400
+best_available_after_experiments_per_endpoint: 160
+minimum_experiments_before_early_stop_per_endpoint: 40
+max_experiments_per_run: 0
+output_root: output/hypersearch_sessions
+
+data_source:
+  db_path: data/market_data.sqlite
+  symbol: XAUUSD
+  timeframes_minutes: [10, 30, 60, 180, 420, 720, 1440]
+
+resources:
+  max_process_ram_gb: 20.0
+  min_free_ram_before_start_gb: 6.0
+  critical_free_ram_gb: 2.0
+  cpu_threads_per_experiment: 6
+  max_estimated_experiment_minutes: 90
+
+target_profiles:
+  OPEN:
+    target_col: [OPEN]
+    input_target_sets:
+      - input_features: [OPEN, y_diff, Open_return, Price_return]
+        target_features: [y_diff, Open_return, Price_return]
+      - input_features: [OPEN, y_diff, Open_return, Price_return, US500_Price_return]
+        target_features: [y_diff, Open_return, Price_return]
+  HIGH:
+    target_col: [HIGH]
+    input_target_sets:
+      - input_features: [HIGH, y_diff, High_return, Price_return]
+        target_features: [y_diff, High_return, Price_return]
+      - input_features: [HIGH, y_diff, High_return, Price_return, US500_High_return, US500_Price_return]
+        target_features: [y_diff, High_return, Price_return]
+  LOW:
+    target_col: [LOW]
+    input_target_sets:
+      - input_features: [LOW, y_diff, Low_return, Price_return]
+        target_features: [y_diff, Low_return, Price_return]
+      - input_features: [LOW, y_diff, Low_return, Price_return, US500_Low_return, US500_Price_return]
+        target_features: [y_diff, Low_return, Price_return]
+  CLOSE:
+    target_col: [CLOSE]
+    input_target_sets:
+      - input_features: [CLOSE, y_diff, Price_return]
+        target_features: [y_diff, Price_return]
+      - input_features: [CLOSE, y_diff, Price_return, US500_Price_return]
+        target_features: [y_diff, Price_return]
+
+experiment_matrix:
+  asset: xauusd
+  base_config: config_templates/univariate.yaml
+  families: [OPEN, HIGH, LOW, CLOSE]
+  sweep_overrides:
+    data_path: [data/market_data.sqlite]
+    sql_symbol: [XAUUSD]
+    sql_source_mode: [cache]
+    cross_asset_features:
+      - enabled: true
+        db_path: data/market_data_us500.sqlite
+        symbol: US500
+        prefix: US500
+        source_mode: cache
+        max_staleness_minutes: 4320
+        minimum_coverage: 0.90
+        require_match: true
+  timeframes:
+    10m: {sweep_config: config/sweeps/sweep_10m_ohlc_return.yaml, max_experiments: 400}
+    30m: {sweep_config: config/sweeps/sweep_30m_ohlc_return.yaml, max_experiments: 400}
+    1h: {sweep_config: config/sweeps/sweep_1h_ohlc_return.yaml, max_experiments: 400}
+    3h: {sweep_config: config/sweeps/sweep_3h_ohlc_return.yaml, max_experiments: 400}
+    7h: {sweep_config: config/sweeps/sweep_7h_ohlc_return.yaml, max_experiments: 400}
+    12h: {sweep_config: config/sweeps/sweep_12h_ohlc_return.yaml, max_experiments: 400}
+    24h: {sweep_config: config/sweeps/sweep_24h_ohlc_return.yaml, max_experiments: 400}

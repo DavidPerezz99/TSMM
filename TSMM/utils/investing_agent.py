@@ -28,6 +28,7 @@ import yaml
 from .backtester import run_backtest_from_validation
 from .market_db import query_ohlc
 from .model_deployment import resolve_active_deployment
+from .data_loader import merge_cross_asset_frame
 from .trading_reporter import generate_trading_plan_report
 from .trading_quality import apply_hybrid_trade_gate, model_quality_weight
 from .iqoption_adapter import IQOptionAdapter
@@ -36,6 +37,7 @@ from .trading_signal_policy import (
     apply_volatility_protection,
     evaluate_joint_ohlc_policy,
     signal_policy_config,
+    weighted_timeframe_consensus,
 )
 
 
@@ -1432,12 +1434,22 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
         return []
 
     discovered: List[Dict[str, Any]] = []
+    deployment_root_value = str(
+        ((trading_cfg.get("model_registry") or {}).get("deployment_root") or "")
+    ).strip()
+    deployment_root = None
+    if deployment_root_value:
+        deployment_root = Path(deployment_root_value)
+        if not deployment_root.is_absolute():
+            deployment_root = (project_root / deployment_root).resolve()
     for tf in endpoint_map.keys():
         tf_label = str(tf).strip()
         if not tf_label:
             continue
         for family in target_families:
-            active_deployment = resolve_active_deployment(f"{tf_label}_{family}")
+            active_deployment = resolve_active_deployment(
+                f"{tf_label}_{family}", deployment_root=deployment_root
+            )
             if active_deployment is not None:
                 metrics = active_deployment.get("metrics") or {}
                 qualification = active_deployment.get("qualification") or {}
@@ -1458,6 +1470,11 @@ def _discover_agent_a_enrichment_candidates(trading_cfg: Dict[str, Any]) -> List
                         "validation_status": "activated_bundle",
                     }
                 )
+                continue
+            if deployment_root is not None:
+                # An asset-specific registry is a hard namespace boundary.
+                # Never substitute legacy XAUUSD Result folders when (for
+                # example) a US500 endpoint has not been activated yet.
                 continue
             tf_dir = config_root / f"{family}{tf_label}Results"
             if not tf_dir.exists() or not tf_dir.is_dir():
@@ -1615,11 +1632,28 @@ def _collect_all_model_assessment_signals(
 ) -> Dict[str, Any]:
     enrichment = _collect_agent_a_enrichment_signals(trading_cfg=trading_cfg, timeout_sec=timeout_sec)
     if bool(enrichment.get("enabled")) and int(enrichment.get("n_signals", 0) or 0) > 0:
+        mode_b_cfg = dict(trading_cfg.get("mode_b") or {})
+        management_weights = dict(
+            mode_b_cfg.get("management_timeframe_weights")
+            or {"10m": 2.4, "30m": 2.0, "1h": 1.5, "3h": 0.8, "7h": 0.4}
+        )
+        management = weighted_timeframe_consensus(
+            dict(enrichment.get("signals") or {}),
+            management_weights,
+            family_weights=(trading_cfg.get("signal_policy") or {}).get("family_weights"),
+            minimum_families=1,
+            decision_threshold=float(
+                mode_b_cfg.get("management_consensus_threshold", 0.20) or 0.20
+            ),
+        )
         return {
             "assessment_scope": "all_models",
             "signals": dict(enrichment.get("signals") or {}),
-            "consensus": str(enrichment.get("consensus") or "hold"),
-            "consensus_score": float(enrichment.get("consensus_score", 0.0) or 0.0),
+            "consensus": str(management.get("decision") or "hold"),
+            "consensus_score": float(management.get("score", 0.0) or 0.0),
+            "management_consensus_detail": management,
+            "entry_consensus": str(enrichment.get("consensus") or "hold"),
+            "entry_consensus_score": float(enrichment.get("consensus_score", 0.0) or 0.0),
             "n_signals": int(enrichment.get("n_signals", 0) or 0),
             "avg_confidence": float(enrichment.get("avg_confidence", 0.0) or 0.0),
             "source": "agent_a_enrichment",
@@ -2081,6 +2115,7 @@ def _discover_endpoint_specs(
     model_endpoints: Dict[str, Any],
     config_root: Optional[str] = None,
     config_overrides: Optional[Dict[str, str]] = None,
+    deployment_root: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
     root = str(config_root or _default_config_root())
     out: Dict[str, Dict[str, Any]] = {}
@@ -2094,10 +2129,6 @@ def _discover_endpoint_specs(
         endpoint_cfg = _normalize_endpoint_cfg(raw_endpoint_cfg)
         preferred_model = str(endpoint_cfg.get("preferred_model") or endpoint_cfg.get("model") or "").strip().lower()
         preferred_config = str(overrides.get(tf_label) or endpoint_cfg.get("config_path") or "").strip()
-        tf_dir = os.path.join(root, f"high{tf_label}Results")
-        if not os.path.isdir(tf_dir):
-            continue
-
         best: Dict[str, Any] | None = None
 
         if preferred_config:
@@ -2112,10 +2143,46 @@ def _discover_endpoint_specs(
                     "r2": _parse_r2_from_filename(pref_path),
                 }
 
+        # Asset-specific registries may intentionally have no legacy Results
+        # folders. Prefer their installed active package before filesystem
+        # discovery, using the explicit config family or HIGH as the default.
+        preferred_family = str(endpoint_cfg.get("target_col") or "high").strip().lower()
+        if best is not None:
+            try:
+                with open(best["config_path"], "r", encoding="utf-8") as stream:
+                    preferred_family = str((yaml.safe_load(stream) or {}).get("target_col") or preferred_family).lower()
+            except Exception:
+                pass
+        active_deployment = resolve_active_deployment(
+            f"{tf_label}_{preferred_family}", deployment_root=deployment_root
+        )
+        if active_deployment is not None:
+            best = {
+                "timeframe": tf_label,
+                "model": str(active_deployment.get("model") or preferred_model or "").lower(),
+                "config_path": str(active_deployment.get("config_path") or ""),
+                "model_path": str(active_deployment.get("model_path") or ""),
+                "artifacts_path": active_deployment.get("artifacts_path"),
+                "deployment_id": active_deployment.get("deployment_id"),
+                "training_data_first_index": active_deployment.get("training_data_first_index"),
+                "training_data_last_index": active_deployment.get("training_data_last_index"),
+                "r2": float(
+                    ((active_deployment.get("metrics") or {}).get("holdout_r2"))
+                    or ((active_deployment.get("qualification") or {}).get("score"))
+                    or 0.0
+                ),
+            }
+
+        if best is None and deployment_root is not None:
+            continue
+
         # An explicit endpoint config is authoritative. Otherwise select from
         # the active top1 files only, so historical runners-up and nested
         # legacy versions cannot silently replace the promoted endpoint model.
         if best is None:
+            tf_dir = os.path.join(root, f"high{tf_label}Results")
+            if not os.path.isdir(tf_dir):
+                continue
             for model_name in os.listdir(tf_dir):
                 if preferred_model and str(model_name).strip().lower() != preferred_model:
                     continue
@@ -2149,7 +2216,9 @@ def _discover_endpoint_specs(
             with open(best["config_path"], "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             family = str(cfg.get("target_col") or "HIGH").strip().lower()
-            active_deployment = resolve_active_deployment(f"{tf_label}_{family}")
+            active_deployment = resolve_active_deployment(
+                f"{tf_label}_{family}", deployment_root=deployment_root
+            )
             if active_deployment is not None:
                 best.update(
                     {
@@ -2176,6 +2245,7 @@ def _discover_endpoint_specs(
                     "target_features": list(cfg.get("target_features") or []),
                     "target_col": str(cfg.get("target_col") or "HIGH"),
                     "rolling_windows": list(cfg.get("rolling_windows") or [2, 7, 30, 60]),
+                    "cross_asset_features": cfg.get("cross_asset_features"),
                 }
             )
             out[tf_label] = best
@@ -2261,10 +2331,19 @@ def _build_endpoint_payloads(
     trading_cfg: Optional[Dict[str, Any]] = None,
     config_overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
+    deployment_root_value = str(
+        (((trading_cfg or {}).get("model_registry") or {}).get("deployment_root") or "")
+    ).strip()
+    deployment_root = None
+    if deployment_root_value:
+        deployment_root = Path(deployment_root_value)
+        if not deployment_root.is_absolute():
+            deployment_root = (Path(__file__).resolve().parents[1] / deployment_root).resolve()
     specs = _discover_endpoint_specs(
         model_endpoints,
         config_root=_default_config_root(),
         config_overrides=config_overrides,
+        deployment_root=deployment_root,
     )
     dashboard_cfg = ((trading_cfg or {}).get("dashboard") or {})
     master_path = str(dashboard_cfg.get("master_table_path") or os.path.join(Path(__file__).resolve().parents[1], "data", "market_data.sqlite"))
@@ -2292,7 +2371,51 @@ def _build_endpoint_payloads(
             payloads[tf] = {"error": f"No market data available for timeframe {tf}"}
             continue
 
-        enriched = _enrich_endpoint_features(df, target_col=str(spec.get("target_col") or "HIGH"), rolling_windows=rolling_windows)
+        merged_market = df
+        cross_sources = spec.get("cross_asset_features") or []
+        if isinstance(cross_sources, dict):
+            cross_sources = [cross_sources]
+        for source_cfg in cross_sources:
+            if not isinstance(source_cfg, dict) or not bool(source_cfg.get("enabled", True)):
+                continue
+            source_symbol = str(source_cfg.get("symbol") or "").strip().upper()
+            source_prefix = re.sub(
+                r"[^A-Z0-9_]+",
+                "_",
+                str(source_cfg.get("prefix") or source_symbol).strip().upper(),
+            ).strip("_")
+            if not any(
+                str(feature).startswith(f"{source_prefix}_")
+                for feature in (spec.get("input_features") or [])
+            ):
+                continue
+            cross_path = str(source_cfg.get("db_path") or "").strip()
+            if not cross_path:
+                payloads[tf] = {"error": f"Missing cross-asset db_path for timeframe {tf}"}
+                merged_market = pd.DataFrame()
+                break
+            if not os.path.isabs(cross_path):
+                cross_path = str((Path(__file__).resolve().parents[1] / cross_path).resolve())
+            cross_frame = _load_endpoint_market_frame(
+                master_path=cross_path,
+                timeframe_label=tf,
+                latest_records=max(latest_records * 3, 500),
+                symbol=source_symbol,
+            )
+            try:
+                merged_market, _ = merge_cross_asset_frame(
+                    merged_market,
+                    cross_frame,
+                    source_cfg,
+                    _tf_to_minutes(tf),
+                )
+            except Exception as exc:
+                payloads[tf] = {"error": f"Cross-asset merge failed for timeframe {tf}: {exc}"}
+                merged_market = pd.DataFrame()
+                break
+        if merged_market.empty:
+            continue
+        enriched = _enrich_endpoint_features(merged_market, target_col=str(spec.get("target_col") or "HIGH"), rolling_windows=rolling_windows)
         if len(enriched) < n_steps:
             payloads[tf] = {"error": f"Insufficient enriched rows for timeframe {tf}: need {n_steps}, got {len(enriched)}"}
             continue

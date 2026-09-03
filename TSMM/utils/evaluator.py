@@ -314,6 +314,9 @@ def recursive_forecast(model, scalers, initial_window, steps, model_type, n_step
     """Recursive forecasting engine for sequence models."""
     predictions = []
     current_window = initial_window.copy()
+    exogenous_defaults = _recursive_exogenous_defaults(
+        initial_window, input_features, target_features, config
+    )
     
     history_gross = []
     history_diff = []
@@ -346,7 +349,7 @@ def recursive_forecast(model, scalers, initial_window, steps, model_type, n_step
         
         new_features, last_gross, history_gross, history_diff = update_features(
             y_pred, last_gross, input_features, target_features, config, max_window,
-            history_gross, history_diff
+            history_gross, history_diff, exogenous_defaults
         )
         
         current_window = np.vstack([current_window[new_features.shape[0]:], new_features])
@@ -354,8 +357,35 @@ def recursive_forecast(model, scalers, initial_window, steps, model_type, n_step
     return np.vstack(predictions)[:steps]
 
 
+def _recursive_exogenous_defaults(
+    initial_window, input_features, target_features, config
+):
+    """Return causal future assumptions for inputs the target model cannot emit.
+
+    Cross-asset returns/differences revert to zero.  Level-like features hold
+    their last observed value.  Rolling-origin scoring does not use these
+    assumptions because every origin receives the actual preceding window.
+    """
+    window = np.asarray(initial_window, dtype=float)
+    defaults = {}
+    target_col = str(config.get('target_col') or '')
+    for index, feature in enumerate(input_features):
+        if feature in target_features or feature in {'y_diff', target_col}:
+            continue
+        if feature.startswith(('SMA_', 'EMA_', 'Volatility_')):
+            continue
+        token = str(feature).lower()
+        if token.endswith(('_return', '_diff')) or 'return' in token:
+            defaults[feature] = 0.0
+            continue
+        value = float(window[-1, index]) if window.size else 0.0
+        defaults[feature] = value if np.isfinite(value) else 0.0
+    return defaults
+
+
 def update_features(predictions, last_gross, input_features, target_features,
-                    config, max_window, history_gross, history_diff):
+                    config, max_window, history_gross, history_diff,
+                    exogenous_defaults=None):
     """Update features for recursive forecasting."""
     updated_features = []
     current_gross = last_gross
@@ -427,6 +457,8 @@ def update_features(predictions, last_gross, input_features, target_features,
             elif feat in target_features:
                 idx = target_features.index(feat)
                 feature_vector.append(pred[idx])
+            elif feat in dict(exogenous_defaults or {}):
+                feature_vector.append(float(exogenous_defaults[feat]))
             else:
                 feature_vector.append(0)
 
@@ -445,6 +477,9 @@ def recursive_forecast_svr(model, scalers, initial_window, steps, n_steps, n_fea
     """Recursive forecasting for SVR models with multi-step prediction"""
     predictions = []
     current_window = initial_window.copy()
+    exogenous_defaults = _recursive_exogenous_defaults(
+        initial_window, input_features, target_features, config
+    )
 
     history_gross = []
     history_diff = []
@@ -472,7 +507,7 @@ def recursive_forecast_svr(model, scalers, initial_window, steps, n_steps, n_fea
 
         new_features, last_gross, history_gross, history_diff = update_features(
             y_pred_2d, last_gross, input_features, target_features, config, max_window,
-            history_gross, history_diff
+            history_gross, history_diff, exogenous_defaults
         )
 
         current_window = np.vstack([current_window[len(new_features):], new_features])
@@ -486,6 +521,9 @@ def recursive_forecast_nbeats(model, scalers, initial_window, steps, n_steps, n_
     torch = _import_torch()
     predictions = []
     current_window = initial_window.copy()
+    exogenous_defaults = _recursive_exogenous_defaults(
+        initial_window, input_features, target_features, config
+    )
 
     history_gross = []
     history_diff = []
@@ -519,7 +557,7 @@ def recursive_forecast_nbeats(model, scalers, initial_window, steps, n_steps, n_
 
         new_features, last_gross, history_gross, history_diff = update_features(
             y_pred_2d, last_gross, input_features, target_features, config, max_window,
-            history_gross, history_diff
+            history_gross, history_diff, exogenous_defaults
         )
 
         current_window = np.vstack([current_window[new_features.shape[0]:], new_features])
@@ -800,19 +838,6 @@ def evaluate_models(models, df, config):
 
                 # Prepare future window (last n_steps in data)
                 X_last = df[input_features].iloc[-n_steps:].values
-
-                # Check if recursive forecasting is possible
-                exog_in_input = [f for f in input_features
-                                 if f not in ['y_diff', config['target_col']]
-                                 and not f.startswith(('SMA_', 'EMA_', 'Volatility_'))]
-                exog_in_target = [f for f in exog_in_input if f in target_features]
-                can_recursive = len(exog_in_input) == len(exog_in_target)
-
-                if test_size > m_steps and not can_recursive:
-                    raise ValueError(
-                        f"Cannot recursively forecast for {model_name} - "
-                        "exogenous features not in target_features"
-                    )
 
                 # Get predictions using recursive engine
                 evaluation_protocol = str(

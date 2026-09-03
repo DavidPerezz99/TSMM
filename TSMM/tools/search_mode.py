@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 import argparse
+import json
 
 # Add project root to path when launched as tools/search_mode.py.
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,17 @@ def parse_cli():
                    help="Bulk-search directory for reproducible bundles above the R2 gate")
     p.add_argument("--worthy-r2-threshold", type=float, default=0.6,
                    help="Persist a bundle only when primary-target R2 is strictly above this value")
+    p.add_argument(
+        "--artifact-selection-tier",
+        default="qualified_candidate",
+        choices=["qualified_candidate", "fallback_best_available"],
+    )
+    p.add_argument(
+        "--force-artifact-export",
+        action="store_true",
+        help="Persist the best finite model below the R2 threshold with fallback labelling",
+    )
+    p.add_argument("--artifact-selection-metadata-json", default=None)
     return p.parse_args()
 
 
@@ -239,16 +251,22 @@ def main():
     if is_bulk_search:
         if args.worthy_artifact_dir:
             try:
+                selection_metadata = {}
+                if args.artifact_selection_metadata_json:
+                    selection_metadata = json.loads(args.artifact_selection_metadata_json)
                 bundle_path = export_worthy_experiment_bundle(
                     models=all_model_results, evaluation=evaluation,
                     future_forecasts=future_forecasts, config=config,
                     config_path=config_path, artifact_root=args.worthy_artifact_dir,
                     r2_threshold=args.worthy_r2_threshold, logger=logger, dataframe=df,
+                    selection_tier=args.artifact_selection_tier,
+                    force_export=bool(args.force_artifact_export),
+                    selection_metadata=selection_metadata,
                 )
                 if bundle_path is None:
-                    print(f"[search_mode] R2 gate not met; no artifacts persisted (requires R2 > {args.worthy_r2_threshold})")
+                    print(f"[search_mode] Artifact gate not met; no artifacts persisted (requires R2 > {args.worthy_r2_threshold} unless explicitly exporting a labelled fallback)")
                 else:
-                    print(f"[search_mode] Worthy artifact bundle saved: {bundle_path}")
+                    print(f"[search_mode] {args.artifact_selection_tier} artifact bundle saved: {bundle_path}")
             except Exception as e:
                 logger.error(f"Error exporting worthy artifact bundle: {e}")
                 _write_failure_summary(config_path, "artifact_export", e, summary_dir)

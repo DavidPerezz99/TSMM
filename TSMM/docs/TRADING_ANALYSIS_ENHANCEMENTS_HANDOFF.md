@@ -1,8 +1,46 @@
 # TSMM Trading Analysis Enhancements Handoff
 
-For the 2026-09-02 R2 evaluation correction, bounded 28-endpoint recalibration
-campaign, initial controlled scores, and the decision not to mix stale US500
-rows into XAUUSD, see `docs/MODEL_RELIABILITY_AND_RECALIBRATION.md`.
+For the 2026-09-02 R2 evaluation correction, bounded recalibration campaigns,
+audited US500 continuation, and lag-safe cross-asset experiments, see
+`docs/MODEL_RELIABILITY_AND_RECALIBRATION.md` and
+`docs/US500_AND_CROSS_ASSET_MODELS.md`.
+
+## 2026-09-02 US500, search fallback, and opportunity-policy update
+
+- `scripts/refresh_market_assets.py` now maintains XAUUSD and an audited
+  SPY-derived US500 continuation. Raw SPY remains namespaced and every derived
+  US500 interval is recorded in `market_data_provenance`.
+- `config/inference_us500.yaml` isolates US500 deployments, inference metrics,
+  service port, and runtime output from XAUUSD.
+- The US500 and bidirectional cross-asset experiment sessions cover all 28 OHLC
+  endpoints, enforce 10,000-record/400-experiment/20-GB limits, and use
+  backward-only timestamp joins.
+- A search that does not reach R2 > 0.60 preserves the best reliable
+  rolling-origin package after its endpoint budget as
+  `fallback_best_available`. It is not automatically a champion and requires
+  explicit fallback acknowledgement to activate.
+- Agent A entry direction now uses a weighted 3h/7h/12h/24h ensemble; 10m/30m/1h
+  confirm timing. Agent B has a separate short-horizon-weighted management
+  consensus. Bounded hourly opportunity scans use programmed range entries and
+  backtest reports now expose entry rejection and pending-terminal counts.
+- Both broker profiles remain disabled. No terminal or autonomous service was
+  started as part of this update.
+
+### Offline replay evidence
+
+The final 15-trading-day replay for 2026-08-12 through 2026-09-01, using a
+$5,000 starting balance, produced 23 filled trades from 299 policy attempts:
+16 wins, 7 losses, 69.57% win rate, $14.16 net P&L, 0.283% return, 1.139 profit
+factor, and 0.964% maximum drawdown. The same period had previously produced no
+fills because conviction scaling reduced 0.01-lot plans below the broker's
+minimum. The guard now floors such a plan to exactly the minimum lot only when
+that lot still fits the monetary risk allowance.
+
+This result is graded `exploratory retrospective current-model replay`, not
+out-of-sample evidence: the current model packages lack pre-period training
+cutoffs and may have learned from some of the replayed history. Keep autonomous
+trading disabled until recalibrated packages with explicit lineage pass strict
+point-in-time or walk-forward evaluation and paper/demo validation.
 
 ## Scope
 

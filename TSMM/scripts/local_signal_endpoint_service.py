@@ -47,6 +47,22 @@ TRADING_CFG_PATH = Path(os.environ.get("TRADING_CONFIG_PATH", str(ROOT / "config
 MODEL_DIR = ROOT / "model_files"
 
 
+def _load_trading_config() -> Dict[str, Any]:
+    if not TRADING_CFG_PATH.exists():
+        return {}
+    with TRADING_CFG_PATH.open("r", encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream) or {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _deployment_root() -> Path | None:
+    value = str(((_load_trading_config().get("model_registry") or {}).get("deployment_root") or "")).strip()
+    if not value:
+        return None
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+
+
 class PredictPayload(BaseModel):
     rows: List[Dict[str, Any]]
     timeframe: str | None = None
@@ -133,12 +149,13 @@ def _resolve_model_paths(spec: Dict[str, Any]) -> Tuple[Path | None, Path | None
 
 
 def _load_specs() -> Dict[str, Dict[str, Any]]:
-    if not TRADING_CFG_PATH.exists():
-        return {}
-    with TRADING_CFG_PATH.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = _load_trading_config()
     endpoints = (cfg.get("model_endpoints") or {})
-    return _discover_endpoint_specs(endpoints, config_root=str(ROOT / "config"))
+    return _discover_endpoint_specs(
+        endpoints,
+        config_root=str(ROOT / "config"),
+        deployment_root=_deployment_root(),
+    )
 
 
 def _load_spec_from_config(timeframe: str, config_path: str, fallback: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -160,6 +177,9 @@ def _load_spec_from_config(timeframe: str, config_path: str, fallback: Dict[str,
                 "target_features": list(cfg.get("target_features") or spec.get("target_features") or []),
                 "target_col": str(cfg.get("target_col") or spec.get("target_col") or "HIGH"),
                 "rolling_windows": list(cfg.get("rolling_windows") or spec.get("rolling_windows") or [2, 7, 30, 60]),
+                "cross_asset_features": cfg.get(
+                    "cross_asset_features", spec.get("cross_asset_features")
+                ),
             }
         )
     return spec
@@ -185,7 +205,9 @@ def _apply_active_deployment(spec: Dict[str, Any]) -> Dict[str, Any]:
     family = _resolve_target_slug(spec)
     if not timeframe:
         return spec
-    deployment = resolve_active_deployment(f"{timeframe}_{family}")
+    deployment = resolve_active_deployment(
+        f"{timeframe}_{family}", deployment_root=_deployment_root()
+    )
     if deployment is None:
         return spec
     deployed = _load_spec_from_config(
@@ -380,6 +402,7 @@ def health() -> Dict[str, Any]:
         "torch_available": torch is not None,
         "torch_import_error": _TORCH_IMPORT_ERROR,
         "loaded_timeframes": sorted(list(DEFAULT_LOADED.keys())),
+        "deployment_root": str(_deployment_root() or (ROOT / "model_files" / "deployments")),
         "cached_models": len(LOADED_CACHE),
         "loaded_models": {
             tf: {

@@ -6,10 +6,31 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 
 from models.multivariate_models import multiVrecurrent_LR
-from utils.evaluator import _forecast_metrics, _rolling_origin_predictions
+from utils.evaluator import (
+    _forecast_metrics,
+    _recursive_exogenous_defaults,
+    _rolling_origin_predictions,
+)
 
 
 class ForecastEvaluationReliabilityTests(unittest.TestCase):
+    def test_recursive_cross_asset_assumptions_are_causal_and_feature_aware(self):
+        window = np.asarray(
+            [
+                [100.0, 1.0, 5000.0, 2.5],
+                [101.0, 1.0, 5010.0, -1.5],
+            ]
+        )
+        defaults = _recursive_exogenous_defaults(
+            window,
+            ["HIGH", "y_diff", "US500_CLOSE", "US500_Price_return"],
+            ["y_diff"],
+            {"target_col": "HIGH"},
+        )
+
+        self.assertEqual(defaults["US500_CLOSE"], 5010.0)
+        self.assertEqual(defaults["US500_Price_return"], 0.0)
+
     def test_rolling_origin_uses_actual_preceding_windows(self):
         frame = pd.DataFrame(
             {

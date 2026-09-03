@@ -62,6 +62,15 @@ python tools/experiment_session.py prepare-data --config config/experiment_sessi
 python tools/experiment_session.py capacity --config config/experiment_sessions/xauusd_nightly.yaml
 python tools/experiment_session.py run --config config/experiment_sessions/xauusd_nightly.yaml
 python tools/experiment_session.py status --config config/experiment_sessions/xauusd_nightly.yaml
+
+# Refresh both configured assets, or one asset only
+python scripts/refresh_market_assets.py
+python scripts/refresh_market_assets.py --asset us500
+
+# US500 and bidirectional cross-asset searches
+python tools/experiment_session.py plan --config config/experiment_sessions/us500_nightly.yaml
+python tools/experiment_session.py run --config config/experiment_sessions/us500_nightly.yaml --max-experiments 10
+python tools/experiment_session.py run --config config/experiment_sessions/xauusd_us500_exogenous_nightly.yaml --max-experiments 10
 ```
 
 ## Documentation
@@ -74,6 +83,7 @@ python tools/experiment_session.py status --config config/experiment_sessions/xa
 - [Trading-analysis enhancement handoff](docs/TRADING_ANALYSIS_ENHANCEMENTS_HANDOFF.md)
 - [Joint OHLC trading signal policy](docs/TRADING_SIGNAL_POLICY.md)
 - [Model reliability and bounded recalibration](docs/MODEL_RELIABILITY_AND_RECALIBRATION.md)
+- [US500 and cross-asset modeling](docs/US500_AND_CROSS_ASSET_MODELS.md)
 
 Delayed stop-loss protection introduced by the trading-analysis branch remains
 disabled by default. Review the enhancement handoff before changing that

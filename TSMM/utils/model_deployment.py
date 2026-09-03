@@ -320,6 +320,9 @@ def deployment_model_spec(deployment: Dict[str, Any]) -> Dict[str, Any]:
         "target_features": [str(value) for value in (config.get("target_features") or ["y_diff"])],
         "target_col": str(config.get("target_col") or deployment.get("family") or "HIGH").upper(),
         "rolling_windows": [int(value) for value in (config.get("rolling_windows") or [2, 7, 30, 60])],
+        "cross_asset_features": config.get("cross_asset_features"),
+        "sql_symbol": config.get("sql_symbol"),
+        "data_path": config.get("data_path"),
     }
 
 

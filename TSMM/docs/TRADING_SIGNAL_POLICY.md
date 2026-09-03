@@ -6,13 +6,14 @@ true, live Agent A and the historical replay use the same decision policy:
 
 1. Qualified HIGH and LOW models are the primary direction/range families.
    CLOSE has a small supporting weight and OPEN has zero trading weight.
-2. TSMM scores 10m, 30m, 1h, 3h, 7h, 12h, and 24h candidates using current
-   endpoint confidence and model-quality weight, then uses the strongest
-   non-neutral HIGH/LOW timeframe as the direction anchor. This means a strong
-   10m model can lead while a stale or weak 7h model cannot retain authority by
-   configuration alone.
-3. The remaining configured timeframes independently confirm entry timing. The
-   default policy requires two supporting timeframes to agree.
+2. TSMM builds the entry direction from a quality/confidence-weighted ensemble
+   of 3h, 7h, 12h, and 24h HIGH/LOW forecasts. The 7h vote has the largest
+   default weight, but no fixed timeframe can override the rest merely by
+   configuration.
+3. The 10m, 30m, and 1h families independently confirm entry timing. The
+   default policy requires one short-horizon confirmation and permits at most
+   one strong opposition, allowing useful timing without letting one noisy
+   short model determine the broader side.
    Models below the configured R2 floor have zero voting power; refreshed R2
    takes precedence over the historical selection score when it is available.
    Legacy scores that have not yet passed the new rolling-origin protocol retain
@@ -30,14 +31,27 @@ true, live Agent A and the historical replay use the same decision policy:
 7. A programmed order that remains unfilled near expiry may become a market
    order only for configured triggers. TSMM re-runs all model assessments,
    requires the joint policy to still support the original side, confirms the
+   market is still inside the side's configured range-entry zone, confirms the
    pending order was cancelled, and runs the normal account/prop-firm guard
    before submitting the market order.
+8. While a session has no open or pending TSMM operation, bounded opportunity
+   scans re-evaluate the whole policy every 60 minutes. A passing follow-up is
+   submitted as a range-priced programmed order, not an unconditional market
+   order. Session, position, drawdown, daily-loss, and weekly-loss limits still
+   cap activity. Reports count every rejection reason and unfilled/cancelled
+   terminal reason so low activity can be diagnosed rather than guessed.
+   When conviction requests a fraction of the broker's minimum lot, account
+   sizing may lift it to exactly one minimum lot only if that lot still fits the
+   configured monetary risk allowance. It continues to fail closed when the
+   minimum lot itself would exceed the allowance.
 
 The policy can abstain. Requiring one broker order regardless of model quality
 would defeat the confirmation and risk controls; `mandatory_session` means an
 analysis attempt is mandatory, not that a weak signal must become a trade.
 
-Agent B now respects the trailing enable flag for both stop and target changes.
+Agent B uses a separate management consensus weighted toward 10m, 30m, and 1h,
+while Agent A keeps the longer entry-direction ensemble. Agent B respects the
+trailing enable flag for both stop and target changes.
 When enabled, its ratchet uses the larger of the configured price gap and an ATR
 gap, never loosens an existing stop, moves defensive protection beyond entry by
 the estimated round-trip cost after sufficient favorable movement, and extends

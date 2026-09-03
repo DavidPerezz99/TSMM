@@ -356,3 +356,27 @@ Config keys for symbol selection:
 - `dashboard.master_table_path`: SQLite DB path for the runtime/profile.
 - `dashboard.sql_symbol`: symbol namespace used when reading from SQLite.
 - `config/config.yaml -> sql_symbol`: app-level symbol for status/snapshot queries.
+
+Refresh and rebuild the configured US500 caches:
+
+```powershell
+.venv\Scripts\python.exe scripts\refresh_market_assets.py --asset us500
+```
+
+US500 model packages live under `model_files/deployments/us500`, separate from
+XAUUSD. Install a qualified bundle and promote it through the normal challenger
+workflow. To deliberately activate a labelled below-threshold fallback:
+
+```powershell
+.venv\Scripts\python.exe tools\model_registry.py --asset us500 activate `
+  --endpoint 10m_high `
+  --bundle C:\path\to\fallback_bundle `
+  --allow-fallback
+```
+
+Start the separate US500 inference service only after packages are activated:
+
+```powershell
+$env:TRADING_CONFIG_PATH="config/inference_us500.yaml"
+.venv\Scripts\python.exe -m uvicorn scripts.local_signal_endpoint_service:app --host 127.0.0.1 --port 8010
+```

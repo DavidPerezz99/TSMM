@@ -1,0 +1,43 @@
+# US500 inference-only runtime. It intentionally uses a separate deployment
+# registry and port so XAUUSD and US500 packages cannot overwrite each other.
+asset: US500
+model_registry:
+  deployment_root: model_files/deployments/us500
+
+model_endpoints:
+  10m: {url: "http://127.0.0.1:8010/predict/10m", target_col: HIGH}
+  30m: {url: "http://127.0.0.1:8010/predict/30m", target_col: HIGH}
+  1h: {url: "http://127.0.0.1:8010/predict/1h", target_col: HIGH}
+  3h: {url: "http://127.0.0.1:8010/predict/3h", target_col: HIGH}
+  7h: {url: "http://127.0.0.1:8010/predict/7h", target_col: HIGH}
+  12h: {url: "http://127.0.0.1:8010/predict/12h", target_col: HIGH}
+  24h: {url: "http://127.0.0.1:8010/predict/24h", target_col: HIGH}
+
+execution:
+  symbol: US500
+
+runtime:
+  root_dir: reports/runtime/us500
+
+dashboard:
+  master_table_path: data/market_data_us500.sqlite
+  sql_symbol: US500
+  tiingo_provider: tiingo_iex_proxy
+  tiingo_symbol: SPY
+  tiingo_rate: 1min
+  tiingo_token_env: TIINGO_API_TOKEN
+  tiingo_token_envs: [TIINGO_API_TOKEN, TIINGO_API_TOKEN_ALT]
+
+endpoint_lifecycle:
+  on_demand_start: false
+  service_script: scripts/local_signal_endpoint_service.py
+  host: 127.0.0.1
+  port: 8010
+
+inference_performance:
+  enabled: true
+  database_path: reports/runtime/us500/full_horizon_metrics.sqlite
+  rolling_window_samples: 100
+  min_samples: 10
+  forecast_retention_days: 180
+  snapshot_retention_days: 365

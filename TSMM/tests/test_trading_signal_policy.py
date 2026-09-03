@@ -12,6 +12,7 @@ from utils.trading_signal_policy import (
     all_training_cutoffs_precede,
     apply_volatility_protection,
     evaluate_joint_ohlc_policy,
+    weighted_timeframe_consensus,
 )
 
 
@@ -126,6 +127,42 @@ class TradingSignalPolicyTests(unittest.TestCase):
 
         self.assertEqual(result["selected_direction_timeframe"], "10m")
         self.assertTrue(result["projected_range"]["available"])
+
+    def test_weighted_long_horizon_ensemble_cannot_be_replaced_by_10m_vote(self):
+        bundle = _bundle(confirmation_signals=(-1, 1, 1))
+        for timeframe in ("3h", "12h", "24h"):
+            for family in ("high", "low", "close", "open"):
+                bundle["signals"][f"{family}:{timeframe}"] = {
+                    "signal": 1,
+                    "confidence": 0.8,
+                    "forecast_price": 102.0 if family == "high" else (98.0 if family == "low" else None),
+                }
+        config = _policy_config(required_confirmations=1)
+        config["signal_policy"].update(
+            {
+                "direction_timeframes": ["3h", "7h", "12h", "24h"],
+                "direction_aggregation": "weighted_ensemble",
+                "direction_timeframe_weights": {"3h": 1.0, "7h": 1.4, "12h": 1.2, "24h": 1.0},
+                "confirmation_timeframes": ["10m", "30m", "1h"],
+                "maximum_opposing_confirmations": 1,
+            }
+        )
+
+        result = evaluate_joint_ohlc_policy(bundle, config, market_price=100.0)
+
+        self.assertEqual(result["decision"], "buy")
+        self.assertNotEqual(result["selected_direction_timeframe"], "10m")
+        self.assertEqual(result["direction_ensemble"]["decision"], "buy")
+
+    def test_management_consensus_can_prioritize_short_timeframes(self):
+        bundle = _bundle(confirmation_signals=(-1, -1, -1))
+        management = weighted_timeframe_consensus(
+            bundle["signals"],
+            {"10m": 2.4, "30m": 2.0, "1h": 1.5, "7h": 0.2},
+            family_weights={"high": 0.45, "low": 0.45, "close": 0.1, "open": 0.0},
+            decision_threshold=0.2,
+        )
+        self.assertEqual(management["decision"], "sell")
 
     def test_unqualified_high_low_cannot_set_entry_range(self):
         bundle = _bundle()

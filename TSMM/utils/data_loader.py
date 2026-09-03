@@ -9,6 +9,7 @@ import yaml
 import logging
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -16,6 +17,168 @@ from utils.market_db import query_ohlc
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _cross_asset_sources(config):
+    raw = (config or {}).get('cross_asset_features')
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        return [raw] if bool(raw.get('enabled', True)) else []
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict) and bool(item.get('enabled', True))]
+    raise ValueError("cross_asset_features must be a mapping or list of mappings")
+
+
+def merge_cross_asset_frame(target_frame, exogenous_frame, source_cfg, timeframe_minutes):
+    """Attach prefixed OHLC features using a backward-only as-of merge."""
+    target = target_frame.copy()
+    exogenous = exogenous_frame.copy()
+    if 'DATE' not in target.columns or 'DATE' not in exogenous.columns:
+        raise ValueError("Cross-asset merge requires DATE in both frames")
+    source_symbol = str(source_cfg.get('symbol') or '').strip().upper()
+    prefix = str(source_cfg.get('prefix') or source_symbol).strip().upper()
+    prefix = re.sub(r'[^A-Z0-9_]+', '_', prefix).strip('_')
+    if not prefix:
+        raise ValueError("cross_asset_features.prefix resolved to an empty value")
+    max_staleness = max(
+        int(source_cfg.get('max_staleness_minutes', timeframe_minutes) or 0),
+        0,
+    )
+    target['DATE'] = pd.to_datetime(target['DATE'], errors='coerce')
+    exogenous['DATE'] = pd.to_datetime(exogenous['DATE'], errors='coerce')
+    target = target.dropna(subset=['DATE']).sort_values('DATE')
+    exogenous = exogenous.dropna(subset=['DATE']).sort_values('DATE')
+    for column in ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']:
+        if column not in exogenous.columns:
+            exogenous[column] = 0.0 if column == 'VOLUME' else float('nan')
+        exogenous[column] = pd.to_numeric(exogenous[column], errors='coerce')
+        exogenous[f'{prefix}_{column}'] = exogenous[column]
+    exogenous[f'{prefix}_Price_return'] = exogenous['CLOSE'].diff()
+    exogenous[f'{prefix}_Open_return'] = exogenous['OPEN'].diff()
+    exogenous[f'{prefix}_High_return'] = exogenous['HIGH'].diff()
+    exogenous[f'{prefix}_Low_return'] = exogenous['LOW'].diff()
+    feature_columns = [
+        f'{prefix}_OPEN', f'{prefix}_HIGH', f'{prefix}_LOW',
+        f'{prefix}_CLOSE', f'{prefix}_VOLUME',
+        f'{prefix}_Price_return', f'{prefix}_Open_return',
+        f'{prefix}_High_return', f'{prefix}_Low_return',
+    ]
+    source_date_column = f'__{prefix}_SOURCE_DATE'
+    exogenous[source_date_column] = exogenous['DATE']
+    merged = pd.merge_asof(
+        target,
+        exogenous[[source_date_column] + feature_columns],
+        left_on='DATE',
+        right_on=source_date_column,
+        direction='backward',
+        allow_exact_matches=True,
+        tolerance=pd.Timedelta(minutes=max_staleness),
+    )
+    matched = merged[source_date_column].notna()
+    coverage = float(matched.mean()) if len(merged) else 0.0
+    minimum_coverage = float(source_cfg.get('minimum_coverage', 0.0) or 0.0)
+    if coverage < minimum_coverage:
+        raise ValueError(
+            f"Cross-asset coverage for {source_symbol} is {coverage:.2%}, "
+            f"below {minimum_coverage:.2%}"
+        )
+    if bool(source_cfg.get('require_match', True)):
+        merged = merged[matched].copy()
+    source_age_minutes = (
+        (merged['DATE'] - merged[source_date_column]).dt.total_seconds() / 60.0
+    )
+    stale = source_age_minutes > 0.0
+    for column in (
+        f'{prefix}_Price_return',
+        f'{prefix}_Open_return',
+        f'{prefix}_High_return',
+        f'{prefix}_Low_return',
+    ):
+        merged.loc[stale, column] = 0.0
+    merged[f'{prefix}_AGE_MINUTES'] = source_age_minutes
+    merged = merged.drop(columns=[source_date_column])
+    return merged.sort_values('DATE').reset_index(drop=True), coverage
+
+
+def _merge_cross_asset_features(df, config, timeframe_minutes):
+    """Merge only same/past exogenous candles with a bounded staleness rule."""
+    sources = _cross_asset_sources(config)
+    if not sources or df is None or df.empty:
+        return df
+
+    target = df.copy().sort_index()
+    if not isinstance(target.index, pd.DatetimeIndex):
+        target.index = pd.to_datetime(target.index, errors='coerce')
+    target = target[~target.index.isna()].sort_index()
+    target_name = target.index.name or str(config.get('date_col') or 'DATE')
+
+    for source_cfg in sources:
+        source_symbol = str(source_cfg.get('symbol') or '').strip().upper()
+        if not source_symbol:
+            raise ValueError("cross_asset_features.symbol is required")
+        prefix = str(source_cfg.get('prefix') or source_symbol).strip().upper()
+        prefix = re.sub(r'[^A-Z0-9_]+', '_', prefix).strip('_')
+        requested_features = {
+            str(value) for value in (config.get('input_features') or []) if str(value)
+        }
+        if not any(feature.startswith(f'{prefix}_') for feature in requested_features):
+            # A sweep can compare baseline and cross-asset recipes in the same
+            # session.  Do not silently restrict the baseline recipe to the
+            # exogenous asset's trading hours when it consumes no such column.
+            continue
+        source_path = _resolve_repo_path(
+            str(source_cfg.get('db_path') or config.get('data_path') or '').strip()
+        )
+        if not source_path.lower().endswith(('.db', '.sqlite')):
+            raise ValueError("cross_asset_features.db_path must be a SQLite database")
+        max_staleness = max(
+            int(source_cfg.get('max_staleness_minutes', timeframe_minutes) or 0),
+            0,
+        )
+        source_mode = str(source_cfg.get('source_mode') or 'auto').strip().lower()
+        start = target.index.min() - pd.Timedelta(minutes=max_staleness)
+        end = target.index.max()
+        span_records = int(
+            math.ceil(
+                max((end - start).total_seconds(), 0.0)
+                / (max(int(timeframe_minutes), 1) * 60.0)
+            )
+        ) + 5
+        exogenous = query_ohlc(
+            db_path=source_path,
+            timeframe_minutes=int(max(timeframe_minutes, 1)),
+            latest_records=max(int(len(target) * 3), span_records, 500),
+            start_date=start.strftime('%Y-%m-%d %H:%M:%S'),
+            end_date=end.strftime('%Y-%m-%d %H:%M:%S'),
+            symbol=source_symbol,
+            source_mode=source_mode,
+        )
+        if exogenous is None or exogenous.empty:
+            raise ValueError(
+                f"No cross-asset rows returned for {source_symbol} from {source_path}"
+            )
+        left = target.reset_index()
+        date_column = left.columns[0]
+        left = left.rename(columns={date_column: 'DATE'}).sort_values('DATE')
+        merged, coverage = merge_cross_asset_frame(
+            left,
+            exogenous,
+            source_cfg,
+            timeframe_minutes,
+        )
+        target = merged.set_index('DATE').sort_index()
+        target.index.name = target_name
+        logging.info(
+            "Merged cross-asset features. symbol=%s prefix=%s rows=%s coverage=%.4f "
+            "direction=backward max_staleness_minutes=%s",
+            source_symbol,
+            prefix,
+            len(target),
+            coverage,
+            max_staleness,
+        )
+    return target
 
 
 def _resolve_repo_path(path_value: str) -> str:
@@ -115,6 +278,10 @@ def load_data(data_path, date_col, target_col, config):
                 return max(value * 10080, 1)
             return int(max(fallback, 1))
 
+        timeframe_minutes = int(config.get('data_timeframe_minutes', 0) or 0)
+        if timeframe_minutes <= 0:
+            timeframe_minutes = _infer_timeframe_minutes(data_path_str, fallback=1)
+
         should_use_sql = False
         sql_source_path = data_path_str
         if data_path_str.lower().endswith('.db') or data_path_str.lower().endswith('.sqlite'):
@@ -126,9 +293,6 @@ def load_data(data_path, date_col, target_col, config):
             sql_source_path = sql_master_path
 
         if should_use_sql:
-            timeframe_minutes = int(config.get('data_timeframe_minutes', 0) or 0)
-            if timeframe_minutes <= 0:
-                timeframe_minutes = _infer_timeframe_minutes(data_path_str, fallback=1)
             sql_symbol = str(
                 config.get('sql_symbol')
                 or config.get('symbol')
@@ -191,6 +355,8 @@ def load_data(data_path, date_col, target_col, config):
         df.set_index(date_col, inplace=True)
         df.index = pd.DatetimeIndex(df.index)
         df.sort_index(inplace=True)
+
+        df = _merge_cross_asset_features(df, config, timeframe_minutes)
         
         logging.info("Adding engineered features")
         # Use CLOSE.diff() for Price_return to match inference pipeline

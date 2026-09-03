@@ -96,10 +96,16 @@ def export_worthy_experiment_bundle(
     *, models: Dict[str, Any], evaluation: Dict[str, Any],
     future_forecasts: Dict[str, Any], config: Dict[str, Any], config_path: str,
     artifact_root: str, r2_threshold: float, logger: Any, dataframe: Any = None,
+    selection_tier: str = "qualified_candidate",
+    force_export: bool = False,
+    selection_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
-    """Persist a bundle only when the best primary-target R2 is above the gate."""
+    """Persist a qualified or explicitly labelled best-available bundle."""
     model_name, r2_score = best_r2_model(evaluation)
-    if model_name is None or r2_score is None or r2_score <= float(r2_threshold):
+    if model_name is None or r2_score is None:
+        return None
+    threshold_passed = r2_score > float(r2_threshold)
+    if not force_export and not threshold_passed:
         return None
 
     metrics = dict(((evaluation or {}).get(model_name) or {}).get("metrics") or {})
@@ -115,15 +121,21 @@ def export_worthy_experiment_bundle(
         return None
     if required_protocol and str(metrics.get("evaluation_protocol") or "") != required_protocol:
         return None
-    if float(metrics.get("MAE_skill_vs_zero_change", float("-inf"))) < minimum_skill:
+    baseline_passed = float(metrics.get("MAE_skill_vs_zero_change", float("-inf"))) >= minimum_skill
+    if not force_export and not baseline_passed:
         return None
+
+    tier = str(selection_tier or "qualified_candidate").strip().lower()
+    if force_export and tier == "qualified_candidate":
+        tier = "fallback_best_available"
 
     root = Path(artifact_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     created_at = datetime.now(timezone.utc)
     score_slug = f"{r2_score:.6f}".replace("-", "neg_").replace(".", "_")
+    tier_slug = "fallback__" if tier != "qualified_candidate" else ""
     bundle_name = (
-        f"{Path(config_path).stem}__{model_name}__r2_{score_slug}__"
+        f"{Path(config_path).stem}__{tier_slug}{model_name}__r2_{score_slug}__"
         f"{created_at.strftime('%Y%m%dT%H%M%SZ')}"
     )
     # Keep the temporary path short enough for Windows runtimes that still
@@ -186,10 +198,14 @@ def export_worthy_experiment_bundle(
             "qualification": {
                 "metric": "R2", "model": model_name, "score": r2_score,
                 "operator": ">", "threshold": float(r2_threshold),
+                "selection_tier": tier,
+                "qualified_candidate": bool(threshold_passed and baseline_passed),
+                "forced_best_available_export": bool(force_export),
                 "sample_count": metrics.get("sample_count"),
                 "evaluation_protocol": metrics.get("evaluation_protocol"),
                 "mae_skill_vs_zero_change": metrics.get("MAE_skill_vs_zero_change"),
                 "requirements": qualification_cfg,
+                "selection_metadata": dict(selection_metadata or {}),
             },
             "code": {"git_commit": _git_revision(project_root), "python": sys.version,
                      "platform": platform.platform()},

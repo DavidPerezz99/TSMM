@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 import yaml
 
-from tools.experiment_session import _entry_source, _materialize_session, build_session_plan
+from tools.experiment_session import (
+    _best_available_candidate,
+    _entry_source,
+    _materialize_session,
+    build_session_plan,
+)
 from tools.hypersearch import (
     build_nbeats_variants,
     build_sweep_plan,
@@ -185,6 +190,45 @@ class HypersearchPlanningTests(unittest.TestCase):
             all(config["input_features"][0] == "CLOSE" for config in configs)
         )
 
+    def test_us500_matrix_covers_every_ohlc_endpoint_with_bounded_searches(self):
+        session = self._yaml("config/experiment_sessions/us500_nightly.yaml")
+        plan = build_session_plan(session)
+        self.assertEqual(len(plan["entries"]), 28)
+        self.assertTrue(all(entry["plan"]["unique_experiments"] <= 400 for entry in plan["entries"]))
+        self.assertEqual({entry["target_col"] for entry in plan["entries"]}, {"OPEN", "HIGH", "LOW", "CLOSE"})
+
+    def test_best_available_candidate_uses_reliable_rolling_r2(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            configs = root / "configs"
+            summaries = root / "summaries"
+            configs.mkdir()
+            summaries.mkdir()
+            for index, score in enumerate((0.12, 0.44), 1):
+                config_path = configs / f"cfg_{index:05d}.yaml"
+                config_path.write_text("records: 1000\n", encoding="utf-8")
+                (summaries / f"cfg_{index:05d}__summary.json").write_text(
+                    json.dumps(
+                        {
+                            "config_path": str(config_path),
+                            "status": "SUCCESS",
+                            "metric": {
+                                "nbeats": {
+                                    "R2": score,
+                                    "sample_count": 120,
+                                    "evaluation_protocol": "rolling_origin_one_step",
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            selected = _best_available_candidate(
+                {"configs_dir": str(configs), "summaries_dir": str(summaries)}
+            )
+            self.assertAlmostEqual(selected["r2"], 0.44)
+            self.assertEqual(Path(selected["config_path"]).name, "cfg_00002.yaml")
+
     def test_session_materialization_is_stable_for_resume(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -223,6 +267,7 @@ class HypersearchPlanningTests(unittest.TestCase):
                 "session_name": "resume_test",
                 "manual_start_only": True,
                 "output_root": str(root / "output"),
+                "minimum_experiments_before_early_stop_per_endpoint": 40,
                 "resources": {"max_process_ram_gb": 20, "max_estimated_experiment_minutes": 90},
                 "experiments": [
                     {
@@ -239,6 +284,10 @@ class HypersearchPlanningTests(unittest.TestCase):
             second = _materialize_session(session_path, session, plan)
             self.assertEqual(first, second)
             self.assertEqual(first["total_experiments"], 1)
+            self.assertEqual(
+                first["minimum_experiments_before_early_stop_per_endpoint"],
+                40,
+            )
             configs = list(Path(first["entries"][0]["configs_dir"]).glob("cfg_*.yaml"))
             self.assertEqual(len(configs), 1)
 
@@ -305,6 +354,30 @@ class HypersearchPlanningTests(unittest.TestCase):
             self.assertTrue((accepted / "experiment_config.yaml").exists())
             manifest = json.loads((accepted / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["qualification"]["operator"], ">")
+
+            fallback = export_worthy_experiment_bundle(
+                evaluation={
+                    "nbeats": {
+                        "metrics": {
+                            "MAE": 1.0,
+                            "R2": 0.41,
+                            "sample_count": 120,
+                            "evaluation_protocol": "rolling_origin_one_step",
+                        }
+                    }
+                },
+                selection_tier="fallback_best_available",
+                force_export=True,
+                **common,
+            )
+            fallback_manifest = json.loads(
+                (fallback / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(fallback_manifest["qualification"]["qualified_candidate"])
+            self.assertEqual(
+                fallback_manifest["qualification"]["selection_tier"],
+                "fallback_best_available",
+            )
 
 
 if __name__ == "__main__":

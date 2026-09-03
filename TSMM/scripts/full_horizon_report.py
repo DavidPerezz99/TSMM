@@ -37,10 +37,11 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-STATUS_PATH = ROOT / "reports" / "runtime" / "full_horizon_report_status.json"
 
 import joblib
 from utils.market_db import query_ohlc
+from utils.data_loader import merge_cross_asset_frame
+from utils.equity_data import refresh_us500_proxy
 from utils.investing_agent import _enrich_endpoint_features, _latest_inference_window, _tf_to_minutes
 from utils.inference_performance import InferencePerformanceStore
 from utils.live_data import bootstrap_master_on_backend_start, resolve_tiingo_token_candidates
@@ -64,6 +65,36 @@ def _load_trading_config() -> dict:
         return {}
     with cfg_path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
+
+
+def _runtime_root(trading_cfg: dict) -> Path:
+    return _resolve_root_path(
+        str((trading_cfg.get("runtime") or {}).get("root_dir") or "reports/runtime")
+    )
+
+
+def _market_source_settings(trading_cfg: dict) -> tuple[Path, str]:
+    dashboard_cfg = trading_cfg.get("dashboard") or {}
+    path = _resolve_root_path(
+        str(
+            dashboard_cfg.get("master_table_path")
+            or dashboard_cfg.get("raw_data_path")
+            or "data/market_data.sqlite"
+        )
+    )
+    symbol = str(
+        dashboard_cfg.get("sql_symbol")
+        or (trading_cfg.get("execution") or {}).get("symbol")
+        or "XAUUSD"
+    ).strip().upper()
+    return path, symbol
+
+
+def _deployment_root(trading_cfg: dict) -> Path | None:
+    value = str(
+        (trading_cfg.get("model_registry") or {}).get("deployment_root") or ""
+    ).strip()
+    return _resolve_root_path(value) if value else None
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -92,17 +123,36 @@ def _refresh_market_source() -> dict:
     if not resolve_tiingo_token_candidates(token_env=token_env, token_envs=token_envs, token=token):
         return {"ok": False, "skipped": True, "reason": "missing_tiingo_token", "master_path": str(master_path)}
 
-    result = bootstrap_master_on_backend_start(
-        master_table_path=str(master_path),
-        rate=str(dashboard_cfg.get("tiingo_rate") or "1min"),
-        symbol=str(dashboard_cfg.get("tiingo_symbol") or "xauusd"),
-        token=token,
-        max_pulls=1,
-        freshness_lag_minutes=int(dashboard_cfg.get("startup_freshness_lag_minutes", 20) or 20),
-        token_env=token_env,
-        token_envs=token_envs,
-        token_rotation_state_path=str(dashboard_cfg.get("tiingo_token_rotation_state_path") or "") or None,
-    )
+    provider = str(dashboard_cfg.get("tiingo_provider") or "tiingo_fx").strip().lower()
+    if provider == "tiingo_iex_proxy":
+        result = refresh_us500_proxy(
+            db_path=str(master_path),
+            source_ticker=str(dashboard_cfg.get("tiingo_symbol") or "SPY"),
+            target_symbol=str(
+                dashboard_cfg.get("sql_symbol")
+                or (trading_cfg.get("execution") or {}).get("symbol")
+                or "US500"
+            ),
+            rate=str(dashboard_cfg.get("tiingo_rate") or "1min"),
+            token=token,
+            token_env=token_env,
+            token_envs=token_envs,
+            token_rotation_state_path=str(
+                dashboard_cfg.get("tiingo_token_rotation_state_path") or ""
+            ) or None,
+        )
+    else:
+        result = bootstrap_master_on_backend_start(
+            master_table_path=str(master_path),
+            rate=str(dashboard_cfg.get("tiingo_rate") or "1min"),
+            symbol=str(dashboard_cfg.get("tiingo_symbol") or "xauusd"),
+            token=token,
+            max_pulls=1,
+            freshness_lag_minutes=int(dashboard_cfg.get("startup_freshness_lag_minutes", 20) or 20),
+            token_env=token_env,
+            token_envs=token_envs,
+            token_rotation_state_path=str(dashboard_cfg.get("tiingo_token_rotation_state_path") or "") or None,
+        )
     result["master_path"] = str(master_path)
     return result
 
@@ -207,6 +257,7 @@ def _load_training_r2_map() -> dict:
 def _load_model_and_predict(
     cfg_path: Path, family: str, timeframe: str, model_name: str,
     deployment: dict | None = None,
+    trading_cfg: dict | None = None,
 ) -> tuple[list[float] | None, float | None, dict, str | None]:
     """Return the latest horizon, dynamic confidence, inference metadata, and error."""
     with open(cfg_path) as f:
@@ -222,12 +273,41 @@ def _load_model_and_predict(
 
     # Load market data for inference
     tf_minutes = _tf_to_minutes(timeframe)
-    db_path = str(ROOT / "data" / "market_data.sqlite")
+    resolved_trading_cfg = trading_cfg or _load_trading_config()
+    market_path, market_symbol = _market_source_settings(resolved_trading_cfg)
+    db_path = str(market_path)
     latest_records = max(n_steps + max(rolling_windows) + 5, 200)
 
-    df = query_ohlc(db_path, tf_minutes, latest_records=latest_records, symbol="XAUUSD")
+    df = query_ohlc(db_path, tf_minutes, latest_records=latest_records, symbol=market_symbol)
     if df is None or df.empty:
         return None, None, {}, "no_market_data"
+
+    raw_cross_sources = cfg.get("cross_asset_features") or []
+    if isinstance(raw_cross_sources, dict):
+        raw_cross_sources = [raw_cross_sources]
+    for source_cfg in raw_cross_sources:
+        if not isinstance(source_cfg, dict) or not bool(source_cfg.get("enabled", True)):
+            continue
+        source_symbol = str(source_cfg.get("symbol") or "").strip().upper()
+        source_prefix = re.sub(
+            r"[^A-Z0-9_]+",
+            "_",
+            str(source_cfg.get("prefix") or source_symbol).strip().upper(),
+        ).strip("_")
+        if not any(str(feature).startswith(f"{source_prefix}_") for feature in input_features):
+            continue
+        source_path = _resolve_root_path(str(source_cfg.get("db_path") or ""))
+        cross_frame = query_ohlc(
+            str(source_path),
+            tf_minutes,
+            latest_records=max(latest_records * 3, 500),
+            symbol=source_symbol,
+            source_mode=str(source_cfg.get("source_mode") or "auto"),
+        )
+        try:
+            df, _ = merge_cross_asset_frame(df, cross_frame, source_cfg, tf_minutes)
+        except Exception as exc:
+            return None, None, {}, f"cross_asset_merge_failed:{exc}"
 
     enriched = _enrich_endpoint_features(df, target_col=target_col, rolling_windows=rolling_windows)
     if len(enriched) < n_steps:
@@ -353,8 +433,9 @@ def _load_model_and_predict(
         return None, None, {}, str(e)
 
 
-def _latest_source_data_timestamp() -> str | None:
-    frame = query_ohlc(str(ROOT / "data" / "market_data.sqlite"), 1, latest_records=1, symbol="XAUUSD")
+def _latest_source_data_timestamp(trading_cfg: dict | None = None) -> str | None:
+    market_path, market_symbol = _market_source_settings(trading_cfg or _load_trading_config())
+    frame = query_ohlc(str(market_path), 1, latest_records=1, symbol=market_symbol)
     if frame is None or frame.empty:
         return None
     return pd.to_datetime(frame.iloc[-1]["DATE"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -374,8 +455,12 @@ def main() -> int:
     args = parse_args()
     report_started_at = _utc_iso()
     trading_cfg = _load_trading_config()
+    runtime_root = _runtime_root(trading_cfg)
+    status_path = runtime_root / "full_horizon_report_status.json"
+    deployment_root = _deployment_root(trading_cfg)
+    market_path, market_symbol = _market_source_settings(trading_cfg)
     _write_json_atomic(
-        STATUS_PATH,
+        status_path,
         {"ok": True, "status": "running", "started_at_utc": report_started_at, "pid": os.getpid()},
     )
     refresh_result = {"ok": True, "skipped": True, "reason": "cli_skip_market_refresh"}
@@ -384,7 +469,7 @@ def main() -> int:
             refresh_result = _refresh_market_source()
         except Exception as exc:
             refresh_result = {"ok": False, "error": str(exc)}
-    source_data_as_of = _latest_source_data_timestamp()
+    source_data_as_of = _latest_source_data_timestamp(trading_cfg)
     families = ["high", "low", "open", "close"]
     timeframes = ["10m", "30m", "1h", "3h", "7h", "12h", "24h"]
     models_by_tf = {
@@ -409,11 +494,17 @@ def main() -> int:
         results[tf] = {}
 
         for family in families:
-            deployment = resolve_active_deployment(f"{tf}_{family}")
+            deployment = resolve_active_deployment(
+                f"{tf}_{family}", deployment_root=deployment_root
+            )
             model_name = str((deployment or {}).get("model") or selected_model(tf, family)).lower()
             if deployment is not None:
                 cfg_path = Path(str(deployment["config_path"]))
             else:
+                if deployment_root is not None:
+                    results[tf][family] = {"error": "no_active_asset_deployment"}
+                    errors.append(f"{tf}/{family}: no active package in {deployment_root}")
+                    continue
                 cfg_dir = ROOT / "config" / f"{family}{tf}Results" / model_name
                 if not cfg_dir.exists():
                     results[tf][family] = {"error": "config_dir_not_found"}
@@ -435,7 +526,12 @@ def main() -> int:
                 cfg_path = cands[0]
 
             pred, confidence, inference_meta, err = _load_model_and_predict(
-                cfg_path, family, tf, model_name, deployment=deployment
+                cfg_path,
+                family,
+                tf,
+                model_name,
+                deployment=deployment,
+                trading_cfg=trading_cfg,
             )
             if err:
                 results[tf][family] = {"error": err}
@@ -497,9 +593,9 @@ def main() -> int:
                         )
             inserted = store.record_forecasts(forecast_rows)
             matured = store.mature_pending(
-                market_db_path=str(_resolve_root_path("data/market_data.sqlite")),
+                market_db_path=str(market_path),
                 source_data_as_of_utc=str(source_data_as_of or ""),
-                symbol="XAUUSD",
+                symbol=market_symbol,
             )
             window_samples = max(int(performance_cfg.get("rolling_window_samples", 100) or 100), 2)
             min_samples = max(int(performance_cfg.get("min_samples", 10) or 10), 2)
@@ -588,7 +684,7 @@ def main() -> int:
             print(f"  - {e}")
 
     # Save to JSON
-    out_path = ROOT / "reports" / "runtime" / "full_horizon_predictions.json"
+    out_path = runtime_root / "full_horizon_predictions.json"
     output = dict(results)
     output["_meta"] = {
         "schema_version": 2,
@@ -604,7 +700,7 @@ def main() -> int:
     }
     _write_json_atomic(out_path, output)
     _write_json_atomic(
-        STATUS_PATH,
+        status_path,
         {
             "ok": True,
             "status": "completed",
@@ -626,8 +722,11 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as exc:
+        failure_status_path = (
+            _runtime_root(_load_trading_config()) / "full_horizon_report_status.json"
+        )
         _write_json_atomic(
-            STATUS_PATH,
+            failure_status_path,
             {"ok": False, "status": "failed", "failed_at_utc": _utc_iso(), "error": str(exc)},
         )
         raise

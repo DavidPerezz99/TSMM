@@ -4998,7 +4998,14 @@ def run_listener(trading_config_path: Path) -> int:
                     session_capacity = _autonomous_capacity_limit(trading_cfg)
                     session_active_jobs = _session_active_job_count(session_states)
                     mandatory_cooldown_seconds = max(int(autonomy_cfg.get("mandatory_session_cooldown_seconds", autonomy_interval_sec) or autonomy_interval_sec), autonomy_interval_sec)
-                    followup_cooldown_seconds = max(int(autonomy_cfg.get("followup_cooldown_seconds", autonomy_interval_sec) or autonomy_interval_sec), autonomy_interval_sec)
+                    opportunity_scan_seconds = max(
+                        int(autonomy_cfg.get("opportunity_scan_interval_minutes", 60) or 60) * 60,
+                        autonomy_interval_sec,
+                    )
+                    followup_cooldown_seconds = max(
+                        int(autonomy_cfg.get("followup_cooldown_seconds", autonomy_interval_sec) or autonomy_interval_sec),
+                        opportunity_scan_seconds,
+                    )
                     max_followup_launches = max(int(autonomy_cfg.get("max_followup_launches_per_session", session_capacity) or session_capacity), 1)
                     max_filtered_followups = max(int(autonomy_cfg.get("max_filtered_followups_per_session", max_followup_launches) or max_followup_launches), 1)
                     mandatory_ready = _seconds_since(session_stats.get("last_mandatory_started_at"), current_utc) >= float(mandatory_cooldown_seconds)
@@ -5047,9 +5054,9 @@ def run_listener(trading_config_path: Path) -> int:
                         and int(session_stats.get("followup_launches") or 0) < max_followup_launches
                         and int(session_stats.get("filtered_followups") or 0) < max_filtered_followups
                     ):
-                        followup_mode = str(autonomy_cfg.get("followup_submission_mode") or "market").strip().lower()
+                        followup_mode = str(autonomy_cfg.get("followup_submission_mode") or "programmed").strip().lower()
                         if followup_mode not in {"programmed", "market"}:
-                            followup_mode = "market"
+                            followup_mode = "programmed"
                         launch_out = _launch_autonomous_trading_start(
                             trading_cfg=trading_cfg,
                             trading_config_path=trading_config_path,

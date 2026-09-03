@@ -27,6 +27,16 @@ Bulk runs keep each confidence discriminator inside its candidate artifact
 package; they no longer write experimental discriminators into the active
 global model directory.
 
+If an endpoint reaches its configured search budget without crossing 0.60,
+TSMM ranks only successful rolling-origin runs with at least 60 samples,
+reproduces the best finite-R2 run, and exports it as
+`fallback_best_available`. The bundle manifest keeps its true score and says
+`qualified_candidate: false`; it is never silently promoted as a champion.
+This prevents a long search from losing its best reproducible result while
+preserving the difference between "best seen" and "good enough." A fallback
+requires an explicit `model_registry activate --allow-fallback` action before
+the trading runtime can use it.
+
 ## Resource boundaries
 
 `config/experiment_sessions/xauusd_nightly.yaml` enforces the current machine
@@ -40,9 +50,17 @@ policy:
 - manual start and resumable state;
 - a local 05:00 hard stop.
 
-The current plan contains 28 XAUUSD OHLC endpoints and 8,748 possible
+The current baseline plan contains 28 XAUUSD OHLC endpoints and 8,748 possible
 experiments. Each endpoint stops early as soon as a qualifying bundle is found.
 The large total is therefore a ceiling, not the expected executed count.
+
+US500 and XAUUSD/US500 comparison sessions are also bounded to 10,000 records,
+400 experiments per endpoint, and preserve the best available package after
+160 unsuccessful qualified-candidate attempts. They run at least 40 successful
+experiments per endpoint before early stopping so baseline and cross-asset
+recipes are both sampled. Their compact matrices produce
+28 endpoints and 5,832 planned configurations each; resolving an endpoint early
+marks its remaining configurations as intentionally skipped in progress output.
 
 Preview and resume the campaign from the repository root:
 
@@ -76,21 +94,21 @@ range information. The first 36 10m HIGH runs peaked at R2 0.54745, so no 10m
 HIGH candidate was promoted yet. The session state is resumable and retains all
 completed configurations.
 
-## US500 exogenous-data decision
+## US500 exogenous-data implementation
 
-The SQLite schema already supports namespaced US500 tables. However, the US500
-database currently ends at `2026-04-30 23:58:00`, while XAUUSD reaches September
-2026. It must not be forward-filled across that four-month gap or joined using
-future timestamps. US500 is therefore not enabled as an XAUUSD exogenous input
-yet.
+`scripts/refresh_market_assets.py` maintains both databases. Tiingo IEX SPY
+minutes are stored under their own `SPY` symbol and can continue the broker-like
+US500 series only after a robust overlap ratio passes dispersion and seam-jump
+limits. Every derived US500 interval is recorded in
+`market_data_provenance`; the raw and derived namespaces are never confused.
+Once a proxy continuation exists, later refreshes continue to calibrate against
+the immutable native overlap rather than against previously derived prices.
 
-Before enabling it:
-
-1. refresh US500 from a supported provider without a manually scaled SPY proxy;
-2. verify timestamp, timezone, market-hours, duplicate, and missing-gap quality;
-3. join with a backward-only as-of rule and a strict staleness tolerance;
-4. compare the same XAUUSD sweep with and without US500 on identical holdouts;
-5. keep the exogenous version only if walk-forward and after-cost results improve.
+Cross-asset recipes use an exact or bounded backward-only as-of join. Baseline
+recipes skip the cross source entirely, so they retain their full trading-day
+history. Compare baseline and exogenous variants on the same rolling holdout;
+retain the exogenous version only when its model and after-cost strategy metrics
+improve. See `US500_AND_CROSS_ASSET_MODELS.md` for commands and deployment paths.
 
 The notebook `XAU_USD_hourly_prices_DL.ipynb` is useful as historical provenance,
 but it contains duplicated exploratory cells, failed provider calls, and an

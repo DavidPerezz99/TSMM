@@ -1667,16 +1667,28 @@ def _prop_firm_guard_preflight(
         if not one_lot.get("ok") or float(one_lot.get("estimated_loss", 0.0) or 0.0) <= 0.0:
             return {"ok": False, "enabled": True, "reason": "account_sizing_loss_estimate_failed", "sizing": sizing}
         risk_sized_volume = allowance / float(one_lot["estimated_loss"])
-        raw_volume = min(risk_sized_volume, effective_volume) if effective_volume > 0.0 else risk_sized_volume
         volume_min = max(float(symbol_spec.get("volume_min", 0.0) or 0.0), 0.0)
-        volume_max = max(float(symbol_spec.get("volume_max", raw_volume) or raw_volume), 0.0)
         volume_step = max(float(symbol_spec.get("volume_step", volume_min) or volume_min), 1e-12)
+        requested_broker_volume = effective_volume
+        minimum_volume_floor_applied = (
+            0.0 < requested_broker_volume < volume_min
+            and risk_sized_volume >= volume_min
+        )
+        if minimum_volume_floor_applied:
+            requested_broker_volume = volume_min
+        raw_volume = (
+            min(risk_sized_volume, requested_broker_volume)
+            if requested_broker_volume > 0.0
+            else risk_sized_volume
+        )
+        volume_max = max(float(symbol_spec.get("volume_max", raw_volume) or raw_volume), 0.0)
         stepped_volume = int((min(raw_volume, volume_max) + 1e-12) / volume_step) * volume_step
         precision = max(0, min(8, len(f"{volume_step:.8f}".rstrip("0").split(".")[-1])))
         effective_volume = round(stepped_volume, precision)
         sizing.update({"equity": equity, "risk_pct": risk_pct, "risk_allowance": allowance,
                        "risk_sized_volume": risk_sized_volume, "raw_volume": raw_volume,
-                       "effective_volume": effective_volume})
+                       "effective_volume": effective_volume,
+                       "minimum_volume_floor_applied": minimum_volume_floor_applied})
         if effective_volume < volume_min or effective_volume <= 0.0:
             return {"ok": False, "enabled": True, "reason": "minimum_broker_volume_exceeds_risk_budget", "sizing": sizing}
 
@@ -2847,15 +2859,30 @@ def _find_symbol_tsmm_exposure(
     }
 
 
-def _programmed_order_expiration_minutes(trading_cfg: Dict[str, Any]) -> int:
+def _programmed_order_expiration_minutes(
+    trading_cfg: Dict[str, Any],
+    autonomous_trigger: str = "",
+) -> int:
     tj = (trading_cfg.get("trading_job") or {})
+    trigger = str(autonomous_trigger or "").strip().lower()
+    if trigger == "autonomous_followup":
+        autonomy = dict(trading_cfg.get("autonomous_trading") or {})
+        raw_minutes = autonomy.get("opportunity_order_expiration_minutes")
+        if raw_minutes is not None:
+            return max(int(raw_minutes or 1), 1)
     raw_minutes = tj.get("programmed_order_expiration_minutes", tj.get("max_wait_fill_minutes", 420))
     return max(int(raw_minutes or 1), 1)
 
 
-def _programmed_order_expiration_utc(trading_cfg: Dict[str, Any], now_utc: Optional[datetime] = None) -> datetime:
+def _programmed_order_expiration_utc(
+    trading_cfg: Dict[str, Any],
+    now_utc: Optional[datetime] = None,
+    autonomous_trigger: str = "",
+) -> datetime:
     base_now = now_utc or _now_utc()
-    return base_now + timedelta(minutes=_programmed_order_expiration_minutes(trading_cfg))
+    return base_now + timedelta(
+        minutes=_programmed_order_expiration_minutes(trading_cfg, autonomous_trigger)
+    )
 
 
 def _timeframe_to_minutes(raw_timeframe: Any) -> Optional[int]:
@@ -5377,11 +5404,8 @@ def start_trading_job(
 
     agent_cfg = (trading_cfg.get("agent") or {})
     channels = agent_cfg.get("approval_channels", ["popup", "terminal"])
-    tj = (trading_cfg.get("trading_job") or {})
     policy = _approval_policy(trading_cfg)
 
-    wait_fill_sec = int(tj.get("fill_check_seconds", 30) or 30)
-    max_wait_fill_minutes = int(tj.get("max_wait_fill_minutes", 420) or 420)
     request_ctx = dict(request_context or {})
     effective_submission_mode = str(request_ctx.get("effective_submission_mode") or submission_mode_override or "").strip().lower()
     if effective_submission_mode:
@@ -5789,7 +5813,10 @@ def start_trading_job(
         submission_mode=submission_mode,
     )
     deadline_a = _now_utc() + timedelta(seconds=int(policy.get("normal_timeout_seconds", 7200)))
-    programmed_expiration_minutes = _programmed_order_expiration_minutes(trading_cfg)
+    programmed_expiration_minutes = _programmed_order_expiration_minutes(
+        trading_cfg,
+        autonomous_trigger,
+    )
     order_label = "market MT5 order" if submission_mode == "market" else "programmed MT5 order"
     bypass_suffix = "" if submission_mode == "market" else f" If accepted as a programmed order, it will use the configured pending-order expiry window of {programmed_expiration_minutes} minutes."
     approval_suffix = "" if submission_mode == "market" else f" If MT5 accepts it as pending, the order will use the configured expiry window of {programmed_expiration_minutes} minutes."
@@ -5968,7 +5995,12 @@ def _execute_approved_order(
     resolved_job_id = str(state.get("job_id") or "").strip()
     tj = (trading_cfg.get("trading_job") or {})
     wait_fill_sec = int(tj.get("fill_check_seconds", 30) or 30)
-    max_wait_fill_minutes = int(tj.get("max_wait_fill_minutes", 420) or 420)
+    request_ctx = dict(state.get("request_context") or {})
+    autonomous_trigger = str(request_ctx.get("autonomous_trigger") or "").strip().lower()
+    max_wait_fill_minutes = _programmed_order_expiration_minutes(
+        trading_cfg,
+        autonomous_trigger,
+    )
     submission_mode = str(state.get("order_submission_mode") or _agent_a_order_submission_mode(plan, trading_cfg))
 
     shadow_cfg = dict(trading_cfg.get("shadow_mode") or {})
@@ -6238,7 +6270,10 @@ def _execute_approved_order(
                             "stack_policy": stack_policy,
                         }
 
-                programmed_order_expiration_utc = _programmed_order_expiration_utc(trading_cfg)
+                programmed_order_expiration_utc = _programmed_order_expiration_utc(
+                    trading_cfg,
+                    autonomous_trigger=autonomous_trigger,
+                )
                 state["programmed_order_expiration_utc"] = _iso(programmed_order_expiration_utc)
                 return _place_programmed_order(
                     adapter,
@@ -6406,7 +6441,12 @@ def resume_trading_job(
                     state_file=state_file,
                     order_res=order_res,
                     wait_fill_sec=int(((trading_cfg.get("trading_job") or {}).get("fill_check_seconds", 30) or 30)),
-                    max_wait_fill_minutes=int(((trading_cfg.get("trading_job") or {}).get("max_wait_fill_minutes", 420) or 420)),
+                    max_wait_fill_minutes=_programmed_order_expiration_minutes(
+                        trading_cfg,
+                        str(
+                            ((state.get("request_context") or {}).get("autonomous_trigger") or "")
+                        ).strip().lower(),
+                    ),
                 )
             finally:
                 adapter.shutdown()

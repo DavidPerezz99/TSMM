@@ -134,6 +134,22 @@ class ModelDeploymentTests(unittest.TestCase):
             )
             self.assertTrue(Path(deployment["model_path"]).is_file())
 
+    def test_asset_specific_registry_never_falls_back_to_xau_legacy_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "config" / "high10mResults" / "nbeats" / "top1_09999.yaml"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                yaml.safe_dump({"target_col": "HIGH", "n_steps": 10}),
+                encoding="utf-8",
+            )
+            specs = _discover_endpoint_specs(
+                {"10m": {"url": "http://localhost:8010/predict/10m"}},
+                config_root=str(root / "config"),
+                deployment_root=root / "deployments" / "us500",
+            )
+            self.assertEqual(specs, {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,8 +14,10 @@ distinction explicit.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 import json
 import math
 import os
@@ -31,6 +33,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from utils.data_loader import merge_cross_asset_frame
 from utils.investing_agent import _discover_agent_a_enrichment_candidates
 from utils.market_db import master_table_name
 from utils.model_deployment import deployment_model_spec
@@ -40,6 +43,7 @@ from utils.trading_signal_policy import (
     apply_volatility_protection,
     evaluate_joint_ohlc_policy,
     signal_policy_config,
+    weighted_timeframe_consensus,
 )
 
 
@@ -240,7 +244,7 @@ def _load_market_minutes(
     if path.suffix.lower() in {".sqlite", ".db"}:
         table = master_table_name(symbol)
         uri = f"file:{path.as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True) as connection:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
             frame = pd.read_sql_query(
                 f"""
                 SELECT DATE, OPEN, HIGH, LOW, CLOSE, VOLUME
@@ -383,6 +387,7 @@ def discover_replay_model_specs(trading_cfg: Dict[str, Any], project_root: Path 
                 "target_features": [str(value) for value in (config.get("target_features") or ["y_diff"])],
                 "target_col": str(config.get("target_col") or str(candidate.get("family") or "HIGH")).upper(),
                 "rolling_windows": [int(value) for value in (config.get("rolling_windows") or [2, 7, 30, 60])],
+                "cross_asset_features": config.get("cross_asset_features"),
             }
         )
     return specs
@@ -660,11 +665,13 @@ class ReplaySignalEngine:
         specs: List[Dict[str, Any]],
         provider: Any,
         trading_cfg: Dict[str, Any],
+        exogenous_tapes: Optional[Dict[tuple[str, str], AsOfMarketTape]] = None,
     ):
         self.tape = tape
         self.specs = list(specs)
         self.provider = provider
         self.trading_cfg = trading_cfg
+        self.exogenous_tapes = dict(exogenous_tapes or {})
         self.interpretation = str(((trading_cfg.get("agent") or {}).get("signal_interpretation") or "momentum")).lower()
         worker_count = max(int(os.environ.get("TSMM_BACKTEST_INFERENCE_WORKERS", "4") or 4), 1)
         self._executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="tsmm-backtest-model")
@@ -675,8 +682,8 @@ class ReplaySignalEngine:
     def evaluate(self, as_of: pd.Timestamp) -> Dict[str, Any]:
         signals: Dict[str, Dict[str, Any]] = {}
         by_timeframe: Dict[str, pd.DataFrame] = {}
-        by_family_frame: Dict[tuple[str, str], pd.DataFrame] = {}
-        prepared: List[tuple[Dict[str, Any], str, str, str, List[Dict[str, Any]]]] = []
+        by_family_frame: Dict[tuple[str, str, str], pd.DataFrame] = {}
+        prepared: List[tuple[Dict[str, Any], str, str, str, List[Dict[str, Any]], Optional[float]]] = []
         for spec in self.specs:
             if hasattr(self.provider, "spec_for"):
                 spec = self.provider.spec_for(spec, as_of)
@@ -687,11 +694,50 @@ class ReplaySignalEngine:
                 if timeframe not in by_timeframe:
                     max_rows = max(int(spec.get("n_steps", 1)) + max(spec.get("rolling_windows") or [1]) + 5, 200)
                     by_timeframe[timeframe] = self.tape.timeframe_as_of(timeframe, as_of, max_rows=max_rows)
-                family_key = (timeframe, family)
+                raw_cross_sources = spec.get("cross_asset_features") or []
+                if isinstance(raw_cross_sources, dict):
+                    raw_cross_sources = [raw_cross_sources]
+                cross_sources = [
+                    dict(value) for value in raw_cross_sources
+                    if isinstance(value, dict) and bool(value.get("enabled", True))
+                ]
+                input_features = [str(value) for value in (spec.get("input_features") or [])]
+                cross_sources = [
+                    value for value in cross_sources
+                    if any(
+                        feature.startswith(
+                            f"{str(value.get('prefix') or value.get('symbol') or '').strip().upper()}_"
+                        )
+                        for feature in input_features
+                    )
+                ]
+                cross_key = json.dumps(cross_sources, sort_keys=True, default=str)
+                family_key = (timeframe, family, cross_key)
                 if family_key not in by_family_frame:
-                    input_features = [str(value) for value in (spec.get("input_features") or [])]
+                    source_frame = by_timeframe[timeframe]
+                    for source_cfg in cross_sources:
+                        source_symbol = str(source_cfg.get("symbol") or "").strip().upper()
+                        source_path = Path(str(source_cfg.get("db_path") or ""))
+                        if not source_path.is_absolute():
+                            source_path = (PROJECT_ROOT / source_path).resolve()
+                        source_tape = self.exogenous_tapes.get((str(source_path), source_symbol))
+                        if source_tape is None:
+                            raise ValueError(
+                                f"cross-asset replay tape unavailable: {source_symbol} at {source_path}"
+                            )
+                        exogenous_frame = source_tape.timeframe_as_of(
+                            timeframe,
+                            as_of,
+                            max_rows=max(len(source_frame) * 3, 500),
+                        )
+                        source_frame, _ = merge_cross_asset_frame(
+                            source_frame,
+                            exogenous_frame,
+                            source_cfg,
+                            _timeframe_minutes(timeframe),
+                        )
                     by_family_frame[family_key] = _enrich_features(
-                        by_timeframe[timeframe],
+                        source_frame,
                         str(spec.get("target_col") or family).upper(),
                         list(spec.get("rolling_windows") or [2, 7, 30, 60]),
                         required_features=input_features,
@@ -709,7 +755,11 @@ class ReplaySignalEngine:
                         if column != "DATE":
                             item[column] = float(record[column])
                     rows.append(item)
-                prepared.append((spec, key, family, timeframe, rows))
+                reference_price = (
+                    float(enriched.iloc[-1][str(spec.get("target_col") or family).upper()])
+                    if not enriched.empty else None
+                )
+                prepared.append((spec, key, family, timeframe, rows, reference_price))
             except Exception as exc:
                 signals[key] = {
                     "family": family,
@@ -721,12 +771,12 @@ class ReplaySignalEngine:
                     "error": str(exc),
                 }
 
-        def _predict(item: tuple[Dict[str, Any], str, str, str, List[Dict[str, Any]]]) -> tuple[Any, ...]:
-            spec, key, family, timeframe, rows = item
+        def _predict(item: tuple[Dict[str, Any], str, str, str, List[Dict[str, Any]], Optional[float]]) -> tuple[Any, ...]:
+            spec, key, family, timeframe, rows, reference_price = item
             try:
-                return spec, key, family, timeframe, self.provider.predict(spec, rows), None
+                return spec, key, family, timeframe, reference_price, self.provider.predict(spec, rows), None
             except Exception as exc:
-                return spec, key, family, timeframe, None, str(exc)
+                return spec, key, family, timeframe, reference_price, None, str(exc)
 
         weighted = 0.0
         total_weight = 0.0
@@ -734,7 +784,7 @@ class ReplaySignalEngine:
         quality_cfg = dict(self.trading_cfg.get("model_quality") or {})
         minimum_r2 = float(quality_cfg.get("minimum_r2_for_vote", 0.0) or 0.0)
         legacy_static_discount = float(quality_cfg.get("legacy_static_score_discount", 0.35) or 0.0)
-        for spec, key, family, timeframe, prediction, prediction_error in self._executor.map(_predict, prepared):
+        for spec, key, family, timeframe, reference_price, prediction, prediction_error in self._executor.map(_predict, prepared):
             if prediction_error:
                 signals[key] = {
                     "family": family,
@@ -770,14 +820,11 @@ class ReplaySignalEngine:
                     "quality": quality,
                     "forecast_sign": prediction.get("forecast_sign"),
                     "reference_price": (
-                        float(by_family_frame[(timeframe, family)].iloc[-1][str(spec.get("target_col") or family).upper()])
-                        if not by_family_frame[(timeframe, family)].empty
-                        else None
+                        reference_price
                     ),
                     "forecast_price": (
-                        float(by_family_frame[(timeframe, family)].iloc[-1][str(spec.get("target_col") or family).upper()])
-                        + float(prediction.get("forecast_sign", 0.0) or 0.0)
-                        if not by_family_frame[(timeframe, family)].empty
+                        float(reference_price) + float(prediction.get("forecast_sign", 0.0) or 0.0)
+                        if reference_price is not None
                         else None
                     ),
                     "feature_horizons": prediction.get("feature_horizons") or {},
@@ -802,11 +849,23 @@ class ReplaySignalEngine:
 
         score = weighted / total_weight if total_weight > 0 else 0.0
         consensus = "buy" if score > 0.1 else ("sell" if score < -0.1 else "hold")
+        mode_b_cfg = dict(self.trading_cfg.get("mode_b") or {})
+        management_weights = dict(mode_b_cfg.get("management_timeframe_weights") or TIMEFRAME_WEIGHTS)
+        management = weighted_timeframe_consensus(
+            signals,
+            management_weights,
+            family_weights=(self.trading_cfg.get("signal_policy") or {}).get("family_weights"),
+            minimum_families=1,
+            decision_threshold=float(mode_b_cfg.get("management_consensus_threshold", 0.20) or 0.20),
+        )
         usable = [signal for signal in signals.values() if not signal.get("error")]
         return {
             "as_of_utc": pd.Timestamp(as_of).strftime("%Y-%m-%d %H:%M:%S"),
             "consensus": consensus,
             "consensus_score": float(score),
+            "management_consensus": management.get("decision"),
+            "management_consensus_score": management.get("score"),
+            "management_consensus_detail": management,
             "avg_confidence": float(np.mean([float(value.get("confidence", 0.5)) for value in usable])) if usable else 0.0,
             "n_signals": len(signals),
             "n_usable": len(usable),
@@ -957,6 +1016,8 @@ def _build_plan(
         raw_volume = allowance / loss_per_lot if loss_per_lot > 0.0 else 0.0
         volume_step = float(sizing_cfg.get("simulation_volume_step", 0.01) or 0.01)
         volume_min = float(sizing_cfg.get("simulation_volume_min", 0.01) or 0.01)
+        if 0.0 < requested_volume < volume_min and raw_volume >= volume_min:
+            requested_volume = volume_min
         sized_volume = int((raw_volume + 1e-12) / volume_step) * volume_step
         volume = min(requested_volume, round(sized_volume, 8))
         if volume < volume_min:
@@ -1043,6 +1104,7 @@ def _report_markdown(summary: Dict[str, Any]) -> str:
     overall = summary.get("overall") or {}
     validity = summary.get("validity") or {}
     diagnostics = summary.get("path_diagnostics") or {}
+    entry_diagnostics = summary.get("entry_diagnostics") or {}
     lines = [
         "# TSMM Trading Strategy Evaluation",
         "",
@@ -1114,6 +1176,19 @@ def _report_markdown(summary: Dict[str, Any]) -> str:
             f"| Losing trades with negligible MFE | {int(diagnostics.get('losers_with_negligible_mfe', 0))} |",
         ]
     )
+    lines.extend(
+        [
+            "",
+            "## Entry decision diagnostics",
+            "",
+            "| Decision or terminal reason | Count |",
+            "|---|---:|",
+        ]
+    )
+    diagnostic_reasons = Counter(entry_diagnostics.get("attempt_reasons") or {})
+    diagnostic_reasons.update(entry_diagnostics.get("pending_terminal_reasons") or {})
+    for reason, count in diagnostic_reasons.most_common():
+        lines.append(f"| {reason} | {int(count)} |")
     lines.extend(
         [
             "",
@@ -1204,8 +1279,50 @@ def run_historical_strategy_backtest(
     volatility_timeframe = str((policy_cfg.get("volatility") or {}).get("timeframe") or "10m")
     timeframes = sorted(set([str(spec.get("timeframe") or "") for spec in replay_specs] + [volatility_timeframe]))
     tape = AsOfMarketTape(minutes, timeframes)
+    exogenous_requirements: Dict[tuple[str, str], set[str]] = {}
+    for spec in replay_specs:
+        raw_sources = spec.get("cross_asset_features") or []
+        if isinstance(raw_sources, dict):
+            raw_sources = [raw_sources]
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, dict) or not bool(raw_source.get("enabled", True)):
+                continue
+            source_symbol = str(raw_source.get("symbol") or "").strip().upper()
+            source_prefix = str(raw_source.get("prefix") or source_symbol).strip().upper()
+            if not any(
+                str(feature).startswith(f"{source_prefix}_")
+                for feature in (spec.get("input_features") or [])
+            ):
+                continue
+            source_path_value = str(raw_source.get("db_path") or "").strip()
+            if not source_symbol or not source_path_value:
+                continue
+            source_path = Path(source_path_value)
+            if not source_path.is_absolute():
+                source_path = (PROJECT_ROOT / source_path).resolve()
+            exogenous_requirements.setdefault((str(source_path), source_symbol), set()).add(
+                str(spec.get("timeframe") or "")
+            )
+    exogenous_tapes: Dict[tuple[str, str], AsOfMarketTape] = {}
+    for (source_path, source_symbol), source_timeframes in exogenous_requirements.items():
+        source_minutes = _load_market_minutes(
+            source_path,
+            source_symbol,
+            warmup_start,
+            end,
+        )
+        exogenous_tapes[(source_path, source_symbol)] = AsOfMarketTape(
+            source_minutes,
+            source_timeframes,
+        )
     signal_provider = provider or FrozenModelSignalProvider(replay_specs)
-    engine = ReplaySignalEngine(tape, replay_specs, signal_provider, trading_cfg)
+    engine = ReplaySignalEngine(
+        tape,
+        replay_specs,
+        signal_provider,
+        trading_cfg,
+        exogenous_tapes=exogenous_tapes,
+    )
     provider_manifest = signal_provider.manifest() if hasattr(signal_provider, "manifest") else []
     explicit_point_in_time_safe = (
         bool(signal_provider.point_in_time_safe(start))
@@ -1242,6 +1359,7 @@ def run_historical_strategy_backtest(
     fallback_enabled = bool(fallback_cfg.get("enabled", False))
     fallback_lead_minutes = max(int(fallback_cfg.get("minutes_before_expiry", 15) or 15), 0)
     fallback_min_score = abs(float(fallback_cfg.get("min_direction_score", 0.12) or 0.12))
+    fallback_require_entry_zone = bool(fallback_cfg.get("require_entry_zone", False))
     fallback_allowed_triggers = {
         str(value).strip().lower()
         for value in (fallback_cfg.get("allowed_triggers") or ["mandatory_session"])
@@ -1260,6 +1378,22 @@ def run_historical_strategy_backtest(
     max_followups = int(autonomy.get("max_followup_launches_per_session", session_capacity) or session_capacity)
     followup_cooldown = int(autonomy.get("followup_cooldown_seconds", 600) or 600)
     followup_enabled = bool(autonomy.get("followup_enabled", True))
+    opportunity_scan_minutes = max(
+        int(autonomy.get("opportunity_scan_interval_minutes", 60) or 60),
+        tick_minutes,
+    )
+    followup_submission_mode = str(
+        autonomy.get("followup_submission_mode") or "programmed"
+    ).strip().lower()
+    if followup_submission_mode not in {"market", "programmed"}:
+        followup_submission_mode = "programmed"
+    opportunity_expiration_minutes = max(
+        int(autonomy.get("opportunity_order_expiration_minutes", expiration_minutes) or expiration_minutes),
+        tick_minutes,
+    )
+    max_filtered_followups = max(
+        int(autonomy.get("max_filtered_followups_per_session", 6) or 6), 0
+    )
 
     local_zone = ZoneInfo(timezone_name)
     pending: List[Dict[str, Any]] = []
@@ -1389,7 +1523,14 @@ def run_historical_strategy_backtest(
             return False
         policy = evaluate_joint_ohlc_policy(bundle, trading_cfg, market_price=close_price)
         side = str(order.get("side") or "")
-        if str(policy.get("decision")) != side or abs(float(policy.get("score", 0.0) or 0.0)) < fallback_min_score:
+        if (
+            str(policy.get("decision")) != side
+            or abs(float(policy.get("score", 0.0) or 0.0)) < fallback_min_score
+            or (
+                fallback_require_entry_zone
+                and not bool(policy.get("market_entry_ready", False))
+            )
+        ):
             return False
 
         fallback_order = dict(order)
@@ -1490,12 +1631,19 @@ def run_historical_strategy_backtest(
             "volatility_protection": plan.get("volatility_protection"),
         }
         attempts.append(attempt)
-        session_state["launches"] += 1
-        if trigger == "followup":
-            session_state["followups"] += 1
+        session_state["last_scan_ts"] = timestamp
+        session_state["scan_attempts"] += 1
+        if trigger == "mandatory_session":
+            session_state["mandatory_attempted"] = True
         if str(plan.get("decision")) not in {"buy", "sell"}:
+            if trigger == "opportunity_scan":
+                session_state["filtered_followups"] += 1
             session_state["last_terminal_ts"] = timestamp
             return
+
+        session_state["launches"] += 1
+        if trigger == "opportunity_scan":
+            session_state["followups"] += 1
 
         order_seq += 1
         side = str(plan["decision"])
@@ -1540,7 +1688,12 @@ def run_historical_strategy_backtest(
         else:
             order_type = "sell_limit" if float(plan["entry"]) >= current else "sell_stop"
         base["order_type"] = order_type
-        base["expires_at"] = timestamp + pd.Timedelta(minutes=expiration_minutes)
+        order_expiration = (
+            opportunity_expiration_minutes
+            if trigger == "opportunity_scan"
+            else expiration_minutes
+        )
+        base["expires_at"] = timestamp + pd.Timedelta(minutes=order_expiration)
         pending.append(base)
 
     for _, minute_bar in period_minutes.iterrows():
@@ -1621,6 +1774,8 @@ def run_historical_strategy_backtest(
                 "timestamp_utc": bundle.get("as_of_utc"),
                 "consensus": bundle.get("consensus"),
                 "consensus_score": bundle.get("consensus_score"),
+                "management_consensus": bundle.get("management_consensus"),
+                "management_consensus_score": bundle.get("management_consensus_score"),
                 "avg_confidence": bundle.get("avg_confidence"),
                 "n_signals": bundle.get("n_signals"),
                 "n_usable": bundle.get("n_usable"),
@@ -1633,8 +1788,8 @@ def run_historical_strategy_backtest(
 
         for order in list(pending):
             side = str(order["side"])
-            consensus = str(bundle.get("consensus") or "hold")
-            score = float(bundle.get("consensus_score", 0.0) or 0.0)
+            consensus = str(bundle.get("management_consensus") or "hold")
+            score = float(bundle.get("management_consensus_score", 0.0) or 0.0)
             opposed = (side == "buy" and consensus == "sell" and score <= -cancel_threshold) or (
                 side == "sell" and consensus == "buy" and score >= cancel_threshold
             )
@@ -1669,8 +1824,8 @@ def run_historical_strategy_backtest(
 
         for position in list(positions):
             side = str(position["side"])
-            consensus = str(bundle.get("consensus") or "hold")
-            score = float(bundle.get("consensus_score", 0.0) or 0.0)
+            consensus = str(bundle.get("management_consensus") or "hold")
+            score = float(bundle.get("management_consensus_score", 0.0) or 0.0)
             should_close = (side == "buy" and consensus == "sell" and score <= -close_threshold) or (
                 side == "sell" and consensus == "buy" and score >= close_threshold
             )
@@ -1685,20 +1840,26 @@ def run_historical_strategy_backtest(
                 continue
 
             trailing = risk.get("trailing") or {}
-            if bool(trailing.get("enabled", True)) and consensus == side:
+            if bool(trailing.get("enabled", True)):
                 entry = float(position["entry_price"])
                 current = float(minute_bar["CLOSE"])
-                target = float(position.get("take_profit") or entry)
-                activation = float(trailing.get("breakeven_activation_ratio", 0.75) or 0.75)
+                initial_stop_distance = float(
+                    position.setdefault(
+                        "_initial_stop_distance",
+                        abs(float(position.get("stop_loss") or entry) - entry),
+                    )
+                )
+                activation = float(trailing.get("breakeven_activation_ratio", 0.50) or 0.50)
                 favorable = (current - entry) if side == "buy" else (entry - current)
-                target_distance = abs(target - entry)
-                if target_distance > 0 and favorable >= activation * target_distance:
-                    trail_pct = float(trailing.get("trail_pct_base", 0.5) or 0.5) / 100.0
+                trail_pct = float(trailing.get("trail_pct_base", 0.15) or 0.15) / 100.0
+                trail_gap = max(entry * trail_pct, 1e-9)
+                activation_move = max(initial_stop_distance * activation, trail_gap)
+                if initial_stop_distance > 0 and favorable >= activation_move:
                     if side == "buy":
-                        candidate = max(entry, current * (1.0 - trail_pct))
+                        candidate = max(entry, current - trail_gap)
                         position["stop_loss"] = max(float(position.get("stop_loss") or candidate), candidate)
                     else:
-                        candidate = min(entry, current * (1.0 + trail_pct))
+                        candidate = min(entry, current + trail_gap)
                         position["stop_loss"] = min(float(position.get("stop_loss") or candidate), candidate)
 
         session = _current_session(local_time, trading_cfg)
@@ -1710,24 +1871,41 @@ def run_historical_strategy_backtest(
                 **session,
                 "launches": 0,
                 "followups": 0,
+                "filtered_followups": 0,
+                "scan_attempts": 0,
+                "mandatory_attempted": False,
+                "last_scan_ts": None,
                 "last_terminal_ts": None,
             }
         state = sessions[session_id]
         session_pending = any(str(order.get("session_id")) == session_id for order in pending)
         session_positions = any(str(position.get("session_id")) == session_id for position in positions)
-        if int(state["launches"]) == 0:
+        if not bool(state.get("mandatory_attempted", False)):
             create_entry(timestamp, session, "mandatory_session", "high:7h", "programmed", bundle, float(minute_bar["CLOSE"]))
             continue
         if not followup_enabled or session_pending or session_positions:
             continue
         last_terminal = state.get("last_terminal_ts")
-        if last_terminal is None or (timestamp - pd.Timestamp(last_terminal)).total_seconds() < followup_cooldown:
+        if last_terminal is not None and (timestamp - pd.Timestamp(last_terminal)).total_seconds() < followup_cooldown:
             continue
         if int(state["launches"]) >= session_capacity or int(state["followups"]) >= max_followups:
             continue
-        if str(bundle.get("consensus")) not in {"buy", "sell"}:
+        if int(state.get("filtered_followups", 0)) >= max_filtered_followups:
             continue
-        create_entry(timestamp, session, "followup", "high:3h", "market", bundle, float(minute_bar["CLOSE"]))
+        last_scan = state.get("last_scan_ts")
+        if last_scan is not None and (
+            timestamp - pd.Timestamp(last_scan)
+        ).total_seconds() < opportunity_scan_minutes * 60:
+            continue
+        create_entry(
+            timestamp,
+            session,
+            "opportunity_scan",
+            "high:3h",
+            followup_submission_mode,
+            bundle,
+            float(minute_bar["CLOSE"]),
+        )
 
     last_timestamp = pd.Timestamp(period_minutes.iloc[min(len(period_minutes) - 1, max(0, len(period_minutes) - 1))]["DATE"])
     if max_ticks is not None and signal_rows:
@@ -1821,7 +1999,7 @@ def run_historical_strategy_backtest(
     running_equity = float(initial_balance)
     for day in all_local_days:
         day_ops = [operation for operation in operations if local_label(pd.Timestamp(operation["exit_time_utc"])) == day]
-        day_attempts = [attempt for attempt in attempts if str(attempt.get("date_local")) == day and attempt.get("trigger") in {"mandatory_session", "followup"}]
+        day_attempts = [attempt for attempt in attempts if str(attempt.get("date_local")) == day and attempt.get("trigger") in {"mandatory_session", "followup", "opportunity_scan"}]
         day_net = float(sum(float(operation.get("net_pnl", 0.0)) for operation in day_ops))
         running_equity += day_net
         daily.append(
@@ -1836,6 +2014,16 @@ def run_historical_strategy_backtest(
             }
         )
 
+    entry_attempt_reasons = Counter(
+        str(attempt.get("reason") or "unknown")
+        for attempt in attempts
+        if attempt.get("trigger") in {"mandatory_session", "followup", "opportunity_scan"}
+    )
+    pending_terminal_reasons = Counter(
+        str(attempt.get("reason") or "unknown")
+        for attempt in attempts
+        if attempt.get("trigger") == "pending_terminal"
+    )
     summary: Dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "mode": "model_backed_point_in_time_market_replay",
@@ -1872,10 +2060,14 @@ def run_historical_strategy_backtest(
             "signal_forecast_scope": "first_model_output_only; identical to the first step of the configured recursive horizon",
             "session_hours": session_hours,
             "programmed_order_expiration_minutes": expiration_minutes,
+            "opportunity_scan_interval_minutes": opportunity_scan_minutes,
+            "opportunity_submission_mode": followup_submission_mode,
+            "opportunity_order_expiration_minutes": opportunity_expiration_minutes,
             "market_fallback": {
                 "enabled": fallback_enabled,
                 "minutes_before_expiry": fallback_lead_minutes,
                 "allowed_triggers": sorted(fallback_allowed_triggers),
+                "require_entry_zone": fallback_require_entry_zone,
             },
             "signal_policy": policy_cfg,
             "spread_bps": float(execution.get("spread_bps", 2.0) or 2.0),
@@ -1901,10 +2093,22 @@ def run_historical_strategy_backtest(
             "expectancy_per_trade": float(np.mean(pnl_values)) if pnl_values.size else 0.0,
             "signal_ticks": int(tick_count),
             "signal_coverage": coverage,
-            "entry_attempts": sum(1 for attempt in attempts if attempt.get("trigger") in {"mandatory_session", "followup"}),
+            "entry_attempts": sum(1 for attempt in attempts if attempt.get("trigger") in {"mandatory_session", "followup", "opportunity_scan"}),
         },
         "daily": daily,
         "path_diagnostics": path_diagnostics,
+        "entry_diagnostics": {
+            "attempt_reasons": dict(entry_attempt_reasons.most_common()),
+            "pending_terminal_reasons": dict(pending_terminal_reasons.most_common()),
+            "session_states": {
+                key: {
+                    field: value
+                    for field, value in state.items()
+                    if field not in {"start_local", "end_local"}
+                }
+                for key, state in sessions.items()
+            },
+        },
         "operations": operations,
         "model_manifest": provider_manifest,
         "signal_errors_last_tick": {

@@ -158,6 +158,20 @@ class PropFirmGuardTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["sized_volume"], 0.02)
 
+    def test_conviction_fraction_uses_minimum_lot_only_when_risk_budget_allows(self):
+        self.config = {
+            "risk": {"risk_per_trade_pct": 0.5, "account_sizing": {"enabled": True}},
+            "prop_firm_guard": {"enabled": False},
+        }
+        self.adapter.account["equity"] = 5000.0
+        self.adapter.estimated_loss = 1800.0
+
+        result = self._run(stop_loss=4982.0, volume=0.0025)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sized_volume"], 0.01)
+        self.assertTrue(result["sizing"]["minimum_volume_floor_applied"])
+
 
 if __name__ == "__main__":
     unittest.main()

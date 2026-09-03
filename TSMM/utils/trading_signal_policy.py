@@ -33,8 +33,12 @@ def signal_policy_config(trading_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "direction_timeframes", ["10m", "30m", "1h", "3h", "7h", "12h", "24h"]
     )
     cfg.setdefault("select_best_direction_timeframe", True)
+    cfg.setdefault("direction_aggregation", "best_timeframe")
+    cfg.setdefault("direction_timeframe_weights", {})
+    cfg.setdefault("minimum_direction_timeframes", 1)
     cfg.setdefault("confirmation_timeframes", ["10m", "30m", "1h"])
     cfg.setdefault("required_confirmations", 2)
+    cfg.setdefault("maximum_opposing_confirmations", 99)
     cfg.setdefault("min_direction_score", 0.12)
     cfg.setdefault("min_confirmation_score", 0.08)
     cfg.setdefault("minimum_coverage", 0.70)
@@ -83,8 +87,54 @@ def _timeframe_score(
         "timeframe": timeframe,
         "score": float(score),
         "direction": "buy" if score > 0.0 else ("sell" if score < 0.0 else "hold"),
+        "total_family_weight": float(total),
         "available_families": sum(1 for value in families.values() if value.get("available")),
         "families": families,
+    }
+
+
+def weighted_timeframe_consensus(
+    signals: Dict[str, Dict[str, Any]],
+    timeframe_weights: Dict[str, float],
+    *,
+    family_weights: Optional[Dict[str, float]] = None,
+    minimum_families: int = 1,
+    decision_threshold: float = 0.10,
+) -> Dict[str, Any]:
+    """Aggregate timeframe votes with explicit, role-specific weights."""
+    resolved_family_weights = {
+        str(key).strip().lower(): max(float(value), 0.0)
+        for key, value in dict(family_weights or DEFAULT_FAMILY_WEIGHTS).items()
+    }
+    votes = []
+    weighted = 0.0
+    total = 0.0
+    for timeframe, raw_weight in dict(timeframe_weights or {}).items():
+        vote = _timeframe_score(signals, str(timeframe), resolved_family_weights)
+        timeframe_weight = max(float(raw_weight or 0.0), 0.0)
+        eligible = (
+            timeframe_weight > 0.0
+            and int(vote.get("available_families", 0) or 0) >= max(int(minimum_families), 1)
+        )
+        vote["timeframe_weight"] = timeframe_weight
+        effective_weight = timeframe_weight * float(
+            vote.get("total_family_weight", 0.0) or 0.0
+        )
+        vote["effective_weight"] = effective_weight
+        vote["eligible"] = bool(eligible)
+        votes.append(vote)
+        if eligible:
+            weighted += effective_weight * float(vote.get("score", 0.0) or 0.0)
+            total += effective_weight
+    score = weighted / total if total > 0.0 else 0.0
+    threshold = abs(float(decision_threshold or 0.0))
+    decision = "buy" if score >= threshold else ("sell" if score <= -threshold else "hold")
+    return {
+        "decision": decision,
+        "score": float(score),
+        "eligible_timeframes": sum(1 for vote in votes if vote.get("eligible")),
+        "total_timeframe_weight": float(total),
+        "votes": votes,
     }
 
 
@@ -173,24 +223,82 @@ def evaluate_joint_ohlc_policy(
         score_strength = abs(float(vote.get("score", 0.0) or 0.0))
         return high_low_quality * score_strength, high_low_quality, high_low_available
 
-    if bool(cfg.get("select_best_direction_timeframe", True)):
+    min_direction = abs(float(cfg.get("min_direction_score", 0.12) or 0.12))
+    aggregation = str(cfg.get("direction_aggregation") or "best_timeframe").strip().lower()
+    direction_ensemble: Dict[str, Any] = {}
+    if aggregation == "weighted_ensemble":
+        configured_tf_weights = dict(cfg.get("direction_timeframe_weights") or {})
+        timeframe_weights = {
+            timeframe: float(configured_tf_weights.get(timeframe, 1.0) or 0.0)
+            for timeframe in direction_timeframes
+        }
+        direction_ensemble = weighted_timeframe_consensus(
+            signals,
+            timeframe_weights,
+            family_weights=family_weights,
+            minimum_families=2,
+            decision_threshold=min_direction,
+        )
+        decision = str(direction_ensemble.get("decision") or "hold")
+        aligned_candidates = [
+            vote
+            for vote in candidate_votes
+            if vote.get("direction") == decision
+            and int(vote.get("available_families", 0) or 0) >= 2
+            and abs(float(vote.get("score", 0.0) or 0.0)) >= min_direction
+        ]
+        minimum_direction_timeframes = max(
+            int(cfg.get("minimum_direction_timeframes", 1) or 1), 1
+        )
+        if decision not in {"buy", "sell"} or len(aligned_candidates) < minimum_direction_timeframes:
+            return {
+                "enabled": True,
+                "decision": "hold",
+                "reason": "long_horizon_direction_ensemble_not_strong_enough",
+                "direction_ensemble": direction_ensemble,
+                "direction_candidates": candidate_votes,
+                "minimum_direction_timeframes": minimum_direction_timeframes,
+            }
+        range_candidates = [
+            vote for vote in aligned_candidates
+            if _projected_range(signals, str(vote.get("timeframe") or "")).get("available")
+        ]
+        direction_vote = max(
+            range_candidates or aligned_candidates,
+            key=lambda vote: (
+                float(timeframe_weights.get(str(vote.get("timeframe") or ""), 0.0))
+                * _direction_rank(vote)[0],
+                *_direction_rank(vote),
+            ),
+            default={},
+        )
+    elif bool(cfg.get("select_best_direction_timeframe", True)):
         direction_vote = max(candidate_votes, key=_direction_rank, default={})
+        decision = str(direction_vote.get("direction") or "hold")
     else:
         direction_vote = next(
             (vote for vote in candidate_votes if vote.get("timeframe") == configured_direction_timeframe),
             {},
         )
+        decision = str(direction_vote.get("direction") or "hold")
     direction_timeframe = str(direction_vote.get("timeframe") or configured_direction_timeframe)
-    min_direction = abs(float(cfg.get("min_direction_score", 0.12) or 0.12))
-    if direction_vote["available_families"] < 2 or abs(float(direction_vote["score"])) < min_direction:
+    direction_score = (
+        float(direction_ensemble.get("score", 0.0) or 0.0)
+        if direction_ensemble
+        else float(direction_vote.get("score", 0.0) or 0.0)
+    )
+    if (
+        int(direction_vote.get("available_families", 0) or 0) < 2
+        or abs(direction_score) < min_direction
+    ):
         return {
             "enabled": True,
             "decision": "hold",
             "reason": "joint_ohlc_direction_not_strong_enough",
             "direction_vote": direction_vote,
+            "direction_ensemble": direction_ensemble,
         }
 
-    decision = str(direction_vote["direction"])
     min_confirmation = abs(float(cfg.get("min_confirmation_score", 0.08) or 0.08))
     confirmation_votes = []
     confirmations = 0
@@ -209,16 +317,19 @@ def evaluate_joint_ohlc_policy(
         oppositions += int(opposed)
 
     required = max(int(cfg.get("required_confirmations", 2) or 2), 0)
-    if confirmations < required:
+    maximum_oppositions = max(int(cfg.get("maximum_opposing_confirmations", 99) or 0), 0)
+    if confirmations < required or oppositions > maximum_oppositions:
         return {
             "enabled": True,
             "decision": "hold",
             "reason": "short_timeframe_confirmation_failed",
             "direction_vote": direction_vote,
+            "direction_ensemble": direction_ensemble,
             "confirmation_votes": confirmation_votes,
             "confirmations": confirmations,
             "required_confirmations": required,
             "oppositions": oppositions,
+            "maximum_opposing_confirmations": maximum_oppositions,
         }
 
     projected = _projected_range(signals, direction_timeframe)
@@ -228,6 +339,7 @@ def evaluate_joint_ohlc_policy(
             "decision": "hold",
             "reason": "qualified_high_low_range_unavailable",
             "direction_vote": direction_vote,
+            "direction_ensemble": direction_ensemble,
             "confirmation_votes": confirmation_votes,
             "confirmations": confirmations,
             "required_confirmations": required,
@@ -237,6 +349,8 @@ def evaluate_joint_ohlc_policy(
             "direction_candidates": candidate_votes,
         }
     entry = _finite_float(market_price)
+    market_entry_ready = False
+    market_range_position = None
     if projected.get("available"):
         low = float(projected["projected_low"])
         high = float(projected["projected_high"])
@@ -244,6 +358,8 @@ def evaluate_joint_ohlc_policy(
         entry = low + (high - low) * fraction if decision == "buy" else high - (high - low) * fraction
         reference = _finite_float(market_price)
         if reference and reference > 0.0:
+            market_range_position = (reference - low) / max(high - low, 1e-12)
+            market_entry_ready = reference <= entry if decision == "buy" else reference >= entry
             max_offset = reference * max(float(cfg.get("max_entry_offset_pct", 0.40) or 0.40), 0.0) / 100.0
             entry = min(max(float(entry), reference - max_offset), reference + max_offset)
 
@@ -257,15 +373,19 @@ def evaluate_joint_ohlc_policy(
         "enabled": True,
         "decision": decision,
         "reason": "joint_ohlc_and_short_timeframe_confirmation_passed",
-        "score": float(direction_vote["score"]),
+        "score": direction_score,
         "confidence": float(np.mean(confidence_values)) if confidence_values else 0.5,
         "entry": float(entry) if entry is not None else None,
         "direction_vote": direction_vote,
+        "direction_ensemble": direction_ensemble,
         "confirmation_votes": confirmation_votes,
         "confirmations": confirmations,
         "required_confirmations": required,
         "oppositions": oppositions,
+        "maximum_opposing_confirmations": maximum_oppositions,
         "projected_range": projected,
+        "market_entry_ready": bool(market_entry_ready),
+        "market_range_position": market_range_position,
         "selected_direction_timeframe": direction_timeframe,
         "direction_candidates": candidate_votes,
     }

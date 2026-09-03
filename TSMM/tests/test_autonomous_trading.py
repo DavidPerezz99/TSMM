@@ -10,10 +10,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.telegram_command_listener import _active_job_display_states, _active_job_ids, _adopt_untracked_live_agent_b_positions, _agent_b_heartbeat_stale, _current_autonomous_session, _handle_weekend_quiet_mode_exit, _is_active_trading_state, _job_registry_path, _job_root_dir, _job_table_row, _maintain_programmed_orders, _programmed_order_maintenance_decision, _reconcile_orphaned_agent_b_jobs, _refresh_job_state_from_mt5, _scheduled_refresh_target, _send_to_chat_ids, _set_runtime_scope_env, _should_auto_reconcile_agent_b_job, _subscriber_path, _weekend_utc_quiet_mode_active
-from utils.trading_job import _autonomous_followup_meets_entry_thresholds
+from utils.trading_job import (
+    _autonomous_followup_meets_entry_thresholds,
+    _programmed_order_expiration_minutes,
+)
 
 
 class AutonomousTradingTests(unittest.TestCase):
+    def test_followup_programmed_orders_use_opportunity_expiration(self):
+        trading_cfg = {
+            "trading_job": {"programmed_order_expiration_minutes": 420},
+            "autonomous_trading": {"opportunity_order_expiration_minutes": 90},
+        }
+
+        self.assertEqual(_programmed_order_expiration_minutes(trading_cfg), 420)
+        self.assertEqual(
+            _programmed_order_expiration_minutes(trading_cfg, "mandatory_session"),
+            420,
+        )
+        self.assertEqual(
+            _programmed_order_expiration_minutes(trading_cfg, "autonomous_followup"),
+            90,
+        )
+
     @patch("scripts.telegram_command_listener.send_telegram_notification")
     @patch("scripts.telegram_command_listener._chat_mode", return_value="tsmm")
     def test_send_to_chat_ids_prefixes_account_label(self, _chat_mode_mock, send_mock):
