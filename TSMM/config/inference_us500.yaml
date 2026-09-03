@@ -25,8 +25,8 @@ dashboard:
   tiingo_provider: tiingo_iex_proxy
   tiingo_symbol: SPY
   tiingo_rate: 1min
-  tiingo_token_env: TIINGO_API_TOKEN
-  tiingo_token_envs: [TIINGO_API_TOKEN, TIINGO_API_TOKEN_ALT]
+  tiingo_token_env: TIINGO_API_TOKEN_ALT
+  tiingo_token_envs: [TIINGO_API_TOKEN_ALT]
 
 endpoint_lifecycle:
   on_demand_start: false

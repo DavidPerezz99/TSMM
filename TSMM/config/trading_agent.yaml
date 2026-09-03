@@ -465,7 +465,6 @@ dashboard:
   tiingo_token_env: TIINGO_API_TOKEN
   tiingo_token_envs:
   - TIINGO_API_TOKEN
-  - TIINGO_API_TOKEN_ALT
   tiingo_token_rotation_state_path: reports/runtime/tiingo_token_rotation_state.json
   auto_update_master: true
   auto_update_every_ticks: 1

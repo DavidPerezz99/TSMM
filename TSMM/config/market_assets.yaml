@@ -7,7 +7,7 @@ assets:
     db_path: data/market_data.sqlite
     rate: 1min
     token_env: TIINGO_API_TOKEN
-    token_envs: [TIINGO_API_TOKEN, TIINGO_API_TOKEN_ALT]
+    token_envs: [TIINGO_API_TOKEN]
     token_rotation_state_path: reports/runtime/tiingo_token_rotation_state.json
     timeframes_minutes: [10, 30, 60, 180, 420, 720, 1440]
 
@@ -18,8 +18,8 @@ assets:
     symbol: US500
     db_path: data/market_data_us500.sqlite
     rate: 1min
-    token_env: TIINGO_API_TOKEN
-    token_envs: [TIINGO_API_TOKEN, TIINGO_API_TOKEN_ALT]
+    token_env: TIINGO_API_TOKEN_ALT
+    token_envs: [TIINGO_API_TOKEN_ALT]
     token_rotation_state_path: reports/runtime/us500/tiingo_token_rotation_state.json
     calibration_lookback_days: 60
     minimum_calibration_samples: 100

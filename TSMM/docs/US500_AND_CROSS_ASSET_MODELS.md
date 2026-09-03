@@ -4,7 +4,10 @@
 
 The old notebook is historical provenance, not the production updater. It
 contains an embedded Tiingo credential; rotate that credential and expose its
-replacement only through `TIINGO_API_TOKEN` or a configured alternate variable.
+replacement only through an environment variable. The maintained profiles keep
+the asset pools separate: XAUUSD uses `TIINGO_API_TOKEN`, while US500 uses
+`TIINGO_API_TOKEN_ALT`. Do not place either asset's variable in the other
+asset's `token_envs` list.
 
 Run the maintained pipeline from the repository root:
 
